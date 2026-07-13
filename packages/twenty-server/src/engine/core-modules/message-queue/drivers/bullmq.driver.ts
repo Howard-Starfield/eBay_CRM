@@ -14,7 +14,7 @@ import {
   type QueueOptions,
   Worker,
 } from 'bullmq';
-import { isDefined } from 'twenty-shared/utils';
+import { fastDeepEqual, isDefined } from 'twenty-shared/utils';
 import { v4 } from 'uuid';
 
 import {
@@ -304,8 +304,34 @@ export class BullMQDriver
       },
     };
 
+    const schedulerId = getJobKey({ jobName, jobId });
+    const existingScheduler =
+      await this.queueMap[queueName].getJobScheduler(schedulerId);
+    const serializedData = JSON.stringify(
+      typeof data === 'undefined' ? {} : data,
+    );
+    const comparableData: unknown =
+      serializedData === '{}' ? undefined : JSON.parse(serializedData);
+    const comparableQueueOptions: unknown = JSON.parse(
+      JSON.stringify(queueOptions),
+    );
+
+    // BullMQ can reset the pending iteration's repeat count when an identical
+    // scheduler is upserted while its current iteration is active.
+    if (
+      isDefined(existingScheduler) &&
+      existingScheduler.name === jobName &&
+      existingScheduler.every === options.repeat.every &&
+      existingScheduler.pattern === options.repeat.pattern &&
+      existingScheduler.limit === options.repeat.limit &&
+      fastDeepEqual(existingScheduler.template?.data, comparableData) &&
+      fastDeepEqual(existingScheduler.template?.opts, comparableQueueOptions)
+    ) {
+      return;
+    }
+
     await this.queueMap[queueName].upsertJobScheduler(
-      getJobKey({ jobName, jobId }),
+      schedulerId,
       options?.repeat,
       {
         name: jobName,

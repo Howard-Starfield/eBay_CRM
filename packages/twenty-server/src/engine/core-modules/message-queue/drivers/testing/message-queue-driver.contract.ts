@@ -251,29 +251,46 @@ export const defineMessageQueueDriverContract = (
     });
 
     it('upserts an interval schedule, honors its limit, and removes it', async () => {
-      let received = 0;
-      const harness = await useHarness('interval', () => {
-        received += 1;
+      const receivedVersions: number[] = [];
+      const harness = await useHarness('interval', (job) => {
+        receivedVersions.push(job.data.version);
       });
 
       await harness.start();
       await harness.driver.addCron({
         queueName: harness.queueName,
         jobName: 'interval',
-        data: {},
+        data: { version: 1, alpha: 'same', beta: 2 },
         jobId: 'interval-id',
         options: { repeat: { every: 150, limit: 2 } },
       });
       await harness.driver.addCron({
         queueName: harness.queueName,
         jobName: 'interval',
-        data: {},
+        data: { beta: 2, alpha: 'same', version: 1 },
         jobId: 'interval-id',
         options: { repeat: { every: 150, limit: 2 } },
       });
-      await harness.waitFor(() => received === 2, WAIT_TIMEOUT_MS);
+      await harness.waitFor(
+        () => receivedVersions.length === 2,
+        WAIT_TIMEOUT_MS,
+      );
       await new Promise((resolve) => setTimeout(resolve, 400));
-      expect(received).toBe(2);
+      expect(receivedVersions).toEqual([1, 1]);
+
+      await harness.driver.addCron({
+        queueName: harness.queueName,
+        jobName: 'interval',
+        data: { version: 2 },
+        jobId: 'interval-id',
+        options: { repeat: { every: 200, limit: 1 } },
+      });
+      await harness.waitFor(
+        () => receivedVersions.length === 3,
+        WAIT_TIMEOUT_MS,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      expect(receivedVersions).toEqual([1, 1, 2]);
       await harness.driver.removeCron({
         queueName: harness.queueName,
         jobName: 'interval',
