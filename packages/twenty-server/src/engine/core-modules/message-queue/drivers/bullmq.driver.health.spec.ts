@@ -1,5 +1,8 @@
+import { execFile } from 'node:child_process';
+import { resolve } from 'node:path';
+import { promisify } from 'node:util';
+
 import { BullMQDriver } from 'src/engine/core-modules/message-queue/drivers/bullmq.driver';
-import { type MessageQueueDriver } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-driver.interface';
 import { type MessageQueueJobRecord } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-job-record.type';
 import { type MetricsService } from 'src/engine/core-modules/metrics/metrics.service';
 import { type TwentyConfigService } from 'src/engine/core-modules/twenty-config/twenty-config.service';
@@ -36,6 +39,9 @@ const createJob = (
   attemptsMade: 0,
   createdAt: Date.now(),
 });
+
+const execFileAsync = promisify(execFile);
+const serverRoot = resolve(__dirname, '../../../../..');
 
 describe('BullMQDriver health', () => {
   beforeEach(() => {
@@ -126,38 +132,21 @@ describe('BullMQDriver health', () => {
     });
   });
 
-  it('bounds repeated probes while Redis keeps reconnecting and destroys cleanly', async () => {
-    const driver = createDriver({
-      host: '127.0.0.1',
-      port: 1,
-      connectTimeout: 50,
-      maxRetriesPerRequest: null,
-      retryStrategy: () => 25,
-    });
-    const neutralDriver: MessageQueueDriver = driver;
+  it('exits cleanly after repeated reconnecting probes and driver destruction', async () => {
+    const { stderr, stdout } = await execFileAsync(
+      process.execPath,
+      [
+        resolve(serverRoot, '../../node_modules/tsx/dist/cli.mjs'),
+        resolve(__dirname, 'testing/fixtures/bullmq-health-process.fixture.ts'),
+      ],
+      {
+        cwd: serverRoot,
+        timeout: 10_000,
+        windowsHide: true,
+      },
+    );
 
-    driver.register(MessageQueue.cronQueue);
-
-    try {
-      for (let probe = 0; probe < 3; probe += 1) {
-        const startedAt = Date.now();
-        const stats = await neutralDriver.getStats(MessageQueue.cronQueue);
-        const elapsedMs = Date.now() - startedAt;
-
-        expect(elapsedMs).toBeGreaterThanOrEqual(900);
-        expect(elapsedMs).toBeLessThan(1_500);
-        expect(stats).toEqual({
-          queueName: MessageQueue.cronQueue,
-          created: 0,
-          active: 0,
-          completed: 0,
-          failed: 0,
-          retry: 0,
-          healthy: false,
-        });
-      }
-    } finally {
-      await driver.onModuleDestroy();
-    }
-  }, 7_500);
+    expect(stdout).toContain('BULLMQ_HEALTH_PROCESS_OK');
+    expect(stderr).not.toContain('ECONNREFUSED');
+  }, 12_000);
 });

@@ -12,6 +12,7 @@ import {
   MetricsTime,
   Queue,
   type QueueOptions,
+  RedisConnection,
   Worker,
 } from 'bullmq';
 import { fastDeepEqual, isDefined } from 'twenty-shared/utils';
@@ -45,6 +46,22 @@ export type BullMQDriverOptions = QueueOptions;
 const V4_LENGTH = 36;
 const QUEUE_STATS_TIMEOUT_MS = 1_000;
 
+class ShutdownSafeRedisConnection extends RedisConnection {
+  private readonly handleLateShutdownError = () => undefined;
+
+  override async close(force = false): Promise<void> {
+    const closing = super.close(force);
+
+    this.on('error', this.handleLateShutdownError);
+    await closing;
+  }
+}
+
+type QueueStatsInspection = {
+  cancel: () => void;
+  promise: Promise<MessageQueueJobRecord[]>;
+};
+
 export class BullMQDriver
   implements MessageQueueDriver, OnModuleDestroy, OnModuleInit
 {
@@ -61,8 +78,9 @@ export class BullMQDriver
     Record<MessageQueue, MessageQueueWorkerOptions>
   > = {};
   private queueStatsInspectionMap: Partial<
-    Record<MessageQueue, Promise<MessageQueueJobRecord[]>>
+    Record<MessageQueue, QueueStatsInspection>
   > = {};
+  private isShuttingDown = false;
 
   constructor(
     private options: BullMQDriverOptions,
@@ -102,7 +120,26 @@ export class BullMQDriver
   }
 
   register(queueName: MessageQueue): void {
-    this.queueMap[queueName] = new Queue(queueName, this.options);
+    const queue = new Queue(
+      queueName,
+      this.options,
+      ShutdownSafeRedisConnection,
+    );
+
+    queue.on('error', (error) => {
+      if (
+        this.isShuttingDown ||
+        isDefined(this.queueStatsInspectionMap[queueName])
+      ) {
+        return;
+      }
+
+      this.logger.error(
+        `Queue ${queueName} emitted an error: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+
+    this.queueMap[queueName] = queue;
   }
 
   private getQueue(queueName: MessageQueue): Queue {
@@ -120,6 +157,18 @@ export class BullMQDriver
   async onModuleDestroy() {
     const workers = Object.entries(this.workerMap) as [MessageQueue, Worker][];
     const queues = Object.values(this.queueMap);
+    const statsInspections = Object.values(this.queueStatsInspectionMap);
+
+    this.isShuttingDown = true;
+
+    for (const inspection of statsInspections) {
+      inspection.cancel();
+    }
+
+    await Promise.allSettled(
+      statsInspections.map((inspection) => inspection.promise),
+    );
+    this.queueStatsInspectionMap = {};
 
     if (workers.length > 0) {
       this.logger.log(
@@ -149,12 +198,6 @@ export class BullMQDriver
       this.logger.error(
         `Failed to close queues during shutdown: ${error instanceof Error ? error.message : String(error)}`,
       );
-    } finally {
-      for (const inspection of Object.values(this.queueStatsInspectionMap)) {
-        void inspection.catch(() => undefined);
-      }
-
-      this.queueStatsInspectionMap = {};
     }
 
     if (isDefined(workerCloseError)) {
@@ -432,28 +475,42 @@ export class BullMQDriver
     queue: Queue,
   ): Promise<MessageQueueJobRecord[]> {
     const existingInspection = this.queueStatsInspectionMap[queueName];
-    let inspection = existingInspection;
+    let inspection = existingInspection?.promise;
 
     if (!isDefined(inspection)) {
-      const pendingInspection = queue
-        .waitUntilReady()
-        .then(() =>
-          this.findJobs(queueName, [
-            'created',
-            'active',
-            'completed',
-            'failed',
-            'retry',
-          ]),
-        );
-      const trackedInspection = pendingInspection.finally(() => {
-        if (this.queueStatsInspectionMap[queueName] === trackedInspection) {
+      let cancel: () => void = () => undefined;
+      const cancellation = new Promise<never>((_resolve, reject) => {
+        cancel = () => reject(new Error('Queue stats inspection cancelled'));
+      });
+      const pendingInspection = queue.waitUntilReady().then(() => {
+        if (this.isShuttingDown) {
+          throw new Error('Queue stats inspection cancelled');
+        }
+
+        return this.findJobs(queueName, [
+          'created',
+          'active',
+          'completed',
+          'failed',
+          'retry',
+        ]);
+      });
+      const trackedInspection = Promise.race([
+        pendingInspection,
+        cancellation,
+      ]).finally(() => {
+        if (
+          this.queueStatsInspectionMap[queueName]?.promise === trackedInspection
+        ) {
           delete this.queueStatsInspectionMap[queueName];
         }
       });
 
       inspection = trackedInspection;
-      this.queueStatsInspectionMap[queueName] = trackedInspection;
+      this.queueStatsInspectionMap[queueName] = {
+        cancel,
+        promise: trackedInspection,
+      };
     }
 
     let timeout: ReturnType<typeof setTimeout> | undefined;
