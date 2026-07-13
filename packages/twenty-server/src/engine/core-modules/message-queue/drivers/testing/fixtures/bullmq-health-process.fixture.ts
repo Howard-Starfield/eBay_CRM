@@ -51,6 +51,9 @@ const run = async () => {
   }
 
   await delay(500);
+  process.stdout.write(
+    `BULLMQ_HEALTH_ACTIVE_RESOURCES=${JSON.stringify(process.getActiveResourcesInfo())}\n`,
+  );
   process.stdout.write('BULLMQ_HEALTH_PROCESS_OK\n');
 };
 

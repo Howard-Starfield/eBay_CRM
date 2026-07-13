@@ -127,10 +127,7 @@ export class BullMQDriver
     );
 
     queue.on('error', (error) => {
-      if (
-        this.isShuttingDown ||
-        isDefined(this.queueStatsInspectionMap[queueName])
-      ) {
+      if (this.isShuttingDown) {
         return;
       }
 

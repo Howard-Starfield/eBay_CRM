@@ -2,6 +2,8 @@ import { execFile } from 'node:child_process';
 import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 
+import { Logger } from '@nestjs/common';
+
 import { BullMQDriver } from 'src/engine/core-modules/message-queue/drivers/bullmq.driver';
 import { type MessageQueueJobRecord } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-job-record.type';
 import { type MetricsService } from 'src/engine/core-modules/metrics/metrics.service';
@@ -132,11 +134,48 @@ describe('BullMQDriver health', () => {
     });
   });
 
+  it('logs queue errors while a stats inspection is pending', async () => {
+    const logError = jest
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined);
+    const driver = createDriver({
+      host: '127.0.0.1',
+      port: 1,
+      connectTimeout: 50,
+      maxRetriesPerRequest: null,
+      retryStrategy: () => null,
+    });
+
+    driver.register(MessageQueue.cronQueue);
+
+    const stats = driver.getStats(MessageQueue.cronQueue);
+    const queue = (
+      driver as unknown as {
+        queueMap: Record<
+          MessageQueue,
+          { emit(event: 'error', error: Error): boolean }
+        >;
+      }
+    ).queueMap[MessageQueue.cronQueue];
+
+    try {
+      queue.emit('error', new Error('protocol failure'));
+
+      expect(logError).toHaveBeenCalledWith(
+        expect.stringContaining('protocol failure'),
+      );
+      await stats;
+    } finally {
+      await driver.onModuleDestroy();
+    }
+  });
+
   it('exits cleanly after repeated reconnecting probes and driver destruction', async () => {
-    const { stderr, stdout } = await execFileAsync(
+    const { stdout } = await execFileAsync(
       process.execPath,
       [
-        resolve(serverRoot, '../../node_modules/tsx/dist/cli.mjs'),
+        '--import',
+        'tsx',
         resolve(__dirname, 'testing/fixtures/bullmq-health-process.fixture.ts'),
       ],
       {
@@ -147,6 +186,6 @@ describe('BullMQDriver health', () => {
     );
 
     expect(stdout).toContain('BULLMQ_HEALTH_PROCESS_OK');
-    expect(stderr).not.toContain('ECONNREFUSED');
+    expect(stdout).toContain('BULLMQ_HEALTH_ACTIVE_RESOURCES=');
   }, 12_000);
 });
