@@ -1,6 +1,16 @@
-import { type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
+import {
+  Logger,
+  type OnModuleDestroy,
+  type OnModuleInit,
+} from '@nestjs/common';
 
-import { PgBoss, type JobWithMetadata as PgBossJobWithMetadata } from 'pg-boss';
+import { Pool, type PoolClient } from 'pg';
+import {
+  type Db as PgBossDatabase,
+  PgBoss,
+  type JobWithMetadata as PgBossJobWithMetadata,
+  type SendOptions as PgBossSendOptions,
+} from 'pg-boss';
 
 import { QUEUE_RETENTION } from 'src/engine/core-modules/message-queue/constants/queue-retention.constants';
 import {
@@ -36,10 +46,14 @@ type PgBossJobEnvelope<T extends MessageQueueJobData = MessageQueueJobData> = {
 
 type InspectablePgBossJob = PgBossJobWithMetadata<PgBossJobEnvelope>;
 
+const RETENTION_CLEANUP_INTERVAL_MS = 60_000;
+
 export class PgBossDriver
   implements MessageQueueDriver, OnModuleInit, OnModuleDestroy
 {
+  private readonly logger = new Logger(PgBossDriver.name);
   private readonly boss: PgBoss;
+  private readonly coordinationPool: Pool;
   private readonly registeredQueues = new Set<MessageQueue>();
   private readonly queueCreationPromises = new Map<
     MessageQueue,
@@ -49,6 +63,10 @@ export class PgBossDriver
   private stopPromise?: Promise<void>;
   private started = false;
   private boundedShutdownDrain = false;
+  private retentionCleanupTimer?: ReturnType<typeof setInterval>;
+  private retentionCleanupPromise?: Promise<void>;
+  private coordinationPoolClosed = false;
+  private destroying = false;
 
   constructor(
     private readonly options: PgBossDriverOptions,
@@ -59,6 +77,10 @@ export class PgBossDriver
       connectionString: options.connectionString,
       schema: options.schema,
       application_name: options.applicationName,
+    });
+    this.coordinationPool = new Pool({
+      connectionString: options.connectionString,
+      application_name: `${options.applicationName}-coordination`,
     });
   }
 
@@ -80,6 +102,9 @@ export class PgBossDriver
             this.ensureQueue(queueName),
           ),
         );
+        if (!this.destroying) {
+          this.startRetentionCleanup();
+        }
       })().finally(() => {
         this.startPromise = undefined;
       });
@@ -89,26 +114,36 @@ export class PgBossDriver
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.destroying = true;
+
     if (this.startPromise) {
       await this.startPromise;
     }
 
-    if (!this.started) {
-      return;
+    this.stopRetentionCleanup();
+
+    if (this.retentionCleanupPromise) {
+      await this.retentionCleanupPromise;
     }
 
     if (!this.stopPromise) {
       this.stopPromise = (async () => {
-        const timeout = this.boundedShutdownDrain
-          ? this.twentyConfigService.get('AI_STREAM_SHUTDOWN_DRAIN_MS')
-          : undefined;
+        try {
+          if (this.started) {
+            const timeout = this.boundedShutdownDrain
+              ? this.twentyConfigService.get('AI_STREAM_SHUTDOWN_DRAIN_MS')
+              : undefined;
 
-        await this.boss.stop({
-          close: true,
-          graceful: true,
-          ...(timeout === undefined ? {} : { timeout }),
-        });
-        this.started = false;
+            await this.boss.stop({
+              close: true,
+              graceful: true,
+              ...(timeout === undefined ? {} : { timeout }),
+            });
+            this.started = false;
+          }
+        } finally {
+          await this.closeCoordinationPool();
+        }
       })().finally(() => {
         this.stopPromise = undefined;
       });
@@ -125,17 +160,6 @@ export class PgBossDriver
   ): Promise<void> {
     await this.ensureStartedQueue(queueName);
 
-    if (options?.id) {
-      const duplicates = await this.boss.findJobs(queueName, {
-        queued: true,
-        data: { logicalId: options.id },
-      });
-
-      if (duplicates.length > 0) {
-        return;
-      }
-    }
-
     const envelope: PgBossJobEnvelope<T> = {
       version: 1,
       jobName,
@@ -144,15 +168,27 @@ export class PgBossDriver
     };
     const priority =
       options?.priority ?? MESSAGE_QUEUE_PRIORITY[queueName] ?? 0;
-
-    await this.boss.send(queueName, envelope, {
+    const sendOptions: PgBossSendOptions = {
       priority: -priority,
       retryLimit: options?.retryLimit ?? 0,
       ...(options?.delay === undefined
         ? {}
         : { startAfter: new Date(Date.now() + options.delay) }),
-      deleteAfterSeconds: QUEUE_RETENTION.completedMaxAge,
-    });
+      deleteAfterSeconds: QUEUE_RETENTION.failedMaxAge,
+    };
+
+    if (options?.id) {
+      await this.sendWaitingJobOnce(
+        queueName,
+        options.id,
+        envelope,
+        sendOptions,
+      );
+
+      return;
+    }
+
+    await this.boss.send(queueName, envelope, sendOptions);
   }
 
   async work<T extends MessageQueueJobData>(
@@ -259,6 +295,143 @@ export class PgBossDriver
     this.register(queueName);
     await this.onModuleInit();
     await this.ensureQueue(queueName);
+  }
+
+  private async sendWaitingJobOnce<T extends MessageQueueJobData>(
+    queueName: MessageQueue,
+    logicalId: string,
+    envelope: PgBossJobEnvelope<T>,
+    sendOptions: PgBossSendOptions,
+  ): Promise<void> {
+    const client = await this.coordinationPool.connect();
+
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+        [JSON.stringify([queueName, logicalId])],
+      );
+
+      const db = this.toPgBossDatabase(client);
+      const duplicates = await this.boss.findJobs(queueName, {
+        queued: true,
+        data: { logicalId },
+        db,
+      });
+
+      if (duplicates.length === 0) {
+        await this.boss.send(queueName, envelope, { ...sendOptions, db });
+      }
+
+      await client.query('COMMIT');
+    } catch (error) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        this.logger.error(
+          'Failed to roll back pg-boss logical-id transaction',
+          rollbackError,
+        );
+      }
+
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private toPgBossDatabase(client: PoolClient): PgBossDatabase {
+    return {
+      executeSql: async (text, values) => client.query(text, values),
+    };
+  }
+
+  private startRetentionCleanup(): void {
+    if (this.retentionCleanupTimer) {
+      return;
+    }
+
+    this.retentionCleanupTimer = setInterval(() => {
+      if (this.retentionCleanupPromise) {
+        return;
+      }
+
+      this.retentionCleanupPromise = this.cleanupTerminalJobs()
+        .catch((error) => {
+          this.logger.error('Failed to clean retained pg-boss jobs', error);
+        })
+        .finally(() => {
+          this.retentionCleanupPromise = undefined;
+        });
+    }, RETENTION_CLEANUP_INTERVAL_MS);
+    this.retentionCleanupTimer.unref?.();
+  }
+
+  private stopRetentionCleanup(): void {
+    if (!this.retentionCleanupTimer) {
+      return;
+    }
+
+    clearInterval(this.retentionCleanupTimer);
+    this.retentionCleanupTimer = undefined;
+  }
+
+  private async cleanupTerminalJobs(): Promise<void> {
+    await Promise.all(
+      [...this.registeredQueues].map(async (queueName) => {
+        const jobs = await this.boss.findJobs<PgBossJobEnvelope>(queueName);
+        const now = Date.now();
+        const expiredIds = new Set<string>();
+
+        for (const retention of [
+          {
+            state: 'completed' as const,
+            maxAgeSeconds: QUEUE_RETENTION.completedMaxAge,
+            maxCount: QUEUE_RETENTION.completedMaxCount,
+          },
+          {
+            state: 'failed' as const,
+            maxAgeSeconds: QUEUE_RETENTION.failedMaxAge,
+            maxCount: QUEUE_RETENTION.failedMaxCount,
+          },
+        ]) {
+          const terminalJobs = jobs
+            .filter((job) => this.toNeutralState(job.state) === retention.state)
+            .sort(
+              (left, right) =>
+                this.terminalTimestamp(right) - this.terminalTimestamp(left),
+            );
+
+          terminalJobs.forEach((job, index) => {
+            const ageMs = now - this.terminalTimestamp(job);
+
+            if (
+              ageMs > retention.maxAgeSeconds * 1_000 ||
+              index >= retention.maxCount
+            ) {
+              expiredIds.add(job.id);
+            }
+          });
+        }
+
+        await Promise.all(
+          [...expiredIds].map((jobId) => this.boss.deleteJob(queueName, jobId)),
+        );
+      }),
+    );
+  }
+
+  private terminalTimestamp(job: InspectablePgBossJob): number {
+    return (job.completedOn ?? job.createdOn).getTime();
+  }
+
+  private async closeCoordinationPool(): Promise<void> {
+    if (this.coordinationPoolClosed) {
+      return;
+    }
+
+    this.coordinationPoolClosed = true;
+    await this.coordinationPool.end();
   }
 
   private async ensureQueue(queueName: MessageQueue): Promise<void> {

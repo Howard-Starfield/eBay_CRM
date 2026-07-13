@@ -185,7 +185,7 @@
       "executor": "nx:run-commands",
       "options": {
         "cwd": "packages/twenty-server",
-        "command": "node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config jest-runtime-contract.config.mjs --runInBand"
+        "command": "node ../../node_modules/jest/bin/jest.js --config jest-runtime-contract.config.mjs --runInBand"
       }
     },
     "test:debug": {

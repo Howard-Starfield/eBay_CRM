@@ -1,3 +1,4 @@
+import { Pool } from 'pg';
 import { PgBoss } from 'pg-boss';
 
 import { type MetricsService } from 'src/engine/core-modules/metrics/metrics.service';
@@ -8,6 +9,9 @@ import { PgBossDriver, type PgBossDriverOptions } from './pg-boss.driver';
 
 jest.mock('pg-boss', () => ({
   PgBoss: jest.fn(),
+}));
+jest.mock('pg', () => ({
+  Pool: jest.fn(),
 }));
 
 type BossMock = {
@@ -20,6 +24,28 @@ type BossMock = {
   getQueueStats: jest.Mock;
   retry: jest.Mock;
   deleteJob: jest.Mock;
+};
+
+type RetentionJob = {
+  id: string;
+  state: 'completed' | 'failed';
+  createdOn: Date;
+  completedOn: Date;
+};
+
+type PoolClientMock = {
+  query: jest.Mock;
+  release: jest.Mock;
+};
+
+type PoolMock = {
+  connect: jest.Mock;
+  end: jest.Mock;
+};
+
+type PgBossDriverRetentionInternals = {
+  cleanupTerminalJobs(): Promise<void>;
+  retentionCleanupTimer?: ReturnType<typeof setInterval>;
 };
 
 const queueName = MessageQueue.aiQueue;
@@ -55,12 +81,28 @@ const twentyConfigService = {
 
 describe('PgBossDriver', () => {
   let boss: BossMock;
+  let pool: PoolMock;
+  let poolClient: PoolClientMock;
   let driver: PgBossDriver;
 
   beforeEach(() => {
+    jest.useRealTimers();
     boss = createBossMock();
+    poolClient = {
+      query: jest.fn().mockResolvedValue({ rows: [] }),
+      release: jest.fn(),
+    };
+    pool = {
+      connect: jest.fn().mockResolvedValue(poolClient),
+      end: jest.fn().mockResolvedValue(undefined),
+    };
     jest.mocked(PgBoss).mockImplementation(() => boss as never);
+    jest.mocked(Pool).mockImplementation(() => pool as never);
     driver = new PgBossDriver(options, metricsService, twentyConfigService);
+  });
+
+  afterEach(async () => {
+    await driver.onModuleDestroy();
   });
 
   it('uses the isolated schema and starts registered queues exactly once', async () => {
@@ -86,10 +128,14 @@ describe('PgBossDriver', () => {
       { id: 'buyer-message-1', priority: 2, retryLimit: 4 },
     );
 
-    expect(boss.findJobs).toHaveBeenCalledWith(queueName, {
-      queued: true,
-      data: { logicalId: 'buyer-message-1' },
-    });
+    expect(boss.findJobs).toHaveBeenCalledWith(
+      queueName,
+      expect.objectContaining({
+        queued: true,
+        data: { logicalId: 'buyer-message-1' },
+        db: expect.objectContaining({ executeSql: expect.any(Function) }),
+      }),
+    );
     expect(boss.createQueue).toHaveBeenCalledWith(queueName);
     expect(boss.send).toHaveBeenCalledWith(
       queueName,
@@ -99,8 +145,21 @@ describe('PgBossDriver', () => {
         logicalId: 'buyer-message-1',
         data: { messageId: 'message-1' },
       },
-      { priority: -2, retryLimit: 4, deleteAfterSeconds: 14_400 },
+      expect.objectContaining({
+        priority: -2,
+        retryLimit: 4,
+        deleteAfterSeconds: 604_800,
+        db: expect.objectContaining({ executeSql: expect.any(Function) }),
+      }),
     );
+    expect(poolClient.query).toHaveBeenNthCalledWith(1, 'BEGIN');
+    expect(poolClient.query).toHaveBeenNthCalledWith(
+      2,
+      'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+      [JSON.stringify([queueName, 'buyer-message-1'])],
+    );
+    expect(poolClient.query).toHaveBeenNthCalledWith(3, 'COMMIT');
+    expect(poolClient.release).toHaveBeenCalledTimes(1);
   });
 
   it('deduplicates only matching queued logical ids', async () => {
@@ -205,6 +264,53 @@ describe('PgBossDriver', () => {
     await driver.onModuleDestroy();
 
     expect(boss.stop).not.toHaveBeenCalled();
+    expect(pool.end).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not leak maintenance when destruction races initialization', async () => {
+    let releaseStart: () => void = () => undefined;
+    const startGate = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+
+    boss.start.mockImplementation(async () => {
+      await startGate;
+    });
+    driver.register(queueName);
+
+    const initialize = driver.onModuleInit();
+    const destroy = driver.onModuleDestroy();
+
+    releaseStart();
+    await Promise.all([initialize, destroy]);
+
+    expect(boss.stop).toHaveBeenCalledTimes(1);
+    expect(pool.end).toHaveBeenCalledTimes(1);
+    expect(
+      (
+        driver as unknown as {
+          retentionCleanupTimer?: ReturnType<typeof setInterval>;
+        }
+      ).retentionCleanupTimer,
+    ).toBeUndefined();
+  });
+
+  it('starts and stops the retention maintenance timer with the driver', async () => {
+    driver.register(queueName);
+
+    await driver.onModuleInit();
+
+    expect(
+      (driver as unknown as PgBossDriverRetentionInternals)
+        .retentionCleanupTimer,
+    ).toBeDefined();
+
+    await driver.onModuleDestroy();
+
+    expect(
+      (driver as unknown as PgBossDriverRetentionInternals)
+        .retentionCleanupTimer,
+    ).toBeUndefined();
   });
 
   it('maps pg-boss metadata into neutral records and inspection operations', async () => {
@@ -282,5 +388,65 @@ describe('PgBossDriver', () => {
       healthy: true,
     });
     expect(boss.getQueueStats).toHaveBeenCalledWith(queueName, { force: true });
+  });
+
+  it('retains failures for seven days while cleaning completed jobs after four hours', async () => {
+    const now = Date.now();
+    const terminalJob = (
+      id: string,
+      state: RetentionJob['state'],
+      ageMs: number,
+    ): RetentionJob => ({
+      id,
+      state,
+      createdOn: new Date(now - ageMs),
+      completedOn: new Date(now - ageMs),
+    });
+
+    boss.findJobs.mockResolvedValue([
+      terminalJob('completed-expired', 'completed', 4 * 60 * 60 * 1000 + 1),
+      terminalJob('failed-still-retained', 'failed', 4 * 60 * 60 * 1000 + 1),
+      terminalJob('failed-expired', 'failed', 7 * 24 * 60 * 60 * 1000 + 1),
+    ]);
+    driver.register(queueName);
+    await driver.onModuleInit();
+
+    await (
+      driver as unknown as PgBossDriverRetentionInternals
+    ).cleanupTerminalJobs();
+
+    expect(boss.deleteJob).toHaveBeenCalledTimes(2);
+    expect(boss.deleteJob).toHaveBeenCalledWith(queueName, 'completed-expired');
+    expect(boss.deleteJob).toHaveBeenCalledWith(queueName, 'failed-expired');
+    expect(boss.deleteJob).not.toHaveBeenCalledWith(
+      queueName,
+      'failed-still-retained',
+    );
+    await driver.onModuleDestroy();
+  });
+
+  it('caps completed and failed retention independently at one thousand jobs', async () => {
+    const now = Date.now();
+    const jobs: RetentionJob[] = ['completed', 'failed'].flatMap((state) =>
+      Array.from({ length: 1_001 }, (_, index) => ({
+        id: `${state}-${index}`,
+        state: state as RetentionJob['state'],
+        createdOn: new Date(now - index),
+        completedOn: new Date(now - index),
+      })),
+    );
+
+    boss.findJobs.mockResolvedValue(jobs);
+    driver.register(queueName);
+    await driver.onModuleInit();
+
+    await (
+      driver as unknown as PgBossDriverRetentionInternals
+    ).cleanupTerminalJobs();
+
+    expect(boss.deleteJob).toHaveBeenCalledTimes(2);
+    expect(boss.deleteJob).toHaveBeenCalledWith(queueName, 'completed-1000');
+    expect(boss.deleteJob).toHaveBeenCalledWith(queueName, 'failed-1000');
+    await driver.onModuleDestroy();
   });
 });

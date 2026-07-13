@@ -1,4 +1,6 @@
-import { type PgBoss } from 'pg-boss';
+import { randomUUID } from 'node:crypto';
+
+import { PgBoss } from 'pg-boss';
 
 import {
   PgBossDriver,
@@ -14,14 +16,10 @@ import { type TwentyConfigService } from 'src/engine/core-modules/twenty-config/
 
 type PgBossDriverInternals = {
   boss: PgBoss;
+  started: boolean;
 };
 
-const createHarness: CreateMessageQueueDriverTestHarness = async ({
-  queueName,
-  handler,
-  workerOptions,
-  shutdownDrainMs = 250,
-}) => {
+const runtimeContractConnectionString = (): string => {
   const connectionString =
     process.env.RUNTIME_CONTRACT_DATABASE_URL ?? process.env.PG_DATABASE_URL;
 
@@ -30,6 +28,93 @@ const createHarness: CreateMessageQueueDriverTestHarness = async ({
       'RUNTIME_CONTRACT_DATABASE_URL or PG_DATABASE_URL is required for the pg-boss runtime contract',
     );
   }
+
+  return connectionString;
+};
+
+const pgBossOptions = () => ({
+  connectionString: runtimeContractConnectionString(),
+  schema: 'desktop_runtime',
+  application_name: 'ebaycrm-runtime-contract-cleanup',
+});
+
+const deleteQueueContentsAndMetadata = async (
+  boss: PgBoss,
+  queueName: string,
+): Promise<void> => {
+  try {
+    await boss.deleteAllJobs(queueName);
+  } finally {
+    await boss.deleteQueue(queueName);
+  }
+};
+
+const deletePgBossQueue = async (queueName: string): Promise<void> => {
+  const boss = new PgBoss(pgBossOptions());
+
+  await boss.start();
+  try {
+    await deleteQueueContentsAndMetadata(boss, queueName);
+  } finally {
+    await boss.stop({ close: true, graceful: true });
+  }
+};
+
+const deleteRuntimeContractQueues = async (): Promise<void> => {
+  const boss = new PgBoss(pgBossOptions());
+
+  await boss.start();
+  try {
+    const queues = await boss.getQueues();
+
+    const results = await Promise.allSettled(
+      queues
+        .filter(({ name }) => name.startsWith('runtime-contract-'))
+        .map(({ name }) => deleteQueueContentsAndMetadata(boss, name)),
+    );
+    const failures = results
+      .filter((result) => result.status === 'rejected')
+      .map((result) => result.reason);
+
+    if (failures.length > 0) {
+      throw new Error(
+        `Failed to delete one or more runtime-contract pg-boss queues: ${failures.map(String).join('; ')}`,
+      );
+    }
+  } finally {
+    await boss.stop({ close: true, graceful: true });
+  }
+};
+
+const within = async <T>(
+  operation: Promise<T>,
+  label: string,
+  timeoutMs = 10_000,
+): Promise<T> => {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`${label} exceeded ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const createHarness: CreateMessageQueueDriverTestHarness = async ({
+  queueName,
+  handler,
+  workerOptions,
+  shutdownDrainMs = 250,
+}) => {
+  const connectionString = runtimeContractConnectionString();
 
   const driverOptions: PgBossDriverOptions = {
     connectionString,
@@ -90,9 +175,11 @@ const createHarness: CreateMessageQueueDriverTestHarness = async ({
       return;
     }
 
-    const boss = (driver as unknown as PgBossDriverInternals).boss;
+    const internals = driver as unknown as PgBossDriverInternals;
 
-    await boss.stop({ close: true, graceful: false, timeout: 1_000 });
+    await internals.boss.stop({ close: true, graceful: false, timeout: 1_000 });
+    internals.started = false;
+    await driver.onModuleDestroy();
     workerStarted = false;
     stopped = true;
   };
@@ -105,14 +192,8 @@ const createHarness: CreateMessageQueueDriverTestHarness = async ({
     start,
     stop,
     async clear() {
-      if (stopped) {
-        driver = await buildDriver();
-        stopped = false;
-      }
-
-      const boss = (driver as unknown as PgBossDriverInternals).boss;
-
-      await boss.deleteAllJobs(queueName);
+      await stop();
+      await deletePgBossQueue(queueName);
     },
     async waitFor(predicate, timeoutMs) {
       const deadline = Date.now() + timeoutMs;
@@ -141,6 +222,80 @@ const createHarness: CreateMessageQueueDriverTestHarness = async ({
 };
 
 if (process.env.RUNTIME_CONTRACT_DRIVER === 'pg-boss') {
+  beforeAll(async () => {
+    jest.useRealTimers();
+    await deleteRuntimeContractQueues();
+  });
+
+  afterAll(async () => {
+    await deleteRuntimeContractQueues();
+  });
+
+  describe('pg-boss adapter integration regressions', () => {
+    it('atomically deduplicates concurrent waiting jobs across driver instances', async () => {
+      const first = await createHarness({
+        queueName: `runtime-contract-concurrent-dedup-${randomUUID()}` as never,
+        handler: () => undefined,
+      });
+      const second = await createHarness({
+        queueName: first.queueName,
+        handler: () => undefined,
+      });
+
+      try {
+        await within(
+          Promise.all(
+            Array.from({ length: 20 }, (_, index) =>
+              (index % 2 === 0 ? first : second).driver.add(
+                first.queueName,
+                'concurrent-dedup',
+                { index },
+                { id: 'one-logical-job' },
+              ),
+            ),
+          ),
+          'concurrent add',
+        );
+
+        await expect(
+          within(
+            first.driver.findJobs(first.queueName, ['created']),
+            'dedup inspection',
+          ),
+        ).resolves.toHaveLength(1);
+      } finally {
+        const cleanupFailures: unknown[] = [];
+
+        try {
+          const stopResults = await within(
+            Promise.allSettled([first.stop(), second.stop()]),
+            'driver stop',
+          );
+
+          cleanupFailures.push(
+            ...stopResults
+              .filter((result) => result.status === 'rejected')
+              .map((result) => result.reason),
+          );
+        } catch (error) {
+          cleanupFailures.push(error);
+        }
+
+        try {
+          await within(first.clear(), 'first harness clear');
+        } catch (error) {
+          cleanupFailures.push(error);
+        }
+
+        if (cleanupFailures.length > 0) {
+          throw new Error(
+            `Failed to clean concurrent pg-boss contract harnesses: ${cleanupFailures.map(String).join('; ')}`,
+          );
+        }
+      }
+    });
+  });
+
   defineMessageQueueDriverContract('pg-boss', createHarness);
 } else {
   describe.skip('pg-boss message queue driver contract', () => {
