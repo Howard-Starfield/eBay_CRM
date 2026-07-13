@@ -18,6 +18,7 @@ import {
   type QueueJobOptions,
 } from 'src/engine/core-modules/message-queue/drivers/interfaces/job-options.interface';
 import { type MessageQueueDriver } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-driver.interface';
+import { PgBossIntervalScheduler } from 'src/engine/core-modules/message-queue/drivers/pg-boss-interval-scheduler';
 import { type MessageQueueJobRecord } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-job-record.type';
 import { type MessageQueueJobState } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-job-state.type';
 import { type MessageQueueStats } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-stats.type';
@@ -28,6 +29,7 @@ import {
 import { type MessageQueueWorkerOptions } from 'src/engine/core-modules/message-queue/interfaces/message-queue-worker-options.interface';
 import { MESSAGE_QUEUE_PRIORITY } from 'src/engine/core-modules/message-queue/message-queue-priority.constant';
 import { type MessageQueue } from 'src/engine/core-modules/message-queue/message-queue.constants';
+import { getJobKey } from 'src/engine/core-modules/message-queue/utils/get-job-key.util';
 import { type MetricsService } from 'src/engine/core-modules/metrics/metrics.service';
 import { type TwentyConfigService } from 'src/engine/core-modules/twenty-config/twenty-config.service';
 
@@ -35,12 +37,18 @@ export type PgBossDriverOptions = {
   connectionString: string;
   schema: 'desktop_runtime';
   applicationName: string;
+  intervalPollMs?: number;
 };
 
 type PgBossJobEnvelope<T extends MessageQueueJobData = MessageQueueJobData> = {
   version: 1;
   jobName: string;
   logicalId?: string;
+  cronScheduleKey?: string;
+  intervalOptions?: {
+    priority: number;
+    retryLimit: number;
+  };
   data: T;
 };
 
@@ -54,12 +62,18 @@ export class PgBossDriver
   private readonly logger = new Logger(PgBossDriver.name);
   private readonly boss: PgBoss;
   private readonly coordinationPool: Pool;
+  private readonly intervalScheduler: PgBossIntervalScheduler;
   private readonly registeredQueues = new Set<MessageQueue>();
   private readonly queueCreationPromises = new Map<
     MessageQueue,
     Promise<void>
   >();
+  private readonly workerOptions = new Map<
+    MessageQueue,
+    MessageQueueWorkerOptions
+  >();
   private startPromise?: Promise<void>;
+  private cronLimitInitializePromise?: Promise<void>;
   private stopPromise?: Promise<void>;
   private started = false;
   private boundedShutdownDrain = false;
@@ -77,10 +91,33 @@ export class PgBossDriver
       connectionString: options.connectionString,
       schema: options.schema,
       application_name: options.applicationName,
+      cronMonitorIntervalSeconds: 1,
+      cronWorkerIntervalSeconds: 1,
+      superviseIntervalSeconds: 1,
     });
     this.coordinationPool = new Pool({
       connectionString: options.connectionString,
       application_name: `${options.applicationName}-coordination`,
+    });
+    this.intervalScheduler = new PgBossIntervalScheduler({
+      pool: this.coordinationPool,
+      schema: options.schema,
+      ...(options.intervalPollMs === undefined
+        ? {}
+        : { pollIntervalMs: options.intervalPollMs }),
+      enqueue: async ({ queueName, payload }, database) => {
+        const { intervalOptions, ...envelope } = payload;
+
+        await this.boss.send(queueName, envelope, {
+          db: database,
+          priority: intervalOptions?.priority ?? 0,
+          retryLimit: intervalOptions?.retryLimit ?? 0,
+          deleteAfterSeconds: QUEUE_RETENTION.failedMaxAge,
+        });
+      },
+      onError: (error) => {
+        this.logger.error('Failed to enqueue due interval schedules', error);
+      },
     });
   }
 
@@ -97,6 +134,10 @@ export class PgBossDriver
       this.startPromise = (async () => {
         await this.boss.start();
         this.started = true;
+        await Promise.all([
+          this.intervalScheduler.start(),
+          this.initializeCronLimitTable(),
+        ]);
         await Promise.all(
           [...this.registeredQueues].map((queueName) =>
             this.ensureQueue(queueName),
@@ -121,6 +162,7 @@ export class PgBossDriver
     }
 
     this.stopRetentionCleanup();
+    await this.intervalScheduler.stop();
 
     if (this.retentionCleanupPromise) {
       await this.retentionCleanupPromise;
@@ -170,7 +212,10 @@ export class PgBossDriver
       options?.priority ?? MESSAGE_QUEUE_PRIORITY[queueName] ?? 0;
     const sendOptions: PgBossSendOptions = {
       priority: -priority,
-      retryLimit: options?.retryLimit ?? 0,
+      retryLimit:
+        options?.retryLimit ??
+        this.workerOptions.get(queueName)?.maxStalledCount ??
+        0,
       ...(options?.delay === undefined
         ? {}
         : { startAfter: new Date(Date.now() + options.delay) }),
@@ -198,6 +243,34 @@ export class PgBossDriver
   ): Promise<void> {
     await this.ensureStartedQueue(queueName);
     this.boundedShutdownDrain ||= options?.boundedShutdownDrain === true;
+    this.workerOptions.set(queueName, options ?? {});
+    const lockDurationSeconds =
+      options?.lockDuration === undefined
+        ? undefined
+        : Math.ceil(options.lockDuration / 1_000);
+
+    const queueRecoveryOptions = {
+      ...(lockDurationSeconds === undefined
+        ? {}
+        : {
+            // pg-boss expiration is second-granularity. Rounding upward avoids
+            // expiring a job earlier than Twenty's millisecond lock duration.
+            expireInSeconds: lockDurationSeconds,
+          }),
+      // pg-boss rejects heartbeat periods below ten seconds. Shorter Twenty
+      // locks therefore rely on expiration; longer locks also get renewal.
+      ...(lockDurationSeconds !== undefined && lockDurationSeconds >= 10
+        ? { heartbeatSeconds: lockDurationSeconds }
+        : {}),
+      ...(options?.maxStalledCount === undefined
+        ? {}
+        : { retryLimit: options.maxStalledCount }),
+    };
+
+    if (Object.keys(queueRecoveryOptions).length > 0) {
+      await this.boss.updateQueue(queueName, queueRecoveryOptions);
+      await this.boss.supervise(queueName);
+    }
 
     await this.boss.work<PgBossJobEnvelope<T>>(
       queueName,
@@ -205,6 +278,9 @@ export class PgBossDriver
         ...(options?.concurrency === undefined
           ? {}
           : { localConcurrency: options.concurrency }),
+        ...(lockDurationSeconds !== undefined && lockDurationSeconds >= 10
+          ? { heartbeatRefreshSeconds: lockDurationSeconds / 2 }
+          : {}),
       },
       async ([job]) => {
         if (!job) {
@@ -212,6 +288,13 @@ export class PgBossDriver
         }
 
         const envelope = this.readEnvelope(job.data);
+
+        if (
+          envelope.cronScheduleKey !== undefined &&
+          !(await this.claimCronRun(queueName, envelope.cronScheduleKey))
+        ) {
+          return;
+        }
 
         await handler({
           id: job.id,
@@ -223,26 +306,122 @@ export class PgBossDriver
     );
   }
 
-  async addCron<T extends MessageQueueJobData | undefined>(_input: {
+  async addCron<T extends MessageQueueJobData | undefined>({
+    queueName,
+    jobName,
+    data,
+    options,
+    jobId,
+  }: {
     queueName: MessageQueue;
     jobName: string;
     data: T;
     options: QueueCronJobOptions;
     jobId?: string;
   }): Promise<void> {
-    throw new Error(
-      'pg-boss recurring schedules are implemented in Phase 0 Task 6',
-    );
+    const { every, pattern, limit } = options.repeat;
+
+    if ((every === undefined) === (pattern === undefined)) {
+      throw new Error(
+        'Recurring jobs require exactly one of repeat.every or repeat.pattern',
+      );
+    }
+
+    if (limit !== undefined && (!Number.isInteger(limit) || limit <= 0)) {
+      throw new Error('Recurring job repeat.limit must be a positive integer');
+    }
+
+    await this.ensureStartedQueue(queueName);
+    const cronKey = getJobKey({ jobName, jobId });
+    const scheduleKey = this.persistedScheduleKey(queueName, cronKey);
+    const envelope: PgBossJobEnvelope = {
+      version: 1,
+      jobName,
+      data: data ?? {},
+    };
+
+    if (pattern !== undefined) {
+      const priority =
+        options.priority ?? MESSAGE_QUEUE_PRIORITY[queueName] ?? 0;
+
+      await this.intervalScheduler.remove(scheduleKey);
+
+      if (limit === undefined) {
+        await this.removeCronLimit(scheduleKey);
+      } else {
+        envelope.cronScheduleKey = scheduleKey;
+        await this.upsertCronLimit({
+          scheduleKey,
+          queueName,
+          cronKey,
+          remainingRuns: limit,
+          definition: {
+            pattern,
+            data: data ?? {},
+            priority,
+            retryLimit: options.retryLimit ?? 0,
+            limit,
+          },
+        });
+      }
+
+      await this.boss.schedule(queueName, pattern, envelope, {
+        key: cronKey,
+        priority: -priority,
+        retryLimit: options.retryLimit ?? 0,
+        deleteAfterSeconds: QUEUE_RETENTION.failedMaxAge,
+      });
+
+      return;
+    }
+
+    await Promise.all([
+      this.boss.unschedule(queueName, cronKey),
+      this.removeCronLimit(scheduleKey),
+    ]);
+
+    if (every === undefined) {
+      throw new Error('Interval schedule is missing repeat.every');
+    }
+
+    await this.intervalScheduler.upsert({
+      scheduleKey,
+      queueName,
+      jobName,
+      payload: {
+        ...envelope,
+        intervalOptions: {
+          priority: -(
+            options.priority ??
+            MESSAGE_QUEUE_PRIORITY[queueName] ??
+            0
+          ),
+          retryLimit: options.retryLimit ?? 0,
+        },
+      },
+      everyMs: every,
+      ...(limit === undefined ? {} : { remainingRuns: limit }),
+    });
   }
 
-  async removeCron(_input: {
+  async removeCron({
+    queueName,
+    jobName,
+    jobId,
+  }: {
     queueName: MessageQueue;
     jobName: string;
     jobId?: string;
   }): Promise<void> {
-    throw new Error(
-      'pg-boss recurring schedules are implemented in Phase 0 Task 6',
-    );
+    await this.ensureStartedQueue(queueName);
+    const cronKey = getJobKey({ jobName, jobId });
+    const scheduleKey = this.persistedScheduleKey(queueName, cronKey);
+
+    await Promise.all([
+      this.boss.unschedule(queueName, cronKey),
+      this.intervalScheduler.remove(scheduleKey),
+      this.removeCronLimit(scheduleKey),
+    ]);
   }
 
   async getStats(queueName: MessageQueue): Promise<MessageQueueStats> {
@@ -432,6 +611,123 @@ export class PgBossDriver
 
     this.coordinationPoolClosed = true;
     await this.coordinationPool.end();
+  }
+
+  private persistedScheduleKey(
+    queueName: MessageQueue,
+    cronKey: string,
+  ): string {
+    return `${queueName}:${cronKey}`;
+  }
+
+  private async initializeCronLimitTable(): Promise<void> {
+    if (!this.cronLimitInitializePromise) {
+      this.cronLimitInitializePromise = this.coordinationPool
+        .query(`
+          CREATE TABLE IF NOT EXISTS ${this.options.schema}.cron_schedule_limit (
+            schedule_key text PRIMARY KEY,
+            queue_name text NOT NULL,
+            cron_key text NOT NULL,
+            definition jsonb NOT NULL,
+            remaining_runs integer NOT NULL CHECK (remaining_runs >= 0),
+            updated_at timestamptz NOT NULL DEFAULT now()
+          )
+        `)
+        .then(() => undefined)
+        .catch((error) => {
+          this.cronLimitInitializePromise = undefined;
+          throw error;
+        });
+    }
+
+    await this.cronLimitInitializePromise;
+  }
+
+  private async upsertCronLimit(input: {
+    scheduleKey: string;
+    queueName: MessageQueue;
+    cronKey: string;
+    remainingRuns: number;
+    definition: MessageQueueJobData;
+  }): Promise<void> {
+    await this.initializeCronLimitTable();
+    await this.coordinationPool.query(
+      `
+        INSERT INTO ${this.options.schema}.cron_schedule_limit
+          (schedule_key, queue_name, cron_key, definition, remaining_runs)
+        VALUES ($1, $2, $3, $4::jsonb, $5)
+        ON CONFLICT (schedule_key) DO UPDATE SET
+          queue_name = EXCLUDED.queue_name,
+          cron_key = EXCLUDED.cron_key,
+          definition = EXCLUDED.definition,
+          remaining_runs = EXCLUDED.remaining_runs,
+          updated_at = now()
+        WHERE ${this.options.schema}.cron_schedule_limit.queue_name IS DISTINCT FROM EXCLUDED.queue_name
+           OR ${this.options.schema}.cron_schedule_limit.cron_key IS DISTINCT FROM EXCLUDED.cron_key
+           OR ${this.options.schema}.cron_schedule_limit.definition IS DISTINCT FROM EXCLUDED.definition
+      `,
+      [
+        input.scheduleKey,
+        input.queueName,
+        input.cronKey,
+        input.definition,
+        input.remainingRuns,
+      ],
+    );
+  }
+
+  private async removeCronLimit(scheduleKey: string): Promise<void> {
+    await this.initializeCronLimitTable();
+    await this.coordinationPool.query(
+      `DELETE FROM ${this.options.schema}.cron_schedule_limit WHERE schedule_key = $1`,
+      [scheduleKey],
+    );
+  }
+
+  private async claimCronRun(
+    queueName: MessageQueue,
+    scheduleKey: string,
+  ): Promise<boolean> {
+    const client = await this.coordinationPool.connect();
+    let remainingRuns: number | undefined;
+    let cronKey: string | undefined;
+
+    try {
+      await client.query('BEGIN');
+      const result = await client.query<{
+        remaining_runs: number;
+        cron_key: string;
+      }>(
+        `
+          UPDATE ${this.options.schema}.cron_schedule_limit
+          SET remaining_runs = remaining_runs - 1, updated_at = now()
+          WHERE schedule_key = $1
+            AND queue_name = $2
+            AND remaining_runs > 0
+          RETURNING remaining_runs, cron_key
+        `,
+        [scheduleKey, queueName],
+      );
+
+      remainingRuns = result.rows[0]?.remaining_runs;
+      cronKey = result.rows[0]?.cron_key;
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    if (remainingRuns === undefined) {
+      return false;
+    }
+
+    if (remainingRuns === 0 && cronKey !== undefined) {
+      await this.boss.unschedule(queueName, cronKey);
+    }
+
+    return true;
   }
 
   private async ensureQueue(queueName: MessageQueue): Promise<void> {

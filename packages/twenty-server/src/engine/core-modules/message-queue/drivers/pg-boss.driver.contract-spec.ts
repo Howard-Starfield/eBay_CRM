@@ -120,6 +120,7 @@ const createHarness: CreateMessageQueueDriverTestHarness = async ({
     connectionString,
     schema: 'desktop_runtime',
     applicationName: 'ebaycrm-runtime-contract',
+    intervalPollMs: 250,
   };
   const metricsService = {} as MetricsService;
   const twentyConfigService = {

@@ -24,6 +24,10 @@ type BossMock = {
   getQueueStats: jest.Mock;
   retry: jest.Mock;
   deleteJob: jest.Mock;
+  schedule: jest.Mock;
+  unschedule: jest.Mock;
+  updateQueue: jest.Mock;
+  supervise: jest.Mock;
 };
 
 type RetentionJob = {
@@ -40,6 +44,7 @@ type PoolClientMock = {
 
 type PoolMock = {
   connect: jest.Mock;
+  query: jest.Mock;
   end: jest.Mock;
 };
 
@@ -60,6 +65,10 @@ const createBossMock = (): BossMock => ({
   getQueueStats: jest.fn().mockResolvedValue([]),
   retry: jest.fn().mockResolvedValue({}),
   deleteJob: jest.fn().mockResolvedValue({}),
+  schedule: jest.fn().mockResolvedValue(undefined),
+  unschedule: jest.fn().mockResolvedValue(undefined),
+  updateQueue: jest.fn().mockResolvedValue(undefined),
+  supervise: jest.fn().mockResolvedValue(undefined),
 });
 
 const options: PgBossDriverOptions = {
@@ -94,6 +103,7 @@ describe('PgBossDriver', () => {
     };
     pool = {
       connect: jest.fn().mockResolvedValue(poolClient),
+      query: jest.fn().mockResolvedValue({ rows: [] }),
       end: jest.fn().mockResolvedValue(undefined),
     };
     jest.mocked(PgBoss).mockImplementation(() => boss as never);
@@ -114,6 +124,9 @@ describe('PgBossDriver', () => {
       connectionString: options.connectionString,
       schema: 'desktop_runtime',
       application_name: options.applicationName,
+      cronMonitorIntervalSeconds: 1,
+      cronWorkerIntervalSeconds: 1,
+      superviseIntervalSeconds: 1,
     });
     expect(boss.start).toHaveBeenCalledTimes(1);
     expect(boss.createQueue).toHaveBeenCalledTimes(1);
@@ -244,6 +257,256 @@ describe('PgBossDriver', () => {
       data: { messageId: 'message-1' },
       abortSignal: signal,
     });
+  });
+
+  it('upserts and removes a deterministic pg-boss cron schedule', async () => {
+    await driver.addCron({
+      queueName,
+      jobName: 'reply-to-buyer',
+      data: { version: 2 },
+      jobId: 'buyer-1',
+      options: {
+        priority: 2,
+        retryLimit: 3,
+        repeat: { pattern: '*/1 * * * * *' },
+      },
+    });
+
+    expect(boss.schedule).toHaveBeenCalledWith(
+      queueName,
+      '*/1 * * * * *',
+      {
+        version: 1,
+        jobName: 'reply-to-buyer',
+        data: { version: 2 },
+      },
+      expect.objectContaining({
+        key: 'reply-to-buyer.buyer-1',
+        priority: -2,
+        retryLimit: 3,
+      }),
+    );
+
+    await driver.removeCron({
+      queueName,
+      jobName: 'reply-to-buyer',
+      jobId: 'buyer-1',
+    });
+
+    expect(boss.unschedule).toHaveBeenCalledWith(
+      queueName,
+      'reply-to-buyer.buyer-1',
+    );
+    expect(pool.query).toHaveBeenCalledWith(
+      expect.stringContaining('DELETE FROM desktop_runtime.interval_schedule'),
+      [`${queueName}:reply-to-buyer.buyer-1`],
+    );
+  });
+
+  it('persists interval schedules and rejects ambiguous repeat definitions', async () => {
+    await driver.addCron({
+      queueName,
+      jobName: 'refresh-order',
+      data: { version: 1 },
+      jobId: 'order-1',
+      options: {
+        priority: 2,
+        retryLimit: 3,
+        repeat: { every: 250, limit: 2 },
+      },
+    });
+
+    expect(pool.query).toHaveBeenCalledWith(
+      expect.stringContaining('ON CONFLICT (schedule_key) DO UPDATE'),
+      [
+        `${queueName}:refresh-order.order-1`,
+        queueName,
+        'refresh-order',
+        {
+          version: 1,
+          jobName: 'refresh-order',
+          data: { version: 1 },
+          intervalOptions: {
+            priority: -2,
+            retryLimit: 3,
+          },
+        },
+        250,
+        2,
+      ],
+    );
+
+    await expect(
+      driver.addCron({
+        queueName,
+        jobName: 'invalid-repeat',
+        data: {},
+        options: {
+          repeat: { every: 250, pattern: '*/1 * * * * *' },
+        },
+      }),
+    ).rejects.toThrow('exactly one of repeat.every or repeat.pattern');
+  });
+
+  it('persists and enforces a cron run limit without resetting an identical upsert', async () => {
+    await driver.addCron({
+      queueName,
+      jobName: 'limited-cron',
+      data: { version: 1 },
+      jobId: 'buyer-1',
+      options: {
+        repeat: { pattern: '*/1 * * * * *', limit: 2 },
+      },
+    });
+    await driver.addCron({
+      queueName,
+      jobName: 'limited-cron',
+      data: { version: 1 },
+      jobId: 'buyer-1',
+      options: {
+        repeat: { pattern: '*/1 * * * * *', limit: 2 },
+      },
+    });
+
+    const persistedScheduleKey = `${queueName}:limited-cron.buyer-1`;
+
+    expect(pool.query).toHaveBeenCalledWith(
+      expect.stringContaining('ON CONFLICT (schedule_key) DO UPDATE'),
+      expect.arrayContaining([persistedScheduleKey, queueName, 2]),
+    );
+    expect(boss.schedule).toHaveBeenLastCalledWith(
+      queueName,
+      '*/1 * * * * *',
+      expect.objectContaining({
+        cronScheduleKey: persistedScheduleKey,
+      }),
+      expect.objectContaining({ key: 'limited-cron.buyer-1' }),
+    );
+
+    let remaining = 2;
+    poolClient.query.mockImplementation(async (sql: string) => {
+      if (sql.includes('UPDATE desktop_runtime.cron_schedule_limit')) {
+        if (remaining === 0) {
+          return { rows: [] };
+        }
+
+        remaining -= 1;
+
+        return {
+          rows: [
+            {
+              remaining_runs: remaining,
+              cron_key: 'limited-cron.buyer-1',
+            },
+          ],
+        };
+      }
+
+      return { rows: [] };
+    });
+    const handler = jest.fn().mockResolvedValue(undefined);
+
+    await driver.work(queueName, handler);
+    const workHandler = boss.work.mock.calls[
+      boss.work.mock.calls.length - 1
+    ][2] as (
+      jobs: Array<{
+        id: string;
+        signal: AbortSignal;
+        data: {
+          version: 1;
+          jobName: string;
+          cronScheduleKey: string;
+          data: { version: number };
+        };
+      }>,
+    ) => Promise<void>;
+    const job = {
+      id: 'cron-job-id',
+      signal: new AbortController().signal,
+      data: {
+        version: 1 as const,
+        jobName: 'limited-cron',
+        cronScheduleKey: persistedScheduleKey,
+        data: { version: 1 },
+      },
+    };
+
+    await workHandler([job]);
+    await workHandler([{ ...job, id: 'cron-job-id-2' }]);
+    await workHandler([{ ...job, id: 'cron-job-id-3' }]);
+
+    expect(handler).toHaveBeenCalledTimes(2);
+    expect(boss.unschedule).toHaveBeenCalledWith(
+      queueName,
+      'limited-cron.buyer-1',
+    );
+  });
+
+  it('removes the prior recurring mechanism when changing schedule type', async () => {
+    await driver.addCron({
+      queueName,
+      jobName: 'switching-schedule',
+      data: {},
+      jobId: 'one',
+      options: { repeat: { every: 500 } },
+    });
+
+    expect(boss.unschedule).toHaveBeenCalledWith(
+      queueName,
+      'switching-schedule.one',
+    );
+
+    await driver.addCron({
+      queueName,
+      jobName: 'switching-schedule',
+      data: {},
+      jobId: 'one',
+      options: { repeat: { pattern: '*/1 * * * * *' } },
+    });
+
+    expect(pool.query).toHaveBeenCalledWith(
+      expect.stringContaining('DELETE FROM desktop_runtime.interval_schedule'),
+      [`${queueName}:switching-schedule.one`],
+    );
+  });
+
+  it('maps lock duration and stalled count to pg-boss queue recovery options', async () => {
+    await driver.work(queueName, jest.fn(), {
+      lockDuration: 500,
+      maxStalledCount: 2,
+    });
+
+    expect(boss.updateQueue).toHaveBeenCalledWith(queueName, {
+      expireInSeconds: 1,
+      retryLimit: 2,
+    });
+
+    await driver.add(queueName, 'recoverable-job', {});
+
+    expect(boss.send).toHaveBeenCalledWith(
+      queueName,
+      expect.any(Object),
+      expect.objectContaining({ retryLimit: 2 }),
+    );
+  });
+
+  it('enables pg-boss heartbeats when the rounded lock duration meets its ten-second minimum', async () => {
+    await driver.work(queueName, jest.fn(), {
+      lockDuration: 10_100,
+      maxStalledCount: 1,
+    });
+
+    expect(boss.updateQueue).toHaveBeenCalledWith(queueName, {
+      expireInSeconds: 11,
+      heartbeatSeconds: 11,
+      retryLimit: 1,
+    });
+    expect(boss.work).toHaveBeenCalledWith(
+      queueName,
+      expect.objectContaining({ heartbeatRefreshSeconds: 5.5 }),
+      expect.any(Function),
+    );
   });
 
   it('uses the configured graceful timeout when any worker requires bounded drain', async () => {
