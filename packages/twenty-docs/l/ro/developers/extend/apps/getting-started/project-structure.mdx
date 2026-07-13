@@ -1,0 +1,78 @@
+---
+title: Structura proiectului
+description: Ce conține o aplicație Twenty generată — fișiere, foldere și ce face fiecare.
+icon: folder-tree
+---
+
+O aplicație nouă generată de `npx create-twenty-app` arată astfel:
+
+```text filename="my-twenty-app/"
+my-twenty-app/
+  package.json
+  src/
+    application-config.ts                   # Required — your app's entry point
+    default-role.ts                         # Permissions for logic functions
+    constants/
+      universal-identifiers.ts              # Auto-generated UUIDs and metadata
+    front-components/
+      main-page.tsx                         # Welcome page component
+    navigation-menu-items/
+      main-page.navigation-menu-item.ts     # Sidebar entry for the welcome page
+    page-layouts/
+      main-page.page-layout.ts              # Standalone page hosting the component
+    __tests__/
+      application-config.test.ts            # Unit test
+      global-setup.ts                       # Integration test setup (sync + uninstall)
+      schema.integration-test.ts            # Integration test against a live server
+  .github/workflows/
+    ci.yml                                  # Lint, typecheck, unit + integration tests
+    cd.yml                                  # Deploy + install on push to main
+  public/
+    logo.svg                                # Static assets
+  vitest.config.ts                          # Integration test runner config
+  vitest.unit.config.ts                     # Unit test runner config
+  tsconfig.json, tsconfig.spec.json
+  .nvmrc, .yarnrc.yml, .oxlintrc.json
+  README.md, AGENTS.md, CLAUDE.md, CHANGELOG.md, SETUP.md
+```
+
+## Fișiere cheie
+
+| Fișier / Folder                                                            | Scop                                                                                                                            |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `src/application-config.ts`                                                | **Necesar.** Fișierul principal de configurare pentru aplicație.                                                                |
+| `src/default-role.ts`                                                      | Rol implicit care controlează la ce pot avea acces funcțiile logice.                                                            |
+| `src/constants/universal-identifiers.ts`                                   | UUID-uri generate automat și metadate (nume afișat, descriere).                                                                 |
+| `src/front-components/`, `src/navigation-menu-items/`, `src/page-layouts/` | O pagină de bun venit inițială: o componentă de interfață randată de un layout de pagină autonom, accesibilă din bara laterală. |
+| `src/__tests__/`                                                           | Un test unitar plus un test de integrare (cu configurarea sa globală) care sincronizează aplicația cu un server real.           |
+| `public/`                                                                  | Resurse statice (imagini, fonturi) servite împreună cu aplicația.                                                               |
+| `AGENTS.md` / `CLAUDE.md`                                                  | Ghid pentru agenții AI de programare care lucrează la aplicație.                                                                |
+| `CHANGELOG.md` / `SETUP.md`                                                | Jurnal de modificări notabile și instrucțiuni de configurare pentru dezvoltare locală.                                          |
+
+<Note>
+**Organizarea fișierelor ține de dvs.** Folderele de mai sus sunt convenții — SDK-ul detectează entitățile prin analiză AST pe apelurile `export default defineEntity(...)`, indiferent unde se află fișierul.
+</Note>
+
+## Dependențe
+
+Ambele pachete Twenty SDK trebuie plasate sub `devDependencies`, nu sub `dependencies`:
+
+```json filename="package.json"
+{
+  "dependencies": {},
+  "devDependencies": {
+    "twenty-client-sdk": "2.20.0",
+    "twenty-sdk": "2.20.0",
+    "twenty-ui": "1.0.0-alpha.1"
+  }
+}
+```
+
+Generatorul de schelete fixează versiunile `twenty-sdk` și `twenty-client-sdk` la propria sa versiune — păstrează-le sincronizate când faci upgrade.
+
+* **`twenty-sdk`** livrează CLI-ul `twenty` și uneltele de build/scaffolding. Acesta rulează doar în timpul dezvoltării și al build-ului și nu este niciodată importat de runtime-ul aplicației tale publicate.
+* **`twenty-client-sdk`** este importat de codul aplicației tale (`CoreApiClient`, `MetadataApiClient`, `RestApiClient`), dar Twenty îl furnizează la runtime — funcțiile de logică îl obțin dintr-un strat SDK generat, iar componentele de interfață îl rezolvă din module livrate de server. Copia instalată local este folosită doar pentru verificarea tipurilor și pentru build-ul la momentul de deploy, astfel că nu trebuie niciodată inclusă în bundle-ul livrat.
+
+Păstrarea oricărui pachet sub `dependencies` îl include în bundle-ul de runtime al aplicației instalate, unde reprezintă o încărcătură inutilă. `twenty dev:build` emite un avertisment atunci când oricare dintre ele este încă listat sub `dependencies`.
+
+Adaugă dependențele de runtime proprii ale aplicației tale (bibliotecile pe care funcțiile tale de logică chiar le importă la runtime) sub `dependencies`, ca de obicei.
