@@ -60,7 +60,9 @@ export class BullMQDriver
   private workerOptionsMap: Partial<
     Record<MessageQueue, MessageQueueWorkerOptions>
   > = {};
-  private queueReadinessMap: Partial<Record<MessageQueue, Promise<void>>> = {};
+  private queueStatsInspectionMap: Partial<
+    Record<MessageQueue, Promise<MessageQueueJobRecord[]>>
+  > = {};
 
   constructor(
     private options: BullMQDriverOptions,
@@ -147,6 +149,12 @@ export class BullMQDriver
       this.logger.error(
         `Failed to close queues during shutdown: ${error instanceof Error ? error.message : String(error)}`,
       );
+    } finally {
+      for (const inspection of Object.values(this.queueStatsInspectionMap)) {
+        void inspection.catch(() => undefined);
+      }
+
+      this.queueStatsInspectionMap = {};
     }
 
     if (isDefined(workerCloseError)) {
@@ -423,47 +431,42 @@ export class BullMQDriver
     queueName: MessageQueue,
     queue: Queue,
   ): Promise<MessageQueueJobRecord[]> {
-    const existingReadiness = this.queueReadinessMap[queueName];
-    const readiness =
-      existingReadiness ??
-      queue
+    const existingInspection = this.queueStatsInspectionMap[queueName];
+    let inspection = existingInspection;
+
+    if (!isDefined(inspection)) {
+      const pendingInspection = queue
         .waitUntilReady()
-        .then(() => undefined)
-        .finally(() => {
-          delete this.queueReadinessMap[queueName];
-        });
+        .then(() =>
+          this.findJobs(queueName, [
+            'created',
+            'active',
+            'completed',
+            'failed',
+            'retry',
+          ]),
+        );
+      const trackedInspection = pendingInspection.finally(() => {
+        if (this.queueStatsInspectionMap[queueName] === trackedInspection) {
+          delete this.queueStatsInspectionMap[queueName];
+        }
+      });
 
-    this.queueReadinessMap[queueName] = readiness;
-
-    const inspection = readiness.then(() =>
-      this.findJobs(queueName, [
-        'created',
-        'active',
-        'completed',
-        'failed',
-        'retry',
-      ]),
-    );
+      inspection = trackedInspection;
+      this.queueStatsInspectionMap[queueName] = trackedInspection;
+    }
 
     let timeout: ReturnType<typeof setTimeout> | undefined;
-    let didTimeOut = false;
 
     try {
       return await Promise.race([
         inspection,
         new Promise<never>((_resolve, reject) => {
           timeout = setTimeout(() => {
-            didTimeOut = true;
             reject(new Error('Queue stats inspection timed out'));
           }, QUEUE_STATS_TIMEOUT_MS);
         }),
       ]);
-    } catch (error) {
-      if (didTimeOut) {
-        void inspection.catch(() => undefined);
-      }
-
-      throw error;
     } finally {
       clearTimeout(timeout);
     }
