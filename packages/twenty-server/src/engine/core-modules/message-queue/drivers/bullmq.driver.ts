@@ -43,6 +43,7 @@ import { type TwentyConfigService } from 'src/engine/core-modules/twenty-config/
 export type BullMQDriverOptions = QueueOptions;
 
 const V4_LENGTH = 36;
+const QUEUE_STATS_TIMEOUT_MS = 1_000;
 
 export class BullMQDriver
   implements MessageQueueDriver, OnModuleDestroy, OnModuleInit
@@ -59,6 +60,7 @@ export class BullMQDriver
   private workerOptionsMap: Partial<
     Record<MessageQueue, MessageQueueWorkerOptions>
   > = {};
+  private queueReadinessMap: Partial<Record<MessageQueue, Promise<void>>> = {};
 
   constructor(
     private options: BullMQDriverOptions,
@@ -396,21 +398,6 @@ export class BullMQDriver
 
   async getStats(queueName: MessageQueue): Promise<MessageQueueStats> {
     const queue = this.getQueue(queueName);
-    let healthy = true;
-
-    try {
-      await queue.waitUntilReady();
-    } catch {
-      healthy = false;
-    }
-
-    const jobs = await this.findJobs(queueName, [
-      'created',
-      'active',
-      'completed',
-      'failed',
-      'retry',
-    ]);
     const counts: Omit<MessageQueueStats, 'queueName' | 'healthy'> = {
       created: 0,
       active: 0,
@@ -419,11 +406,58 @@ export class BullMQDriver
       retry: 0,
     };
 
-    for (const job of jobs) {
-      counts[job.state] += 1;
+    try {
+      await this.waitForQueueReadiness(queueName, queue);
+
+      const jobs = await this.findJobs(queueName, [
+        'created',
+        'active',
+        'completed',
+        'failed',
+        'retry',
+      ]);
+
+      for (const job of jobs) {
+        counts[job.state] += 1;
+      }
+    } catch {
+      return { queueName, healthy: false, ...counts };
     }
 
-    return { queueName, healthy, ...counts };
+    return { queueName, healthy: true, ...counts };
+  }
+
+  private async waitForQueueReadiness(
+    queueName: MessageQueue,
+    queue: Queue,
+  ): Promise<void> {
+    const existingReadiness = this.queueReadinessMap[queueName];
+    const readiness =
+      existingReadiness ??
+      queue
+        .waitUntilReady()
+        .then(() => undefined)
+        .finally(() => {
+          delete this.queueReadinessMap[queueName];
+        });
+
+    this.queueReadinessMap[queueName] = readiness;
+
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      await Promise.race([
+        readiness,
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error('Queue readiness timed out')),
+            QUEUE_STATS_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   async findJobs(

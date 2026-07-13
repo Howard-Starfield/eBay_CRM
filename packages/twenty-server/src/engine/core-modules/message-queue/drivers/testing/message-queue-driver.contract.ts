@@ -222,7 +222,6 @@ export const defineMessageQueueDriverContract = (
         received.push({ name: job.name, version: job.data.version });
       });
 
-      await harness.start();
       await harness.driver.addCron({
         queueName: harness.queueName,
         jobName: 'cron-pattern',
@@ -237,6 +236,7 @@ export const defineMessageQueueDriverContract = (
         jobId: 'cron-pattern-id',
         options: { repeat: { pattern: '*/1 * * * * *' } },
       });
+      await harness.start();
       await harness.waitFor(() => received.length >= 1, WAIT_TIMEOUT_MS);
       expect(received.every(({ version }) => version === 2)).toBe(true);
 
@@ -283,19 +283,20 @@ export const defineMessageQueueDriverContract = (
         jobName: 'interval',
         data: { version: 2 },
         jobId: 'interval-id',
-        options: { repeat: { every: 200, limit: 1 } },
+        options: { repeat: { every: 500, limit: 3 } },
       });
       await harness.waitFor(
         () => receivedVersions.length === 3,
         WAIT_TIMEOUT_MS,
       );
-      await new Promise((resolve) => setTimeout(resolve, 350));
       expect(receivedVersions).toEqual([1, 1, 2]);
       await harness.driver.removeCron({
         queueName: harness.queueName,
         jobName: 'interval',
         jobId: 'interval-id',
       });
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      expect(receivedVersions).toEqual([1, 1, 2]);
     });
 
     it('reclaims a non-acknowledged job after a worker is killed and restarted', async () => {
