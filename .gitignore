@@ -63,3 +63,6 @@ screenshots/
 
 # Local agent orchestration state
 .superpowers/
+
+# Local isolated implementation worktrees
+.worktrees/
