@@ -1,0 +1,24 @@
+{
+  "baselineDirectImports": [
+    "packages/twenty-server/src/engine/core-modules/admin-panel/__tests__/admin-panel-health.service.spec.ts",
+    "packages/twenty-server/src/engine/core-modules/admin-panel/__tests__/redis.health.spec.ts",
+    "packages/twenty-server/src/engine/core-modules/admin-panel/__tests__/worker.health.spec.ts",
+    "packages/twenty-server/src/engine/core-modules/admin-panel/admin-panel-health.service.ts",
+    "packages/twenty-server/src/engine/core-modules/admin-panel/admin-panel-queue.service.ts",
+    "packages/twenty-server/src/engine/core-modules/admin-panel/indicators/worker.health.ts",
+    "packages/twenty-server/src/engine/core-modules/cache-storage/cache-storage.module-factory.ts",
+    "packages/twenty-server/src/engine/core-modules/cache-storage/services/cache-storage.service.ts",
+    "packages/twenty-server/src/engine/core-modules/message-queue/drivers/bullmq.driver.ts",
+    "packages/twenty-server/src/engine/core-modules/redis-client/redis-client.service.ts",
+    "packages/twenty-server/src/engine/core-modules/session-storage/session-storage.module-factory.ts",
+    "packages/twenty-server/src/engine/metadata-modules/ai/ai-chat/services/agent-chat-cancel-subscriber.service.ts"
+  ],
+  "adapterPathPrefixes": [
+    "packages/twenty-server/src/engine/core-modules/message-queue/drivers/",
+    "packages/twenty-server/src/engine/core-modules/redis-client/",
+    "packages/twenty-server/src/engine/core-modules/cache-storage/drivers/",
+    "packages/twenty-server/src/engine/core-modules/session-storage/drivers/",
+    "packages/twenty-server/src/engine/subscriptions/drivers/"
+  ],
+  "sourcePathPrefixes": ["packages/twenty-server/src/"]
+}
