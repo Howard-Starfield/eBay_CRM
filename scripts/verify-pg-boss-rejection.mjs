@@ -55,8 +55,10 @@ const fail = (message) => {
 };
 
 export const verifyPgBossRejectionReport = (report) => {
-  if (report.wasInterrupted) {
-    fail('The pg-boss contract run was interrupted.');
+  if (report.wasInterrupted !== false) {
+    fail(
+      'Expected wasInterrupted=false; the pg-boss contract run was interrupted or the field is missing.',
+    );
   }
 
   if (report.numRuntimeErrorTestSuites !== 0) {

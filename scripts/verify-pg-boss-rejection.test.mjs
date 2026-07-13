@@ -125,3 +125,14 @@ test('rejects interrupted, runtime-error, or incomplete runs', () => {
     /rejection report counts changed/,
   );
 });
+
+test('rejects a report that omits wasInterrupted', () => {
+  const report = createValidReport();
+
+  delete report.wasInterrupted;
+
+  assert.throws(
+    () => verifyPgBossRejectionReport(report),
+    /wasInterrupted=false/,
+  );
+});
