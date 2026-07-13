@@ -295,6 +295,148 @@ if (process.env.RUNTIME_CONTRACT_DRIVER === 'pg-boss') {
         }
       }
     });
+
+    it('persists stalled recovery policy across separate producer and worker drivers', async () => {
+      let entries = 0;
+      let releaseFirst: () => void = () => undefined;
+      const firstAttempt = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const worker = await createHarness({
+        queueName:
+          `runtime-contract-cross-process-recovery-${randomUUID()}` as never,
+        handler: async () => {
+          entries += 1;
+          if (entries === 1) {
+            await firstAttempt;
+          }
+        },
+        workerOptions: { lockDuration: 500, maxStalledCount: 2 },
+      });
+      const producer = await createHarness({
+        queueName: worker.queueName,
+        handler: () => undefined,
+      });
+
+      try {
+        await worker.start();
+        await producer.driver.add(worker.queueName, 'cross-process', {});
+        await worker.waitFor(() => entries === 1, 15_000);
+        await worker.restartWorker();
+        await worker.waitFor(() => entries === 2, 45_000);
+        releaseFirst();
+      } finally {
+        releaseFirst();
+        await Promise.allSettled([worker.stop(), producer.stop()]);
+        await worker.clear();
+      }
+    });
+
+    it('does not abort a healthy handler after one Bull-style lock period', async () => {
+      let calls = 0;
+      let prematurelyAborted = false;
+      const harness = await createHarness({
+        queueName:
+          `runtime-contract-healthy-long-handler-${randomUUID()}` as never,
+        handler: async ({ abortSignal }) => {
+          calls += 1;
+          let completedNaturally = false;
+          abortSignal?.addEventListener('abort', () => {
+            if (!completedNaturally) {
+              prematurelyAborted = true;
+            }
+          });
+          await new Promise((resolve) => setTimeout(resolve, 1_500));
+          completedNaturally = true;
+        },
+        workerOptions: { lockDuration: 500, maxStalledCount: 2 },
+      });
+
+      try {
+        await harness.start();
+        await harness.driver.add(harness.queueName, 'healthy-long', {});
+        await harness.waitFor(async () => {
+          return (
+            (await harness.driver.findJobs(harness.queueName, ['completed']))
+              .length === 1
+          );
+        }, 15_000);
+        expect(calls).toBe(1);
+        expect(prematurelyAborted).toBe(false);
+      } finally {
+        await harness.clear();
+      }
+    });
+
+    it('preserves second-level cron cadence across consecutive occurrences', async () => {
+      let calls = 0;
+      const harness = await createHarness({
+        queueName: `runtime-contract-cron-cadence-${randomUUID()}` as never,
+        handler: () => {
+          calls += 1;
+        },
+      });
+
+      try {
+        await harness.start();
+        await harness.driver.addCron({
+          queueName: harness.queueName,
+          jobName: 'second-level-cron',
+          data: {},
+          jobId: 'cadence',
+          options: { repeat: { pattern: '*/1 * * * * *' } },
+        });
+        await harness.waitFor(() => calls >= 2, 8_000);
+      } finally {
+        await harness.driver.removeCron({
+          queueName: harness.queueName,
+          jobName: 'second-level-cron',
+          jobId: 'cadence',
+        });
+        await harness.clear();
+      }
+    });
+
+    it('consumes a cron limit per occurrence without suppressing its retry', async () => {
+      let calls = 0;
+      const harness = await createHarness({
+        queueName: `runtime-contract-cron-limit-retry-${randomUUID()}` as never,
+        handler: () => {
+          calls += 1;
+          throw new Error('expected contract failure');
+        },
+      });
+
+      try {
+        await harness.start();
+        await harness.driver.addCron({
+          queueName: harness.queueName,
+          jobName: 'limited-retrying-cron',
+          data: {},
+          jobId: 'one-occurrence',
+          options: {
+            retryLimit: 1,
+            repeat: { pattern: '*/1 * * * * *', limit: 1 },
+          },
+        });
+        await harness.waitFor(() => calls === 2, 10_000);
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        expect(calls).toBe(2);
+        await expect(
+          harness.driver.findJobs(harness.queueName, ['failed']),
+        ).resolves.toHaveLength(1);
+        await expect(
+          harness.driver.findJobs(harness.queueName, ['completed']),
+        ).resolves.toHaveLength(0);
+      } finally {
+        await harness.driver.removeCron({
+          queueName: harness.queueName,
+          jobName: 'limited-retrying-cron',
+          jobId: 'one-occurrence',
+        });
+        await harness.clear();
+      }
+    });
   });
 
   defineMessageQueueDriverContract('pg-boss', createHarness);

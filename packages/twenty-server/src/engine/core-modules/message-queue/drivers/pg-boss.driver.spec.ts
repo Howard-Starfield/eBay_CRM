@@ -124,13 +124,20 @@ describe('PgBossDriver', () => {
       connectionString: options.connectionString,
       schema: 'desktop_runtime',
       application_name: options.applicationName,
-      cronMonitorIntervalSeconds: 1,
-      cronWorkerIntervalSeconds: 1,
       superviseIntervalSeconds: 1,
+    });
+    expect(Pool).toHaveBeenCalledWith({
+      connectionString: options.connectionString,
+      application_name: `${options.applicationName}-coordination`,
+      connectionTimeoutMillis: 1_000,
+      query_timeout: 1_000,
+      statement_timeout: 1_000,
     });
     expect(boss.start).toHaveBeenCalledTimes(1);
     expect(boss.createQueue).toHaveBeenCalledTimes(1);
-    expect(boss.createQueue).toHaveBeenCalledWith(queueName);
+    expect(boss.createQueue).toHaveBeenCalledWith(queueName, {
+      retryLimit: 0,
+    });
   });
 
   it('maps logical id, lower numeric priority, and exact retry count into a versioned envelope', async () => {
@@ -149,7 +156,9 @@ describe('PgBossDriver', () => {
         db: expect.objectContaining({ executeSql: expect.any(Function) }),
       }),
     );
-    expect(boss.createQueue).toHaveBeenCalledWith(queueName);
+    expect(boss.createQueue).toHaveBeenCalledWith(queueName, {
+      retryLimit: 0,
+    });
     expect(boss.send).toHaveBeenCalledWith(
       queueName,
       {
@@ -272,20 +281,28 @@ describe('PgBossDriver', () => {
       },
     });
 
-    expect(boss.schedule).toHaveBeenCalledWith(
+    expect(boss.unschedule).toHaveBeenCalledWith(
       queueName,
-      '*/1 * * * * *',
-      {
-        version: 1,
-        jobName: 'reply-to-buyer',
-        data: { version: 2 },
-      },
-      expect.objectContaining({
-        key: 'reply-to-buyer.buyer-1',
-        priority: -2,
-        retryLimit: 3,
-      }),
+      'reply-to-buyer.buyer-1',
     );
+    expect(pool.query).toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO desktop_runtime.cron_schedule'),
+      [
+        `${queueName}:reply-to-buyer.buyer-1`,
+        queueName,
+        'reply-to-buyer',
+        {
+          version: 1,
+          jobName: 'reply-to-buyer',
+          data: { version: 2 },
+          intervalOptions: { priority: -2, retryLimit: 3 },
+        },
+        '*/1 * * * * *',
+        null,
+        expect.any(Date),
+      ],
+    );
+    expect(boss.schedule).not.toHaveBeenCalled();
 
     await driver.removeCron({
       queueName,
@@ -299,6 +316,10 @@ describe('PgBossDriver', () => {
     );
     expect(pool.query).toHaveBeenCalledWith(
       expect.stringContaining('DELETE FROM desktop_runtime.interval_schedule'),
+      [`${queueName}:reply-to-buyer.buyer-1`],
+    );
+    expect(pool.query).toHaveBeenCalledWith(
+      expect.stringContaining('DELETE FROM desktop_runtime.cron_schedule'),
       [`${queueName}:reply-to-buyer.buyer-1`],
     );
   });
@@ -348,7 +369,7 @@ describe('PgBossDriver', () => {
     ).rejects.toThrow('exactly one of repeat.every or repeat.pattern');
   });
 
-  it('persists and enforces a cron run limit without resetting an identical upsert', async () => {
+  it('persists a cron occurrence limit for enqueue-time consumption', async () => {
     await driver.addCron({
       queueName,
       jobName: 'limited-cron',
@@ -371,72 +392,10 @@ describe('PgBossDriver', () => {
     const persistedScheduleKey = `${queueName}:limited-cron.buyer-1`;
 
     expect(pool.query).toHaveBeenCalledWith(
-      expect.stringContaining('ON CONFLICT (schedule_key) DO UPDATE'),
+      expect.stringContaining('INSERT INTO desktop_runtime.cron_schedule'),
       expect.arrayContaining([persistedScheduleKey, queueName, 2]),
     );
-    expect(boss.schedule).toHaveBeenLastCalledWith(
-      queueName,
-      '*/1 * * * * *',
-      expect.objectContaining({
-        cronScheduleKey: persistedScheduleKey,
-      }),
-      expect.objectContaining({ key: 'limited-cron.buyer-1' }),
-    );
-
-    let remaining = 2;
-    poolClient.query.mockImplementation(async (sql: string) => {
-      if (sql.includes('UPDATE desktop_runtime.cron_schedule_limit')) {
-        if (remaining === 0) {
-          return { rows: [] };
-        }
-
-        remaining -= 1;
-
-        return {
-          rows: [
-            {
-              remaining_runs: remaining,
-              cron_key: 'limited-cron.buyer-1',
-            },
-          ],
-        };
-      }
-
-      return { rows: [] };
-    });
-    const handler = jest.fn().mockResolvedValue(undefined);
-
-    await driver.work(queueName, handler);
-    const workHandler = boss.work.mock.calls[
-      boss.work.mock.calls.length - 1
-    ][2] as (
-      jobs: Array<{
-        id: string;
-        signal: AbortSignal;
-        data: {
-          version: 1;
-          jobName: string;
-          cronScheduleKey: string;
-          data: { version: number };
-        };
-      }>,
-    ) => Promise<void>;
-    const job = {
-      id: 'cron-job-id',
-      signal: new AbortController().signal,
-      data: {
-        version: 1 as const,
-        jobName: 'limited-cron',
-        cronScheduleKey: persistedScheduleKey,
-        data: { version: 1 },
-      },
-    };
-
-    await workHandler([job]);
-    await workHandler([{ ...job, id: 'cron-job-id-2' }]);
-    await workHandler([{ ...job, id: 'cron-job-id-3' }]);
-
-    expect(handler).toHaveBeenCalledTimes(2);
+    expect(boss.schedule).not.toHaveBeenCalled();
     expect(boss.unschedule).toHaveBeenCalledWith(
       queueName,
       'limited-cron.buyer-1',
@@ -478,16 +437,21 @@ describe('PgBossDriver', () => {
     });
 
     expect(boss.updateQueue).toHaveBeenCalledWith(queueName, {
-      expireInSeconds: 1,
+      heartbeatSeconds: 10,
       retryLimit: 2,
     });
+    expect(boss.work).toHaveBeenCalledWith(
+      queueName,
+      expect.objectContaining({ heartbeatRefreshSeconds: 5 }),
+      expect.any(Function),
+    );
 
     await driver.add(queueName, 'recoverable-job', {});
 
     expect(boss.send).toHaveBeenCalledWith(
       queueName,
       expect.any(Object),
-      expect.objectContaining({ retryLimit: 2 }),
+      expect.not.objectContaining({ retryLimit: expect.anything() }),
     );
   });
 
@@ -498,7 +462,6 @@ describe('PgBossDriver', () => {
     });
 
     expect(boss.updateQueue).toHaveBeenCalledWith(queueName, {
-      expireInSeconds: 11,
       heartbeatSeconds: 11,
       retryLimit: 1,
     });

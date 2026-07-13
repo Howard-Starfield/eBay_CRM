@@ -44,10 +44,9 @@ type PgBossJobEnvelope<T extends MessageQueueJobData = MessageQueueJobData> = {
   version: 1;
   jobName: string;
   logicalId?: string;
-  cronScheduleKey?: string;
   intervalOptions?: {
-    priority: number;
-    retryLimit: number;
+    priority?: number;
+    retryLimit?: number;
   };
   data: T;
 };
@@ -68,12 +67,7 @@ export class PgBossDriver
     MessageQueue,
     Promise<void>
   >();
-  private readonly workerOptions = new Map<
-    MessageQueue,
-    MessageQueueWorkerOptions
-  >();
   private startPromise?: Promise<void>;
-  private cronLimitInitializePromise?: Promise<void>;
   private stopPromise?: Promise<void>;
   private started = false;
   private boundedShutdownDrain = false;
@@ -91,13 +85,14 @@ export class PgBossDriver
       connectionString: options.connectionString,
       schema: options.schema,
       application_name: options.applicationName,
-      cronMonitorIntervalSeconds: 1,
-      cronWorkerIntervalSeconds: 1,
       superviseIntervalSeconds: 1,
     });
     this.coordinationPool = new Pool({
       connectionString: options.connectionString,
       application_name: `${options.applicationName}-coordination`,
+      connectionTimeoutMillis: 1_000,
+      query_timeout: 1_000,
+      statement_timeout: 1_000,
     });
     this.intervalScheduler = new PgBossIntervalScheduler({
       pool: this.coordinationPool,
@@ -110,8 +105,12 @@ export class PgBossDriver
 
         await this.boss.send(queueName, envelope, {
           db: database,
-          priority: intervalOptions?.priority ?? 0,
-          retryLimit: intervalOptions?.retryLimit ?? 0,
+          ...(intervalOptions?.priority === undefined
+            ? {}
+            : { priority: intervalOptions.priority }),
+          ...(intervalOptions?.retryLimit === undefined
+            ? {}
+            : { retryLimit: intervalOptions.retryLimit }),
           deleteAfterSeconds: QUEUE_RETENTION.failedMaxAge,
         });
       },
@@ -134,10 +133,7 @@ export class PgBossDriver
       this.startPromise = (async () => {
         await this.boss.start();
         this.started = true;
-        await Promise.all([
-          this.intervalScheduler.start(),
-          this.initializeCronLimitTable(),
-        ]);
+        await this.intervalScheduler.start();
         await Promise.all(
           [...this.registeredQueues].map((queueName) =>
             this.ensureQueue(queueName),
@@ -212,10 +208,9 @@ export class PgBossDriver
       options?.priority ?? MESSAGE_QUEUE_PRIORITY[queueName] ?? 0;
     const sendOptions: PgBossSendOptions = {
       priority: -priority,
-      retryLimit:
-        options?.retryLimit ??
-        this.workerOptions.get(queueName)?.maxStalledCount ??
-        0,
+      ...(options?.retryLimit === undefined
+        ? {}
+        : { retryLimit: options.retryLimit }),
       ...(options?.delay === undefined
         ? {}
         : { startAfter: new Date(Date.now() + options.delay) }),
@@ -243,25 +238,16 @@ export class PgBossDriver
   ): Promise<void> {
     await this.ensureStartedQueue(queueName);
     this.boundedShutdownDrain ||= options?.boundedShutdownDrain === true;
-    this.workerOptions.set(queueName, options ?? {});
-    const lockDurationSeconds =
+    const heartbeatSeconds =
       options?.lockDuration === undefined
         ? undefined
-        : Math.ceil(options.lockDuration / 1_000);
+        : Math.max(10, Math.ceil(options.lockDuration / 1_000));
 
     const queueRecoveryOptions = {
-      ...(lockDurationSeconds === undefined
-        ? {}
-        : {
-            // pg-boss expiration is second-granularity. Rounding upward avoids
-            // expiring a job earlier than Twenty's millisecond lock duration.
-            expireInSeconds: lockDurationSeconds,
-          }),
-      // pg-boss rejects heartbeat periods below ten seconds. Shorter Twenty
-      // locks therefore rely on expiration; longer locks also get renewal.
-      ...(lockDurationSeconds !== undefined && lockDurationSeconds >= 10
-        ? { heartbeatSeconds: lockDurationSeconds }
-        : {}),
+      // expireInSeconds is a hard handler deadline in pg-boss, not a renewable
+      // Bull-style lock. Heartbeats reclaim crashed workers without aborting a
+      // healthy handler. pg-boss enforces a ten-second heartbeat minimum.
+      ...(heartbeatSeconds === undefined ? {} : { heartbeatSeconds }),
       ...(options?.maxStalledCount === undefined
         ? {}
         : { retryLimit: options.maxStalledCount }),
@@ -278,9 +264,9 @@ export class PgBossDriver
         ...(options?.concurrency === undefined
           ? {}
           : { localConcurrency: options.concurrency }),
-        ...(lockDurationSeconds !== undefined && lockDurationSeconds >= 10
-          ? { heartbeatRefreshSeconds: lockDurationSeconds / 2 }
-          : {}),
+        ...(heartbeatSeconds === undefined
+          ? {}
+          : { heartbeatRefreshSeconds: heartbeatSeconds / 2 }),
       },
       async ([job]) => {
         if (!job) {
@@ -288,13 +274,6 @@ export class PgBossDriver
         }
 
         const envelope = this.readEnvelope(job.data);
-
-        if (
-          envelope.cronScheduleKey !== undefined &&
-          !(await this.claimCronRun(queueName, envelope.cronScheduleKey))
-        ) {
-          return;
-        }
 
         await handler({
           id: job.id,
@@ -344,32 +323,25 @@ export class PgBossDriver
       const priority =
         options.priority ?? MESSAGE_QUEUE_PRIORITY[queueName] ?? 0;
 
-      await this.intervalScheduler.remove(scheduleKey);
-
-      if (limit === undefined) {
-        await this.removeCronLimit(scheduleKey);
-      } else {
-        envelope.cronScheduleKey = scheduleKey;
-        await this.upsertCronLimit({
-          scheduleKey,
-          queueName,
-          cronKey,
-          remainingRuns: limit,
-          definition: {
-            pattern,
-            data: data ?? {},
-            priority,
-            retryLimit: options.retryLimit ?? 0,
-            limit,
+      await Promise.all([
+        this.boss.unschedule(queueName, cronKey),
+        this.intervalScheduler.remove(scheduleKey),
+      ]);
+      await this.intervalScheduler.upsertCron({
+        scheduleKey,
+        queueName,
+        jobName,
+        payload: {
+          ...envelope,
+          intervalOptions: {
+            priority: -priority,
+            ...(options.retryLimit === undefined
+              ? {}
+              : { retryLimit: options.retryLimit }),
           },
-        });
-      }
-
-      await this.boss.schedule(queueName, pattern, envelope, {
-        key: cronKey,
-        priority: -priority,
-        retryLimit: options.retryLimit ?? 0,
-        deleteAfterSeconds: QUEUE_RETENTION.failedMaxAge,
+        },
+        pattern,
+        ...(limit === undefined ? {} : { remainingRuns: limit }),
       });
 
       return;
@@ -377,7 +349,7 @@ export class PgBossDriver
 
     await Promise.all([
       this.boss.unschedule(queueName, cronKey),
-      this.removeCronLimit(scheduleKey),
+      this.intervalScheduler.removeCron(scheduleKey),
     ]);
 
     if (every === undefined) {
@@ -396,7 +368,9 @@ export class PgBossDriver
             MESSAGE_QUEUE_PRIORITY[queueName] ??
             0
           ),
-          retryLimit: options.retryLimit ?? 0,
+          ...(options.retryLimit === undefined
+            ? {}
+            : { retryLimit: options.retryLimit }),
         },
       },
       everyMs: every,
@@ -420,7 +394,7 @@ export class PgBossDriver
     await Promise.all([
       this.boss.unschedule(queueName, cronKey),
       this.intervalScheduler.remove(scheduleKey),
-      this.removeCronLimit(scheduleKey),
+      this.intervalScheduler.removeCron(scheduleKey),
     ]);
   }
 
@@ -620,122 +594,12 @@ export class PgBossDriver
     return `${queueName}:${cronKey}`;
   }
 
-  private async initializeCronLimitTable(): Promise<void> {
-    if (!this.cronLimitInitializePromise) {
-      this.cronLimitInitializePromise = this.coordinationPool
-        .query(`
-          CREATE TABLE IF NOT EXISTS ${this.options.schema}.cron_schedule_limit (
-            schedule_key text PRIMARY KEY,
-            queue_name text NOT NULL,
-            cron_key text NOT NULL,
-            definition jsonb NOT NULL,
-            remaining_runs integer NOT NULL CHECK (remaining_runs >= 0),
-            updated_at timestamptz NOT NULL DEFAULT now()
-          )
-        `)
-        .then(() => undefined)
-        .catch((error) => {
-          this.cronLimitInitializePromise = undefined;
-          throw error;
-        });
-    }
-
-    await this.cronLimitInitializePromise;
-  }
-
-  private async upsertCronLimit(input: {
-    scheduleKey: string;
-    queueName: MessageQueue;
-    cronKey: string;
-    remainingRuns: number;
-    definition: MessageQueueJobData;
-  }): Promise<void> {
-    await this.initializeCronLimitTable();
-    await this.coordinationPool.query(
-      `
-        INSERT INTO ${this.options.schema}.cron_schedule_limit
-          (schedule_key, queue_name, cron_key, definition, remaining_runs)
-        VALUES ($1, $2, $3, $4::jsonb, $5)
-        ON CONFLICT (schedule_key) DO UPDATE SET
-          queue_name = EXCLUDED.queue_name,
-          cron_key = EXCLUDED.cron_key,
-          definition = EXCLUDED.definition,
-          remaining_runs = EXCLUDED.remaining_runs,
-          updated_at = now()
-        WHERE ${this.options.schema}.cron_schedule_limit.queue_name IS DISTINCT FROM EXCLUDED.queue_name
-           OR ${this.options.schema}.cron_schedule_limit.cron_key IS DISTINCT FROM EXCLUDED.cron_key
-           OR ${this.options.schema}.cron_schedule_limit.definition IS DISTINCT FROM EXCLUDED.definition
-      `,
-      [
-        input.scheduleKey,
-        input.queueName,
-        input.cronKey,
-        input.definition,
-        input.remainingRuns,
-      ],
-    );
-  }
-
-  private async removeCronLimit(scheduleKey: string): Promise<void> {
-    await this.initializeCronLimitTable();
-    await this.coordinationPool.query(
-      `DELETE FROM ${this.options.schema}.cron_schedule_limit WHERE schedule_key = $1`,
-      [scheduleKey],
-    );
-  }
-
-  private async claimCronRun(
-    queueName: MessageQueue,
-    scheduleKey: string,
-  ): Promise<boolean> {
-    const client = await this.coordinationPool.connect();
-    let remainingRuns: number | undefined;
-    let cronKey: string | undefined;
-
-    try {
-      await client.query('BEGIN');
-      const result = await client.query<{
-        remaining_runs: number;
-        cron_key: string;
-      }>(
-        `
-          UPDATE ${this.options.schema}.cron_schedule_limit
-          SET remaining_runs = remaining_runs - 1, updated_at = now()
-          WHERE schedule_key = $1
-            AND queue_name = $2
-            AND remaining_runs > 0
-          RETURNING remaining_runs, cron_key
-        `,
-        [scheduleKey, queueName],
-      );
-
-      remainingRuns = result.rows[0]?.remaining_runs;
-      cronKey = result.rows[0]?.cron_key;
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-
-    if (remainingRuns === undefined) {
-      return false;
-    }
-
-    if (remainingRuns === 0 && cronKey !== undefined) {
-      await this.boss.unschedule(queueName, cronKey);
-    }
-
-    return true;
-  }
-
   private async ensureQueue(queueName: MessageQueue): Promise<void> {
     let creation = this.queueCreationPromises.get(queueName);
 
     if (!creation) {
       const pendingCreation = this.boss
-        .createQueue(queueName)
+        .createQueue(queueName, { retryLimit: 0 })
         .catch((error) => {
           if (this.queueCreationPromises.get(queueName) === pendingCreation) {
             this.queueCreationPromises.delete(queueName);
