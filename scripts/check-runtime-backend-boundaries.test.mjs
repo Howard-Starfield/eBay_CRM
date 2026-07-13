@@ -203,3 +203,22 @@ test('detects restricted imports when comments or options separate syntax tokens
     },
   );
 });
+
+test('detects a TypeScript import-equals require declaration', async () => {
+  await withFixture(
+    {
+      'src/import-equals.ts':
+        "import Redis = require('redis');\n\nexport type RedisClient = Redis.RedisClientType;\n",
+    },
+    async (root) => {
+      const policy = {
+        baselineDirectImports: [],
+        adapterPathPrefixes: [],
+      };
+
+      assert.deepEqual(await findViolations({ root, policy }), [
+        'src/import-equals.ts -> redis',
+      ]);
+    },
+  );
+});

@@ -53514,6 +53514,7 @@ __metadata:
     nx: "npm:22.7.5"
     oxfmt: "npm:0.50.0"
     tsx: "npm:^4.17.0"
+    typescript: "npm:5.9.3"
     verdaccio: "npm:^6.3.1"
   languageName: unknown
   linkType: soft

@@ -76,7 +76,12 @@ const findRestrictedSpecifiers = ({ source, sourceFilePath }) => {
   };
 
   const visit = (node) => {
-    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+    if (
+      ts.isImportEqualsDeclaration(node) &&
+      ts.isExternalModuleReference(node.moduleReference)
+    ) {
+      addSpecifier(node.moduleReference.expression);
+    } else if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
       addSpecifier(node.moduleSpecifier);
     } else if (ts.isCallExpression(node)) {
       const isDynamicImport =
