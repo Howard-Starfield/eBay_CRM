@@ -41,9 +41,11 @@ retry/recovery semantics pass BullMQ and fail pg-boss on every run.
 
 The three rejected cases are permanent shared acceptance tests. They are not
 deleted, weakened, or skipped for pg-boss. The PostgreSQL CI job runs the full
-contract and accepts its non-zero exit only when the JSON report contains
-exactly these three failures, no unrelated failure, no runtime suite error,
-and at least 22 passing spike cases.
+contract and accepts its non-zero exit only when the JSON report contains the
+exact complete assertion map: 22 specifically named passing cases, these three
+specifically named failures, and the specifically named opposite-adapter
+sentinel pending. Exact test/suite totals, suite statuses, no runtime suite
+error, and no interruption are also required.
 
 | Mandatory semantic | BullMQ 5.78.0 | pg-boss 12.26.0 |
 | --- | --- | --- |
