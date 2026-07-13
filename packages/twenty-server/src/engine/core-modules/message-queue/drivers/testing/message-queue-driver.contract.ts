@@ -144,6 +144,81 @@ export const defineMessageQueueDriverContract = (
       expect(attempts).toBe(3);
     });
 
+    it('keeps stalled-recovery allowance independent from ordinary handler failures', async () => {
+      let attempts = 0;
+      const harness = await useHarness(
+        'independent-stall-allowance',
+        () => {
+          attempts += 1;
+          throw new Error('ordinary handler failure');
+        },
+        { maxStalledCount: 2 },
+      );
+
+      await harness.start();
+      await harness.driver.add(harness.queueName, 'ordinary-failure', {});
+      await harness.waitFor(async () => {
+        const stats = await harness.driver.getStats(harness.queueName);
+
+        return stats.failed === 1;
+      }, WAIT_TIMEOUT_MS);
+
+      expect(attempts).toBe(1);
+    });
+
+    it('keeps crash recovery available when handler retryLimit is zero', async () => {
+      const firstAttempt = deferred();
+      let entries = 0;
+      const harness = await useHarness(
+        'zero-handler-retries-with-stall-recovery',
+        async () => {
+          entries += 1;
+          if (entries === 1) {
+            await firstAttempt.promise;
+          }
+        },
+        { lockDuration: 500, maxStalledCount: 2 },
+      );
+
+      try {
+        await harness.start();
+        await harness.driver.add(
+          harness.queueName,
+          'zero-handler-retries',
+          {},
+          { retryLimit: 0 },
+        );
+        await harness.waitFor(() => entries === 1, WAIT_TIMEOUT_MS);
+        await harness.terminateWorker();
+        await harness.restartWorker();
+        await harness.waitFor(() => entries === 2, RECOVERY_TIMEOUT_MS);
+      } finally {
+        firstAttempt.resolve();
+      }
+    });
+
+    it('uses one stalled recovery by default without adding handler retries', async () => {
+      const firstAttempt = deferred();
+      let entries = 0;
+      const harness = await useHarness('default-stalled-recovery', async () => {
+        entries += 1;
+        if (entries === 1) {
+          await firstAttempt.promise;
+        }
+      });
+
+      try {
+        await harness.start();
+        await harness.driver.add(harness.queueName, 'default-recovery', {});
+        await harness.waitFor(() => entries === 1, WAIT_TIMEOUT_MS);
+        await harness.terminateWorker();
+        await harness.restartWorker();
+        await harness.waitFor(() => entries === 2, RECOVERY_TIMEOUT_MS);
+      } finally {
+        firstAttempt.resolve();
+      }
+    });
+
     it('never exceeds configured concurrency', async () => {
       const gates = Array.from({ length: 6 }, () => deferred());
       let active = 0;

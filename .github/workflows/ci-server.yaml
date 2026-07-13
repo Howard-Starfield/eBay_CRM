@@ -12,6 +12,7 @@ concurrency:
 
 env:
   SERVER_BUILD_CACHE_KEY: server-build
+  RUNTIME_BACKEND: redis
 
 jobs:
   changed-files-check:

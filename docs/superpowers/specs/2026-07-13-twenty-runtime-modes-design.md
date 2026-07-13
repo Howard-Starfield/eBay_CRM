@@ -468,6 +468,7 @@ Local Desktop mode is ready for the next product specification when:
 - PostgreSQL advisory locks: https://www.postgresql.org/docs/current/explicit-locking.html
 - PostgreSQL `LISTEN`: https://www.postgresql.org/docs/current/sql-listen.html
 - PostgreSQL `NOTIFY`: https://www.postgresql.org/docs/current/sql-notify.html
+- Phase 0 evidence and queue verdict: [Phase 0 PostgreSQL runtime spike report](../../architecture/phase-0-runtime-spike-report.md)
 
 ## 21. Approved decisions
 
@@ -481,4 +482,3 @@ Local Desktop mode is ready for the next product specification when:
 - pg-boss receives the first queue compatibility spike.
 - PostgreSQL runtime data is isolated in `desktop_runtime`.
 - AI streaming migration happens after the queue, sessions, coordination, and realtime foundations.
-
