@@ -9,6 +9,7 @@ import {
 import { type MessageQueueDriver } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-driver.interface';
 
 import { BullMQDriver } from 'src/engine/core-modules/message-queue/drivers/bullmq.driver';
+import { PgBossDriver } from 'src/engine/core-modules/message-queue/drivers/pg-boss.driver';
 import { SyncDriver } from 'src/engine/core-modules/message-queue/drivers/sync.driver';
 import { MessageQueueDriverType } from 'src/engine/core-modules/message-queue/interfaces';
 import {
@@ -97,6 +98,13 @@ export class MessageQueueCoreModule extends ConfigurableModuleClass {
     switch (config.type) {
       case MessageQueueDriverType.BullMQ: {
         return new BullMQDriver(
+          config.options,
+          config.metricsService,
+          config.twentyConfigService,
+        );
+      }
+      case MessageQueueDriverType.PgBoss: {
+        return new PgBossDriver(
           config.options,
           config.metricsService,
           config.twentyConfigService,

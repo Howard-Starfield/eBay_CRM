@@ -125,6 +125,8 @@ import { FileModule } from './file/file.module';
     AdminPanelModule,
     LabModule,
     RoleModule,
+    // Phase 0 removes Redis only from the postgres-desktop queue adapter.
+    // Other cache, session, pub/sub, and stream subsystems still require this module.
     RedisClientModule,
     WorkspaceQueryRunnerModule,
     GeoMapModule,
