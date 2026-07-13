@@ -48,10 +48,10 @@ export class SyncDriver implements MessageQueueDriver {
     this.logger.log(`Removing '${queueName}' cron job with SyncDriver`);
   }
 
-  work<T extends MessageQueueJobData>(
+  async work<T extends MessageQueueJobData>(
     queueName: MessageQueue,
     handler: (job: MessageQueueJob<T>) => Promise<void> | void,
-  ): void {
+  ): Promise<void> {
     this.logger.log(`Registering handler for queue: ${queueName}`);
     this.workersMap[queueName] = handler;
   }

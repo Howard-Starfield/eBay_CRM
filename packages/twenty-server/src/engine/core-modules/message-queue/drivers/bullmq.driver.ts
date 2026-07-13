@@ -20,7 +20,10 @@ import {
   type QueueJobOptions,
 } from 'src/engine/core-modules/message-queue/drivers/interfaces/job-options.interface';
 import { type MessageQueueDriver } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-driver.interface';
-import { type MessageQueueJob } from 'src/engine/core-modules/message-queue/interfaces/message-queue-job.interface';
+import {
+  type MessageQueueJob,
+  type MessageQueueJobData,
+} from 'src/engine/core-modules/message-queue/interfaces/message-queue-job.interface';
 import { type MessageQueueWorkerOptions } from 'src/engine/core-modules/message-queue/interfaces/message-queue-worker-options.interface';
 
 import { QUEUE_RETENTION } from 'src/engine/core-modules/message-queue/constants/queue-retention.constants';
@@ -162,11 +165,11 @@ export class BullMQDriver
     }
   }
 
-  work<T>(
+  async work<T extends MessageQueueJobData>(
     queueName: MessageQueue,
-    handler: (job: MessageQueueJob<T>) => Promise<void>,
+    handler: (job: MessageQueueJob<T>) => Promise<void> | void,
     options?: MessageQueueWorkerOptions,
-  ) {
+  ): Promise<void> {
     const workerOptions = {
       ...this.options,
       ...(isDefined(options?.concurrency)

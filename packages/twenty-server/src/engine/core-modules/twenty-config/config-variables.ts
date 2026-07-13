@@ -39,6 +39,10 @@ import {
   type TwentyLogLevel,
 } from 'src/engine/core-modules/logger/interfaces';
 import { type MeterDriver } from 'src/engine/core-modules/metrics/types/meter-driver.type';
+import {
+  RUNTIME_BACKENDS,
+  type RuntimeBackend,
+} from 'src/engine/core-modules/runtime-backend/runtime-backend.constants';
 import { CastToLogLevelArray } from 'src/engine/core-modules/twenty-config/decorators/cast-to-log-level-array.decorator';
 import { CastToMeterDriverArray } from 'src/engine/core-modules/twenty-config/decorators/cast-to-meter-driver.decorator';
 import { CastToPositiveNumber } from 'src/engine/core-modules/twenty-config/decorators/cast-to-positive-number.decorator';
@@ -1222,6 +1226,17 @@ export class ConfigVariables {
   })
   @IsOptional()
   IS_CONFIG_VARIABLES_IN_DB_ENABLED = true;
+
+  @ConfigVariablesMetadata({
+    group: ConfigVariablesGroup.SERVER_CONFIG,
+    description: 'Runtime backend used for queue and infrastructure services',
+    type: ConfigVariableType.ENUM,
+    options: Object.values(RUNTIME_BACKENDS),
+    isEnvOnly: true,
+    isHiddenInAdminPanel: true,
+  })
+  @IsIn(Object.values(RUNTIME_BACKENDS))
+  RUNTIME_BACKEND: RuntimeBackend = RUNTIME_BACKENDS.POSTGRES_DESKTOP;
 
   @ConfigVariablesMetadata({
     group: ConfigVariablesGroup.TOKENS_DURATION,

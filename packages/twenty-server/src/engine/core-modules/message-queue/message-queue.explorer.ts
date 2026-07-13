@@ -43,11 +43,11 @@ export class MessageQueueExplorer implements OnModuleInit {
     private readonly exceptionHandlerService: ExceptionHandlerService,
   ) {}
 
-  onModuleInit() {
-    this.explore();
+  async onModuleInit(): Promise<void> {
+    await this.explore();
   }
 
-  explore() {
+  async explore(): Promise<void> {
     const processors = this.discoveryService
       .getProviders()
       .filter((wrapper) =>
@@ -60,18 +60,20 @@ export class MessageQueueExplorer implements OnModuleInit {
 
     const groupedProcessors = this.groupProcessorsByQueueName(processors);
 
-    for (const [queueName, processorGroupCollection] of Object.entries(
-      groupedProcessors,
-    )) {
-      const queueToken = getQueueToken(queueName);
-      const messageQueueService = this.getQueueService(queueToken);
+    const workerRegistrationPromises = Object.entries(groupedProcessors).map(
+      ([queueName, processorGroupCollection]) => {
+        const queueToken = getQueueToken(queueName);
+        const messageQueueService = this.getQueueService(queueToken);
 
-      this.handleProcessorGroupCollection(
-        processorGroupCollection,
-        messageQueueService,
-        QUEUE_WORKER_OPTIONS[queueName as MessageQueue],
-      );
-    }
+        return this.handleProcessorGroupCollection(
+          processorGroupCollection,
+          messageQueueService,
+          QUEUE_WORKER_OPTIONS[queueName as MessageQueue],
+        );
+      },
+    );
+
+    await Promise.all(workerRegistrationPromises);
   }
 
   private groupProcessorsByQueueName(processors: InstanceWrapper[]) {
@@ -136,8 +138,8 @@ export class MessageQueueExplorer implements OnModuleInit {
     processorGroupCollection: ProcessorGroup[],
     queue: MessageQueueService,
     options?: MessageQueueWorkerOptions,
-  ) {
-    queue.work(async (job) => {
+  ): Promise<void> {
+    return queue.work(async (job) => {
       for (const processorGroup of processorGroupCollection) {
         await this.handleProcessor(processorGroup, job);
       }
