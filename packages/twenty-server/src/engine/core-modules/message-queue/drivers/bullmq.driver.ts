@@ -407,15 +407,7 @@ export class BullMQDriver
     };
 
     try {
-      await this.waitForQueueReadiness(queueName, queue);
-
-      const jobs = await this.findJobs(queueName, [
-        'created',
-        'active',
-        'completed',
-        'failed',
-        'retry',
-      ]);
+      const jobs = await this.getJobsForStats(queueName, queue);
 
       for (const job of jobs) {
         counts[job.state] += 1;
@@ -427,10 +419,10 @@ export class BullMQDriver
     return { queueName, healthy: true, ...counts };
   }
 
-  private async waitForQueueReadiness(
+  private async getJobsForStats(
     queueName: MessageQueue,
     queue: Queue,
-  ): Promise<void> {
+  ): Promise<MessageQueueJobRecord[]> {
     const existingReadiness = this.queueReadinessMap[queueName];
     const readiness =
       existingReadiness ??
@@ -443,18 +435,35 @@ export class BullMQDriver
 
     this.queueReadinessMap[queueName] = readiness;
 
+    const inspection = readiness.then(() =>
+      this.findJobs(queueName, [
+        'created',
+        'active',
+        'completed',
+        'failed',
+        'retry',
+      ]),
+    );
+
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    let didTimeOut = false;
 
     try {
-      await Promise.race([
-        readiness,
+      return await Promise.race([
+        inspection,
         new Promise<never>((_resolve, reject) => {
-          timeout = setTimeout(
-            () => reject(new Error('Queue readiness timed out')),
-            QUEUE_STATS_TIMEOUT_MS,
-          );
+          timeout = setTimeout(() => {
+            didTimeOut = true;
+            reject(new Error('Queue stats inspection timed out'));
+          }, QUEUE_STATS_TIMEOUT_MS);
         }),
       ]);
+    } catch (error) {
+      if (didTimeOut) {
+        void inspection.catch(() => undefined);
+      }
+
+      throw error;
     } finally {
       clearTimeout(timeout);
     }

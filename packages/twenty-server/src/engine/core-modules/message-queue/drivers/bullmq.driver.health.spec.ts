@@ -19,7 +19,7 @@ describe('BullMQDriver health', () => {
           port: 1,
           connectTimeout: 50,
           maxRetriesPerRequest: null,
-          retryStrategy: () => 50,
+          retryStrategy: () => null,
         },
       },
       metricsService,
