@@ -140,4 +140,3 @@ rg -l "from ['\"](bullmq|ioredis|redis|connect-redis|cache-manager-redis-yet|gra
 rg -n '\.(acquireLock|releaseLock|withLock)\(|@WithLock\(' packages/twenty-server/src --glob '*.ts' --glob '!**/__tests__/**'
 rg -n '\.(setAdd|setPop)\(' packages/twenty-server/src/modules/calendar packages/twenty-server/src/modules/messaging --glob '*.ts'
 ```
-

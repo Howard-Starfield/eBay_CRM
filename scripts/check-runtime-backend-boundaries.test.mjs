@@ -143,3 +143,63 @@ test('limits scanning to policy source path prefixes', async () => {
     },
   );
 });
+
+test('ignores restricted package text in comments and arbitrary strings', async () => {
+  await withFixture(
+    {
+      'src/examples.ts': `
+// import { Queue } from 'bullmq';
+/*
+ * require('redis');
+ * import('ioredis');
+ */
+const examples = [
+  "import 'connect-redis';",
+  "export { redisInsStore } from 'cache-manager-redis-yet';",
+  "require('graphql-redis-subscriptions');",
+];
+const loader = { require: (specifier) => specifier };
+loader.require('bullmq');
+export { examples, loader };
+`,
+    },
+    async (root) => {
+      const policy = {
+        baselineDirectImports: [],
+        adapterPathPrefixes: [],
+      };
+
+      assert.deepEqual(await findViolations({ root, policy }), []);
+    },
+  );
+});
+
+test('detects restricted imports when comments or options separate syntax tokens', async () => {
+  await withFixture(
+    {
+      'src/a-side-effect.ts': "import/* comment */'redis';\n",
+      'src/b-require.cjs':
+        "module.exports = require(/* comment */ 'bullmq');\n",
+      'src/c-dynamic.ts':
+        "export const loadRedis = () => import(/* comment */ 'ioredis', { with: { type: 'json' } });\n",
+      'src/d-from.ts':
+        "import { createClient } /* comment */ from /* comment */ 'connect-redis';\nexport { createClient };\n",
+      'src/e-export.ts':
+        "export { redisInsStore } from /* comment */ 'cache-manager-redis-yet';\n",
+    },
+    async (root) => {
+      const policy = {
+        baselineDirectImports: [],
+        adapterPathPrefixes: [],
+      };
+
+      assert.deepEqual(await findViolations({ root, policy }), [
+        'src/a-side-effect.ts -> redis',
+        'src/b-require.cjs -> bullmq',
+        'src/c-dynamic.ts -> ioredis',
+        'src/d-from.ts -> connect-redis',
+        'src/e-export.ts -> cache-manager-redis-yet',
+      ]);
+    },
+  );
+});

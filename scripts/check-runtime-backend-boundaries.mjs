@@ -2,6 +2,8 @@ import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import ts from 'typescript';
+
 export const restrictedPackages = new Set([
   'bullmq',
   'ioredis',
@@ -19,12 +21,13 @@ const skippedDirectories = new Set([
   'dist',
   'coverage',
 ]);
-const packageSpecifierPatterns = [
-  /\bfrom\s*['"]([^'"]+)['"]/g,
-  /\bimport\s*['"]([^'"]+)['"]/g,
-  /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
-  /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
-];
+const scriptKinds = new Map([
+  ['.ts', ts.ScriptKind.TS],
+  ['.tsx', ts.ScriptKind.TSX],
+  ['.js', ts.ScriptKind.JS],
+  ['.mjs', ts.ScriptKind.JS],
+  ['.cjs', ts.ScriptKind.JS],
+]);
 
 const normalizePath = (value) => value.split(path.sep).join('/');
 
@@ -52,16 +55,44 @@ const walkSourceFiles = async (directory) => {
   return sourceFiles;
 };
 
-const findRestrictedSpecifiers = (source) => {
+const findRestrictedSpecifiers = ({ source, sourceFilePath }) => {
   const specifiers = new Set();
+  const sourceFile = ts.createSourceFile(
+    sourceFilePath,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    scriptKinds.get(path.extname(sourceFilePath)),
+  );
 
-  for (const pattern of packageSpecifierPatterns) {
-    for (const match of source.matchAll(pattern)) {
-      if (restrictedPackages.has(match[1])) {
-        specifiers.add(match[1]);
+  const addSpecifier = (moduleSpecifier) => {
+    if (
+      moduleSpecifier &&
+      ts.isStringLiteralLike(moduleSpecifier) &&
+      restrictedPackages.has(moduleSpecifier.text)
+    ) {
+      specifiers.add(moduleSpecifier.text);
+    }
+  };
+
+  const visit = (node) => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      addSpecifier(node.moduleSpecifier);
+    } else if (ts.isCallExpression(node)) {
+      const isDynamicImport =
+        node.expression.kind === ts.SyntaxKind.ImportKeyword;
+      const isRequireCall =
+        ts.isIdentifier(node.expression) && node.expression.text === 'require';
+
+      if (isDynamicImport || isRequireCall) {
+        addSpecifier(node.arguments[0]);
       }
     }
-  }
+
+    ts.forEachChild(node, visit);
+  };
+
+  visit(sourceFile);
 
   return specifiers;
 };
@@ -90,7 +121,10 @@ export const findViolations = async ({ root, policy }) => {
 
     const source = await readFile(sourceFile, 'utf8');
 
-    for (const packageSpecifier of findRestrictedSpecifiers(source)) {
+    for (const packageSpecifier of findRestrictedSpecifiers({
+      source,
+      sourceFilePath: sourceFile,
+    })) {
       violations.push(`${relativePath} -> ${packageSpecifier}`);
     }
   }
