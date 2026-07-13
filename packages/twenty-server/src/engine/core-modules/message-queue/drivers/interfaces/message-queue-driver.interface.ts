@@ -2,6 +2,9 @@ import {
   type QueueCronJobOptions,
   type QueueJobOptions,
 } from 'src/engine/core-modules/message-queue/drivers/interfaces/job-options.interface';
+import { type MessageQueueJobRecord } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-job-record.type';
+import { type MessageQueueJobState } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-job-state.type';
+import { type MessageQueueStats } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-stats.type';
 import { type MessageQueueJobData } from 'src/engine/core-modules/message-queue/interfaces/message-queue-job.interface';
 import { type MessageQueueWorkerOptions } from 'src/engine/core-modules/message-queue/interfaces/message-queue-worker-options.interface';
 
@@ -41,5 +44,12 @@ export interface MessageQueueDriver {
     jobName: string;
     jobId?: string;
   }): Promise<void>;
+  getStats(queueName: MessageQueue): Promise<MessageQueueStats>;
+  findJobs(
+    queueName: MessageQueue,
+    states: MessageQueueJobState[],
+  ): Promise<MessageQueueJobRecord[]>;
+  retryJob(queueName: MessageQueue, jobId: string): Promise<void>;
+  deleteJob(queueName: MessageQueue, jobId: string): Promise<void>;
   register?(queueName: MessageQueue): void;
 }

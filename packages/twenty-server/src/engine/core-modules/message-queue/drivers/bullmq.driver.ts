@@ -6,6 +6,8 @@ import {
 
 import * as Sentry from '@sentry/node';
 import {
+  type Job,
+  type JobType,
   type JobsOptions,
   MetricsTime,
   Queue,
@@ -20,6 +22,9 @@ import {
   type QueueJobOptions,
 } from 'src/engine/core-modules/message-queue/drivers/interfaces/job-options.interface';
 import { type MessageQueueDriver } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-driver.interface';
+import { type MessageQueueJobRecord } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-job-record.type';
+import { type MessageQueueJobState } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-job-state.type';
+import { type MessageQueueStats } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-stats.type';
 import {
   type MessageQueueJob,
   type MessageQueueJobData,
@@ -94,6 +99,18 @@ export class BullMQDriver
 
   register(queueName: MessageQueue): void {
     this.queueMap[queueName] = new Queue(queueName, this.options);
+  }
+
+  private getQueue(queueName: MessageQueue): Queue {
+    const queue = this.queueMap[queueName];
+
+    if (!isDefined(queue)) {
+      throw new Error(
+        `Queue ${queueName} is not registered, make sure you have added it as a queue provider`,
+      );
+    }
+
+    return queue;
   }
 
   async onModuleDestroy() {
@@ -318,15 +335,11 @@ export class BullMQDriver
     data: T,
     options?: QueueJobOptions,
   ): Promise<void> {
-    if (!this.queueMap[queueName]) {
-      throw new Error(
-        `Queue ${queueName} is not registered, make sure you have added it as a queue provider`,
-      );
-    }
+    const queue = this.getQueue(queueName);
 
     // This ensures only one waiting job can be queued for a specific option.id
     if (options?.id) {
-      const waitingJobs = await this.queueMap[queueName].getJobs(['waiting']);
+      const waitingJobs = await queue.getJobs(['waiting', 'prioritized']);
 
       const isJobAlreadyWaiting = waitingJobs.some(
         (job) => job.id?.slice(0, -(V4_LENGTH + 1)) === options.id,
@@ -352,6 +365,116 @@ export class BullMQDriver
       delay: options?.delay,
     };
 
-    await this.queueMap[queueName].add(jobName, data, queueOptions);
+    await queue.add(jobName, data, queueOptions);
+  }
+
+  async getStats(queueName: MessageQueue): Promise<MessageQueueStats> {
+    const queue = this.getQueue(queueName);
+    let healthy = true;
+
+    try {
+      await queue.waitUntilReady();
+    } catch {
+      healthy = false;
+    }
+
+    const jobs = await this.findJobs(queueName, [
+      'created',
+      'active',
+      'completed',
+      'failed',
+      'retry',
+    ]);
+    const counts: Omit<MessageQueueStats, 'queueName' | 'healthy'> = {
+      created: 0,
+      active: 0,
+      completed: 0,
+      failed: 0,
+      retry: 0,
+    };
+
+    for (const job of jobs) {
+      counts[job.state] += 1;
+    }
+
+    return { queueName, healthy, ...counts };
+  }
+
+  async findJobs(
+    queueName: MessageQueue,
+    states: MessageQueueJobState[],
+  ): Promise<MessageQueueJobRecord[]> {
+    const queue = this.getQueue(queueName);
+    const bullStates = new Set<JobType>();
+
+    if (states.includes('created') || states.includes('retry')) {
+      bullStates.add('waiting');
+      bullStates.add('delayed');
+      bullStates.add('prioritized');
+    }
+    if (states.includes('active')) {
+      bullStates.add('active');
+    }
+    if (states.includes('completed')) {
+      bullStates.add('completed');
+    }
+    if (states.includes('failed')) {
+      bullStates.add('failed');
+    }
+
+    if (bullStates.size === 0) {
+      return [];
+    }
+
+    const jobs = await queue.getJobs([...bullStates], 0, -1, true);
+    const records = await Promise.all(
+      jobs.map(async (job) => this.toJobRecord(job)),
+    );
+
+    return records.filter(({ state }) => states.includes(state));
+  }
+
+  async retryJob(queueName: MessageQueue, jobId: string): Promise<void> {
+    const job = await this.getQueue(queueName).getJob(jobId);
+
+    if (!isDefined(job)) {
+      throw new Error(`Job ${jobId} was not found on queue ${queueName}`);
+    }
+
+    await job.retry('failed');
+  }
+
+  async deleteJob(queueName: MessageQueue, jobId: string): Promise<void> {
+    const job = await this.getQueue(queueName).getJob(jobId);
+
+    if (!isDefined(job)) {
+      return;
+    }
+
+    await job.remove();
+  }
+
+  private async toJobRecord(job: Job): Promise<MessageQueueJobRecord> {
+    const bullState = await job.getState();
+    const state: MessageQueueJobState =
+      bullState === 'active' ||
+      bullState === 'completed' ||
+      bullState === 'failed'
+        ? bullState
+        : job.attemptsMade > 0
+          ? 'retry'
+          : 'created';
+
+    return {
+      id: job.id ?? '',
+      name: job.name,
+      data: job.data,
+      state,
+      attemptsMade: job.attemptsMade,
+      createdAt: job.timestamp,
+      processedAt: job.processedOn,
+      finishedAt: job.finishedOn,
+      failedReason: job.failedReason,
+    };
   }
 }

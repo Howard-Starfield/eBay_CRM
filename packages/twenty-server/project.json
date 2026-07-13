@@ -181,6 +181,13 @@
       }
     },
     "test": {},
+    "test-runtime-contract": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "packages/twenty-server",
+        "command": "node --experimental-vm-modules ../../node_modules/jest/bin/jest.js --config jest-runtime-contract.config.mjs --runInBand"
+      }
+    },
     "test:debug": {
       "executor": "nx:run-commands",
       "options": {
