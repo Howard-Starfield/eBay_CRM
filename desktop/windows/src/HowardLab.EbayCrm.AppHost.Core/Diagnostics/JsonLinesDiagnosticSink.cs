@@ -52,8 +52,10 @@ public sealed class JsonLinesDiagnosticSink : IDiagnosticSink
         _segmentFactory = segmentFactory;
         _clock = clock;
         _canaries = (registeredSecrets ?? [])
-            .Select(secret => secret.RevealForChildEnvironment())
-            .Where(value => !string.IsNullOrEmpty(value))
+            .Select(secret => secret?.RevealForChildEnvironment() ?? throw new ArgumentException(
+                "Registered secrets cannot contain null values.",
+                nameof(registeredSecrets)))
+            .Select(value => SecretCanary.Validate(value, nameof(registeredSecrets)))
             .Distinct(StringComparer.Ordinal)
             .OrderByDescending(value => value.Length)
             .ToArray();
@@ -101,7 +103,15 @@ public sealed class JsonLinesDiagnosticSink : IDiagnosticSink
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            _writerCancellation.Cancel();
+            try
+            {
+                _writerCancellation.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The writer completed and disposed its source while cancellation raced with completion.
+            }
+
             throw;
         }
     }
@@ -182,6 +192,8 @@ public sealed class JsonLinesDiagnosticSink : IDiagnosticSink
                     Interlocked.Increment(ref _sinkFailureCount);
                 }
             }
+
+            _writerCancellation.Dispose();
         }
     }
 
@@ -292,7 +304,7 @@ public sealed class JsonLinesDiagnosticSink : IDiagnosticSink
     {
         foreach (var canary in _canaries)
         {
-            value = value.Replace(canary, "[REDACTED]", StringComparison.Ordinal);
+            value = value.Replace(canary, SecretCanary.RedactedText, StringComparison.Ordinal);
         }
 
         if (Encoding.UTF8.GetByteCount(value) <= _maxFieldBytes)

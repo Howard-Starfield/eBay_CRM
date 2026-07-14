@@ -6,18 +6,26 @@ namespace HowardLab.EbayCrm.AppHost.Core.Diagnostics;
 public sealed class BoundedTextCollector
 {
     private static readonly byte[] NewLine = [(byte)'\n'];
-    private static readonly byte[] RedactedBytes = "[REDACTED]"u8.ToArray();
-    private static readonly byte[] ReplacementRuneBytes = "\ufffd"u8.ToArray();
+    private static readonly byte[] RedactedBytes = Encoding.UTF8.GetBytes(SecretCanary.RedactedText);
     private readonly object _gate = new();
     private readonly int _maxBytes;
-    private readonly int _maxLineBytes;
-    private readonly string[] _canaries;
-    private readonly byte[][] _canaryBytes;
+    private readonly byte[][] _canaries;
+    private readonly byte[] _matchBuffer;
+    private readonly byte[] _decoderTail = new byte[4];
+    private readonly byte[] _lineBuffer;
     private readonly MemoryStream _buffer;
+    private int _matchCount;
+    private int _decoderTailCount;
+    private int _lineByteCount;
+    private long _lineTotalBytes;
     private long _droppedLineCount;
     private long _invalidEncodingCount;
     private long _lineCount;
     private long _truncatedByteCount;
+    private bool _lineAccepting = true;
+    private bool _hasFinalFragment;
+    private bool _previousWasCarriageReturn;
+    private bool _completed;
 
     public BoundedTextCollector(
         int maxBytes,
@@ -28,13 +36,14 @@ public sealed class BoundedTextCollector
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxLineBytes);
 
         _maxBytes = maxBytes;
-        _maxLineBytes = maxLineBytes;
         _canaries = (registeredCanaries ?? [])
-            .Where(value => !string.IsNullOrEmpty(value))
+            .Select(value => SecretCanary.Validate(value, nameof(registeredCanaries)))
             .Distinct(StringComparer.Ordinal)
+            .Select(Encoding.UTF8.GetBytes)
             .OrderByDescending(value => value.Length)
             .ToArray();
-        _canaryBytes = _canaries.Select(Encoding.UTF8.GetBytes).ToArray();
+        _matchBuffer = new byte[Math.Max(1, _canaries.FirstOrDefault()?.Length ?? 0)];
+        _lineBuffer = new byte[Math.Min(maxBytes, maxLineBytes)];
         _buffer = new MemoryStream(Math.Min(maxBytes, 4_096));
     }
 
@@ -49,21 +58,108 @@ public sealed class BoundedTextCollector
         }
     }
 
-    public long LineCount => Interlocked.Read(ref _lineCount);
+    public long LineCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _lineCount;
+            }
+        }
+    }
 
-    public long DroppedLineCount => Interlocked.Read(ref _droppedLineCount);
+    public long DroppedLineCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _droppedLineCount;
+            }
+        }
+    }
 
-    public long InvalidEncodingCount => Interlocked.Read(ref _invalidEncodingCount);
+    public long InvalidEncodingCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _invalidEncodingCount;
+            }
+        }
+    }
 
-    public long TruncatedByteCount => Interlocked.Read(ref _truncatedByteCount);
+    public long TruncatedByteCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _truncatedByteCount;
+            }
+        }
+    }
 
     public void Append(string text)
     {
         ArgumentNullException.ThrowIfNull(text);
-        AppendTextLines(text.AsSpan());
+
+        lock (_gate)
+        {
+            ThrowIfCompleted();
+            var remaining = text.AsSpan();
+            Span<byte> encodedRune = stackalloc byte[4];
+            while (!remaining.IsEmpty)
+            {
+                var status = Rune.DecodeFromUtf16(remaining, out var rune, out var consumed);
+                if (status != OperationStatus.Done)
+                {
+                    rune = Rune.ReplacementChar;
+                    consumed = 1;
+                }
+
+                var encodedLength = rune.EncodeToUtf8(encodedRune);
+                AppendSourceBytes(encodedRune[..encodedLength]);
+                remaining = remaining[consumed..];
+            }
+        }
     }
 
-    public void Append(ReadOnlySpan<byte> utf8Bytes) => AppendUtf8Lines(utf8Bytes);
+    public void Append(ReadOnlySpan<byte> utf8Bytes)
+    {
+        lock (_gate)
+        {
+            ThrowIfCompleted();
+            AppendSourceBytes(utf8Bytes);
+        }
+    }
+
+    public void Complete()
+    {
+        lock (_gate)
+        {
+            if (_completed)
+            {
+                return;
+            }
+
+            ResolveMatches(final: true);
+            if (_decoderTailCount > 0)
+            {
+                _invalidEncodingCount++;
+                _decoderTailCount = 0;
+            }
+
+            if (_hasFinalFragment)
+            {
+                CommitLine();
+            }
+
+            _completed = true;
+        }
+    }
 
     public string Snapshot()
     {
@@ -73,245 +169,188 @@ public sealed class BoundedTextCollector
         }
     }
 
-    private void AppendTextLines(ReadOnlySpan<char> text)
+    private void AppendSourceBytes(ReadOnlySpan<byte> bytes)
     {
-        var lineStart = 0;
-        var foundDelimiter = false;
-        for (var index = 0; index < text.Length; index++)
+        foreach (var value in bytes)
         {
-            if (text[index] is not ('\r' or '\n'))
-            {
-                continue;
-            }
-
-            foundDelimiter = true;
-            AppendTextLine(text[lineStart..index]);
-            if (text[index] == '\r' && index + 1 < text.Length && text[index + 1] == '\n')
-            {
-                index++;
-            }
-
-            lineStart = index + 1;
-        }
-
-        if (lineStart < text.Length || !foundDelimiter)
-        {
-            AppendTextLine(text[lineStart..]);
+            _matchBuffer[_matchCount++] = value;
+            ResolveMatches(final: false);
         }
     }
 
-    private void AppendUtf8Lines(ReadOnlySpan<byte> bytes)
+    private void ResolveMatches(bool final)
     {
-        var lineStart = 0;
-        var foundDelimiter = false;
-        for (var index = 0; index < bytes.Length; index++)
+        while (_matchCount > 0)
         {
-            if (bytes[index] is not ((byte)'\r' or (byte)'\n'))
+            var pending = _matchBuffer.AsSpan(0, _matchCount);
+            var exactLength = FindLongestCanaryPrefix(pending);
+            var mayGrowIntoCanary = !final && HasLongerCanaryPrefix(pending);
+
+            if (mayGrowIntoCanary || (!final && exactLength == 0 && IsCanaryPrefix(pending)))
             {
-                continue;
-            }
-
-            foundDelimiter = true;
-            AppendUtf8Line(bytes[lineStart..index]);
-            if (bytes[index] == (byte)'\r' && index + 1 < bytes.Length && bytes[index + 1] == (byte)'\n')
-            {
-                index++;
-            }
-
-            lineStart = index + 1;
-        }
-
-        if (lineStart < bytes.Length || !foundDelimiter)
-        {
-            AppendUtf8Line(bytes[lineStart..]);
-        }
-    }
-
-    private void AppendTextLine(ReadOnlySpan<char> line)
-    {
-        var boundedLine = new byte[Math.Min(_maxBytes, _maxLineBytes)];
-        var keptBytes = 0;
-        long totalBytes = 0;
-        var acceptingOutput = true;
-        var offset = 0;
-
-        while (offset < line.Length && TryFindNextCanary(line[offset..], out var matchOffset, out var matchLength))
-        {
-            AppendText(line.Slice(offset, matchOffset), boundedLine, ref keptBytes, ref totalBytes, ref acceptingOutput);
-            AppendBytes(RedactedBytes, boundedLine, ref keptBytes, ref totalBytes, ref acceptingOutput);
-            offset += matchOffset + matchLength;
-        }
-
-        AppendText(line[offset..], boundedLine, ref keptBytes, ref totalBytes, ref acceptingOutput);
-        CommitLine(boundedLine.AsSpan(0, keptBytes), totalBytes);
-    }
-
-    private void AppendUtf8Line(ReadOnlySpan<byte> line)
-    {
-        var boundedLine = new byte[Math.Min(_maxBytes, _maxLineBytes)];
-        var keptBytes = 0;
-        long totalBytes = 0;
-        var acceptingOutput = true;
-        var invalidEncodingCount = 0;
-        var offset = 0;
-
-        while (offset < line.Length && TryFindNextCanary(line[offset..], out var matchOffset, out var matchLength))
-        {
-            AppendUtf8(
-                line.Slice(offset, matchOffset),
-                boundedLine,
-                ref keptBytes,
-                ref totalBytes,
-                ref acceptingOutput,
-                ref invalidEncodingCount);
-            AppendBytes(RedactedBytes, boundedLine, ref keptBytes, ref totalBytes, ref acceptingOutput);
-            offset += matchOffset + matchLength;
-        }
-
-        AppendUtf8(
-            line[offset..],
-            boundedLine,
-            ref keptBytes,
-            ref totalBytes,
-            ref acceptingOutput,
-            ref invalidEncodingCount);
-        if (invalidEncodingCount > 0)
-        {
-            Interlocked.Add(ref _invalidEncodingCount, invalidEncodingCount);
-        }
-
-        CommitLine(boundedLine.AsSpan(0, keptBytes), totalBytes);
-    }
-
-    private void CommitLine(ReadOnlySpan<byte> line, long totalBytes)
-    {
-        if (totalBytes > line.Length)
-        {
-            Interlocked.Add(ref _truncatedByteCount, totalBytes - line.Length);
-        }
-
-        lock (_gate)
-        {
-            if (_buffer.Length + line.Length + NewLine.Length > _maxBytes)
-            {
-                Interlocked.Increment(ref _droppedLineCount);
                 return;
             }
 
-            _buffer.Write(line);
-            _buffer.Write(NewLine);
-            Interlocked.Increment(ref _lineCount);
-        }
-    }
-
-    private static void AppendText(
-        ReadOnlySpan<char> text,
-        Span<byte> destination,
-        ref int keptBytes,
-        ref long totalBytes,
-        ref bool acceptingOutput)
-    {
-        Span<byte> encodedRune = stackalloc byte[4];
-        while (!text.IsEmpty)
-        {
-            var status = Rune.DecodeFromUtf16(text, out var rune, out var consumed);
-            if (status != OperationStatus.Done)
+            if (exactLength > 0)
             {
-                AppendBytes(ReplacementRuneBytes, destination, ref keptBytes, ref totalBytes, ref acceptingOutput);
-                text = text[1..];
+                EmitRedaction();
+                RemoveMatchedBytes(exactLength);
                 continue;
             }
 
-            var encodedLength = rune.EncodeToUtf8(encodedRune);
-            AppendBytes(encodedRune[..encodedLength], destination, ref keptBytes, ref totalBytes, ref acceptingOutput);
-            text = text[consumed..];
+            EmitDecodedByte(_matchBuffer[0]);
+            RemoveMatchedBytes(1);
         }
     }
 
-    private static void AppendUtf8(
-        ReadOnlySpan<byte> bytes,
-        Span<byte> destination,
-        ref int keptBytes,
-        ref long totalBytes,
-        ref bool acceptingOutput,
-        ref int invalidEncodingCount)
+    private int FindLongestCanaryPrefix(ReadOnlySpan<byte> pending)
     {
-        while (!bytes.IsEmpty)
-        {
-            var status = Rune.DecodeFromUtf8(bytes, out _, out var consumed);
-            if (status != OperationStatus.Done)
-            {
-                AppendBytes(ReplacementRuneBytes, destination, ref keptBytes, ref totalBytes, ref acceptingOutput);
-                invalidEncodingCount++;
-                bytes = bytes[1..];
-                continue;
-            }
-
-            AppendBytes(bytes[..consumed], destination, ref keptBytes, ref totalBytes, ref acceptingOutput);
-            bytes = bytes[consumed..];
-        }
-    }
-
-    private static void AppendBytes(
-        ReadOnlySpan<byte> bytes,
-        Span<byte> destination,
-        ref int keptBytes,
-        ref long totalBytes,
-        ref bool acceptingOutput)
-    {
-        totalBytes += bytes.Length;
-        if (!acceptingOutput)
-        {
-            return;
-        }
-
-        if (keptBytes + bytes.Length > destination.Length)
-        {
-            acceptingOutput = false;
-            return;
-        }
-
-        bytes.CopyTo(destination[keptBytes..]);
-        keptBytes += bytes.Length;
-    }
-
-    private bool TryFindNextCanary(
-        ReadOnlySpan<char> text,
-        out int matchOffset,
-        out int matchLength)
-    {
-        matchOffset = int.MaxValue;
-        matchLength = 0;
         foreach (var canary in _canaries)
         {
-            var offset = text.IndexOf(canary.AsSpan(), StringComparison.Ordinal);
-            if (offset >= 0 && offset < matchOffset)
+            if (canary.Length <= pending.Length && pending.StartsWith(canary))
             {
-                matchOffset = offset;
-                matchLength = canary.Length;
+                return canary.Length;
             }
         }
 
-        return matchLength > 0;
+        return 0;
     }
 
-    private bool TryFindNextCanary(
-        ReadOnlySpan<byte> bytes,
-        out int matchOffset,
-        out int matchLength)
+    private bool IsCanaryPrefix(ReadOnlySpan<byte> pending)
     {
-        matchOffset = int.MaxValue;
-        matchLength = 0;
-        foreach (var canary in _canaryBytes)
+        foreach (var canary in _canaries)
         {
-            var offset = bytes.IndexOf(canary);
-            if (offset >= 0 && offset < matchOffset)
+            if (canary.AsSpan().StartsWith(pending))
             {
-                matchOffset = offset;
-                matchLength = canary.Length;
+                return true;
             }
         }
 
-        return matchLength > 0;
+        return false;
+    }
+
+    private bool HasLongerCanaryPrefix(ReadOnlySpan<byte> pending)
+    {
+        foreach (var canary in _canaries)
+        {
+            if (canary.Length > pending.Length && canary.AsSpan().StartsWith(pending))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void EmitRedaction()
+    {
+        foreach (var value in RedactedBytes)
+        {
+            EmitDecodedByte(value);
+        }
+    }
+
+    private void RemoveMatchedBytes(int count)
+    {
+        _matchBuffer.AsSpan(count, _matchCount - count).CopyTo(_matchBuffer);
+        _matchCount -= count;
+    }
+
+    private void EmitDecodedByte(byte value)
+    {
+        _decoderTail[_decoderTailCount++] = value;
+        while (_decoderTailCount > 0)
+        {
+            var tail = _decoderTail.AsSpan(0, _decoderTailCount);
+            var status = Rune.DecodeFromUtf8(tail, out var rune, out var consumed);
+            if (status == OperationStatus.NeedMoreData)
+            {
+                return;
+            }
+
+            if (status == OperationStatus.InvalidData)
+            {
+                rune = Rune.ReplacementChar;
+                consumed = 1;
+                _invalidEncodingCount++;
+            }
+
+            ProcessRune(rune);
+            _decoderTail.AsSpan(consumed, _decoderTailCount - consumed).CopyTo(_decoderTail);
+            _decoderTailCount -= consumed;
+        }
+    }
+
+    private void ProcessRune(Rune rune)
+    {
+        if (rune.Value == '\r')
+        {
+            CommitLine();
+            _previousWasCarriageReturn = true;
+            return;
+        }
+
+        if (rune.Value == '\n')
+        {
+            if (_previousWasCarriageReturn)
+            {
+                _previousWasCarriageReturn = false;
+                return;
+            }
+
+            CommitLine();
+            return;
+        }
+
+        _previousWasCarriageReturn = false;
+        _hasFinalFragment = true;
+        Span<byte> encodedRune = stackalloc byte[4];
+        var encodedLength = rune.EncodeToUtf8(encodedRune);
+        _lineTotalBytes += encodedLength;
+        if (!_lineAccepting)
+        {
+            return;
+        }
+
+        if (_lineByteCount + encodedLength > _lineBuffer.Length)
+        {
+            _lineAccepting = false;
+            return;
+        }
+
+        encodedRune[..encodedLength].CopyTo(_lineBuffer.AsSpan(_lineByteCount));
+        _lineByteCount += encodedLength;
+    }
+
+    private void CommitLine()
+    {
+        if (_lineTotalBytes > _lineByteCount)
+        {
+            _truncatedByteCount += _lineTotalBytes - _lineByteCount;
+        }
+
+        if (_buffer.Length + _lineByteCount + NewLine.Length > _maxBytes)
+        {
+            _droppedLineCount++;
+        }
+        else
+        {
+            _buffer.Write(_lineBuffer, 0, _lineByteCount);
+            _buffer.Write(NewLine);
+            _lineCount++;
+        }
+
+        _lineByteCount = 0;
+        _lineTotalBytes = 0;
+        _lineAccepting = true;
+        _hasFinalFragment = false;
+    }
+
+    private void ThrowIfCompleted()
+    {
+        if (_completed)
+        {
+            throw new InvalidOperationException("Cannot append child output after the collector is complete.");
+        }
     }
 }

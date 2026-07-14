@@ -18,6 +18,16 @@ public sealed class DiagnosticSafetyTests
         Assert.Equal("[REDACTED]", $"{secret}");
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("[REDACTED]")]
+    [InlineData("REDACTED")]
+    [InlineData("ACT")]
+    public void SecretValuesRejectReplacementTokenCollisions(string invalidSecret)
+    {
+        Assert.Throws<ArgumentException>(() => new SecretValue(invalidSecret));
+    }
+
     [Fact]
     public async Task StandardDiagnosticsNeverContainRegisteredCanaries()
     {
@@ -224,6 +234,32 @@ public sealed class DiagnosticSafetyTests
             blockingStream.ReleaseWrites();
             await sink.DisposeAsync();
         }
+    }
+
+    [Fact]
+    public async Task RepeatedDisposalCompletesWriterAndDisposesItsOwnedCancellationSource()
+    {
+        var output = new MemoryStream();
+        var capturedWriterToken = CancellationToken.None;
+        var sink = new JsonLinesDiagnosticSink(
+            (_, writerToken) =>
+            {
+                capturedWriterToken = writerToken;
+                return ValueTask.FromResult<Stream>(output);
+            },
+            new TestClock(Epoch),
+            channelCapacity: 1,
+            maxFieldBytes: 128,
+            maxSegmentBytes: 1_024,
+            maxSegmentCount: 1);
+
+        await sink.WriteAsync(DiagnosticEvent.Create("dispose"));
+        await sink.DisposeAsync();
+        await sink.DisposeAsync();
+
+        Assert.True(sink.Completion.IsCompletedSuccessfully);
+        Assert.True(capturedWriterToken.CanBeCanceled);
+        Assert.Throws<ObjectDisposedException>(() => _ = capturedWriterToken.WaitHandle);
     }
 
     [Fact]
