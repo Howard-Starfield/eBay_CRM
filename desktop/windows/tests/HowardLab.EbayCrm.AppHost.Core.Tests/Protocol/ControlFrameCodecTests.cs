@@ -147,6 +147,30 @@ public sealed class ControlFrameCodecTests
         Assert.Equal(ControlProtocolErrorCode.UnknownMessageType, exception.Code);
     }
 
+    [Theory]
+    [InlineData("9")]
+    [InlineData("999")]
+    public async Task RejectsNumericMessageTypes(string numericType)
+    {
+        var json = CreateRawEnvelopeJson().Replace("\"type\":\"health\"", $"\"type\":{numericType}", StringComparison.Ordinal);
+
+        var exception = await ReadProtocolExceptionAsync(json);
+
+        Assert.Equal(ControlProtocolErrorCode.UnknownMessageType, exception.Code);
+    }
+
+    [Theory]
+    [InlineData("2")]
+    [InlineData("999")]
+    public async Task RejectsNumericRoles(string numericRole)
+    {
+        var json = CreateRawEnvelopeJson().Replace("\"role\":\"worker\"", $"\"role\":{numericRole}", StringComparison.Ordinal);
+
+        var exception = await ReadProtocolExceptionAsync(json);
+
+        Assert.Equal(ControlProtocolErrorCode.UnknownRole, exception.Code);
+    }
+
     [Fact]
     public async Task RejectsUnmappedEnvelopeFields()
     {
@@ -155,6 +179,49 @@ public sealed class ControlFrameCodecTests
         var exception = await ReadProtocolExceptionAsync(json);
 
         Assert.Equal(ControlProtocolErrorCode.InvalidJson, exception.Code);
+    }
+
+    [Theory]
+    [InlineData("{\"version\":1,\"version\":2,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"generation\":7,\"type\":\"health\",\"payload\":{\"protocolVersion\":1,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}}")]
+    [InlineData("{\"version\":1,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"generation\":7,\"type\":\"health\",\"type\":\"drain\",\"payload\":{\"protocolVersion\":1,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}}")]
+    [InlineData("{\"version\":1,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"role\":\"server\",\"generation\":7,\"type\":\"health\",\"payload\":{\"protocolVersion\":1,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}}")]
+    public async Task RejectsConflictingDuplicateTopLevelProperties(string json)
+    {
+        var exception = await ReadProtocolExceptionAsync(json);
+
+        Assert.Equal("DuplicateJsonProperty", exception.Code.ToString());
+    }
+
+    [Fact]
+    public async Task RejectsDuplicateNestedHelloPropertyWithoutExposingSecretAndClearsBuffer()
+    {
+        const string firstSecret = "secret-first-value";
+        const string secondSecret = "secret-second-value";
+        var json = $"{{\"version\":1,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"generation\":7,\"type\":\"hello\",\"payload\":{{\"processId\":42,\"processCreationTimeUtcTicks\":638880000000000000,\"capabilityNonce\":\"{firstSecret}\",\"capabilityNonce\":\"{secondSecret}\",\"buildIdentity\":\"build-1\",\"loopbackEndpoint\":null}}}}";
+        var pool = new TrackingArrayPool();
+
+        var exception = await Assert.ThrowsAsync<ControlProtocolException>(
+            () => new ControlFrameCodec(pool).ReadAsync(
+                new MemoryStream(CreateFrame(Encoding.UTF8.GetBytes(json))),
+                CancellationToken.None));
+
+        Assert.Equal("DuplicateJsonProperty", exception.Code.ToString());
+        Assert.DoesNotContain(firstSecret, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(secondSecret, exception.Message, StringComparison.Ordinal);
+        Assert.True(pool.ReturnedWithClearData);
+    }
+
+    [Fact]
+    public async Task RejectsDuplicateNestedHealthProperty()
+    {
+        var json = CreateRawEnvelopeJson().Replace(
+            "\"status\":\"ready\"",
+            "\"status\":\"ready\",\"status\":\"degraded\"",
+            StringComparison.Ordinal);
+
+        var exception = await ReadProtocolExceptionAsync(json);
+
+        Assert.Equal("DuplicateJsonProperty", exception.Code.ToString());
     }
 
     [Fact]

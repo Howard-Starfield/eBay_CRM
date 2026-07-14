@@ -20,6 +20,7 @@ public enum ControlProtocolErrorCode
     UnknownRole,
     InvalidEnvelope,
     InvalidPayload,
+    DuplicateJsonProperty,
 }
 
 public sealed class ControlProtocolException(ControlProtocolErrorCode code, Exception? innerException = null)
@@ -97,7 +98,7 @@ public sealed class ControlFrameCodec
             ControlEnvelope envelope;
             try
             {
-                PrevalidateMessageType(payload.AsSpan(0, length));
+                PrevalidateJson(payload.AsSpan(0, length));
                 envelope = JsonSerializer.Deserialize<ControlEnvelope>(payload.AsSpan(0, length), SerializerOptions)
                     ?? throw new ControlProtocolException(ControlProtocolErrorCode.InvalidJson);
             }
@@ -247,14 +248,37 @@ public sealed class ControlFrameCodec
     internal static bool IsBoundedNonEmpty(string? value) =>
         !string.IsNullOrWhiteSpace(value) && value.Length <= ControlProtocolConstants.MaxTextFieldChars;
 
-    private static void PrevalidateMessageType(ReadOnlySpan<byte> json)
+    private static void PrevalidateJson(ReadOnlySpan<byte> json)
     {
         var reader = new Utf8JsonReader(json, isFinalBlock: true, state: default);
+        var objectProperties = new Stack<HashSet<string>>();
         while (reader.Read())
         {
-            if (reader.TokenType != JsonTokenType.PropertyName ||
-                reader.CurrentDepth != 1 ||
-                !reader.ValueTextEquals("type"u8))
+            if (reader.TokenType == JsonTokenType.StartObject)
+            {
+                objectProperties.Push(new HashSet<string>(StringComparer.Ordinal));
+                continue;
+            }
+
+            if (reader.TokenType == JsonTokenType.EndObject)
+            {
+                objectProperties.Pop();
+                continue;
+            }
+
+            if (reader.TokenType != JsonTokenType.PropertyName)
+            {
+                continue;
+            }
+
+            var propertyName = reader.GetString()!;
+            if (!objectProperties.Peek().Add(propertyName))
+            {
+                throw new ControlProtocolException(ControlProtocolErrorCode.DuplicateJsonProperty);
+            }
+
+            if (objectProperties.Count != 1 ||
+                propertyName is not ("type" or "role"))
             {
                 continue;
             }
@@ -264,9 +288,9 @@ public sealed class ControlFrameCodec
                 return;
             }
 
-            var known = reader.TokenType switch
+            var known = reader.TokenType == JsonTokenType.String && propertyName switch
             {
-                JsonTokenType.String => reader.GetString() is
+                "type" => reader.GetString() is
                     "hello" or
                     "drain" or
                     "drainAccepted" or
@@ -277,17 +301,17 @@ public sealed class ControlFrameCodec
                     "shutdownAccepted" or
                     "stopped" or
                     "health",
-                JsonTokenType.Number => reader.TryGetInt32(out var numericType) &&
-                    Enum.IsDefined((ControlMessageType)numericType),
+                "role" => reader.GetString() is "database" or "server" or "worker",
                 _ => false,
             };
 
             if (!known)
             {
-                throw new ControlProtocolException(ControlProtocolErrorCode.UnknownMessageType);
+                throw new ControlProtocolException(
+                    propertyName == "type"
+                        ? ControlProtocolErrorCode.UnknownMessageType
+                        : ControlProtocolErrorCode.UnknownRole);
             }
-
-            return;
         }
     }
 
@@ -300,7 +324,7 @@ public sealed class ControlFrameCodec
             RespectRequiredConstructorParameters = true,
             UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
         };
-        options.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.CamelCase, allowIntegerValues: true));
+        options.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.CamelCase, allowIntegerValues: false));
         return options;
     }
 

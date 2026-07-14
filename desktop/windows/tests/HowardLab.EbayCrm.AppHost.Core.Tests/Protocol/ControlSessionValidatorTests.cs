@@ -208,6 +208,17 @@ public sealed class ControlSessionValidatorTests
     }
 
     [Fact]
+    public void AcceptsDrainedDirectlyAfterNoNewWorkWhenNoActiveWorkWasReported()
+    {
+        var expected = CreateExpected(RuntimeRole.Worker);
+        var validator = CreateWorkerAtNoNewWork(expected);
+
+        var result = validator.Validate(CreateEmpty(ControlMessageType.Drained, DrainOperationId));
+
+        AssertAccepted(result);
+    }
+
+    [Fact]
     public async Task NamedPipeClientConnectsToSuppliedNameAndSendsHelloFirst()
     {
         var pipeName = $"ebaycrm-{Guid.NewGuid():N}";
@@ -238,6 +249,73 @@ public sealed class ControlSessionValidatorTests
         cancellation.Cancel();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => client.ConnectAsync(cancellation.Token));
+    }
+
+    [Theory]
+    [InlineData(ClientFailurePhase.Connect)]
+    [InlineData(ClientFailurePhase.HelloWrite)]
+    [InlineData(ClientFailurePhase.HelloFlush)]
+    [InlineData(ClientFailurePhase.LaterWrite)]
+    [InlineData(ClientFailurePhase.LaterFlush)]
+    public async Task NamedPipeClientIsPermanentlyFaultedAfterTransportFailure(ClientFailurePhase failurePhase)
+    {
+        var expected = CreateExpected(RuntimeRole.Worker);
+        var transport = new ControlledClientTransport();
+        await using var client = new NamedPipeControlClient(transport, CreateHello(expected), TimeSpan.FromSeconds(5));
+
+        Func<Task> failingOperation;
+        switch (failurePhase)
+        {
+            case ClientFailurePhase.Connect:
+                transport.FailConnect = true;
+                failingOperation = () => client.ConnectAsync(CancellationToken.None);
+                break;
+            case ClientFailurePhase.HelloWrite:
+                transport.Stream.FailWriteCall = 2;
+                failingOperation = () => client.ConnectAsync(CancellationToken.None);
+                break;
+            case ClientFailurePhase.HelloFlush:
+                transport.FailFlushCall = 1;
+                failingOperation = () => client.ConnectAsync(CancellationToken.None);
+                break;
+            case ClientFailurePhase.LaterWrite:
+                await client.ConnectAsync(CancellationToken.None);
+                transport.Stream.FailWriteCall = 4;
+                failingOperation = () => client.SendAsync(CreateHealth(Guid.NewGuid(), "ready", 0), CancellationToken.None);
+                break;
+            case ClientFailurePhase.LaterFlush:
+                await client.ConnectAsync(CancellationToken.None);
+                transport.FailFlushCall = 2;
+                failingOperation = () => client.SendAsync(CreateHealth(Guid.NewGuid(), "ready", 0), CancellationToken.None);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(failurePhase));
+        }
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(failingOperation);
+        var callsAfterFailure = transport.OperationCount;
+
+        var connectException = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => client.ConnectAsync(CancellationToken.None));
+        var sendException = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => client.SendAsync(CreateHealth(Guid.NewGuid(), "ready", 0), CancellationToken.None));
+
+        Assert.Equal("The control client is faulted and cannot be reused.", connectException.Message);
+        Assert.Equal("The control client is faulted and cannot be reused.", sendException.Message);
+        Assert.Equal(callsAfterFailure, transport.OperationCount);
+    }
+
+    [Fact]
+    public async Task NamedPipeClientDisposeIsIdempotent()
+    {
+        var expected = CreateExpected(RuntimeRole.Worker);
+        var transport = new ControlledClientTransport();
+        var client = new NamedPipeControlClient(transport, CreateHello(expected), TimeSpan.FromSeconds(5));
+
+        await client.DisposeAsync();
+        await client.DisposeAsync();
+
+        Assert.Equal(1, transport.DisposeCalls);
     }
 
     private static ControlSessionValidator CreateWorkerAtNoNewWork(ExpectedControlIdentity expected)
@@ -294,4 +372,77 @@ public sealed class ControlSessionValidatorTests
 
     private static void AssertAccepted(ControlValidationResult result) =>
         Assert.Equal(ControlValidationStatus.Accepted, result.Status);
+
+    public enum ClientFailurePhase
+    {
+        Connect,
+        HelloWrite,
+        HelloFlush,
+        LaterWrite,
+        LaterFlush,
+    }
+
+    private sealed class ControlledClientTransport : IControlClientTransport
+    {
+        public ControlledWriteStream Stream { get; } = new();
+        Stream IControlClientTransport.Stream => Stream;
+        public bool IsConnected { get; private set; }
+        public bool FailConnect { get; set; }
+        public int FailFlushCall { get; set; }
+        public int ConnectCalls { get; private set; }
+        public int FlushCalls { get; private set; }
+        public int DisposeCalls { get; private set; }
+        public int OperationCount => ConnectCalls + Stream.WriteCalls + FlushCalls;
+
+        public Task ConnectAsync(CancellationToken cancellationToken)
+        {
+            ConnectCalls++;
+            if (FailConnect)
+            {
+                return Task.FromException(new OperationCanceledException());
+            }
+
+            IsConnected = true;
+            return Task.CompletedTask;
+        }
+
+        public Task FlushAsync(CancellationToken cancellationToken)
+        {
+            FlushCalls++;
+            return FlushCalls == FailFlushCall
+                ? Task.FromException(new OperationCanceledException())
+                : Task.CompletedTask;
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            DisposeCalls++;
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class ControlledWriteStream : Stream
+    {
+        public int FailWriteCall { get; set; }
+        public int WriteCalls { get; private set; }
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            WriteCalls++;
+            return WriteCalls == FailWriteCall
+                ? ValueTask.FromException(new OperationCanceledException())
+                : ValueTask.CompletedTask;
+        }
+
+        public override void Flush() => throw new NotSupportedException();
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
 }
