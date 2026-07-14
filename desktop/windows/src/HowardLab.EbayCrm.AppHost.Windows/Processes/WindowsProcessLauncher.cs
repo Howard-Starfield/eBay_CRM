@@ -13,18 +13,42 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
     private readonly IDiagnosticSink _diagnosticSink;
     private readonly int _maxOutputBytes;
     private readonly int _maxLineBytes;
+    private readonly IProcessCleanupPolicy _cleanupPolicy;
+    private readonly IWindowsProcessIdentityVerifier _identityVerifier;
 
     public WindowsProcessLauncher(
         IDiagnosticSink diagnosticSink,
         int maxOutputBytes = 1024 * 1024,
-        int maxLineBytes = 64 * 1024)
+        int maxLineBytes = 64 * 1024,
+        TimeSpan? processCleanupTimeout = null)
+        : this(
+            diagnosticSink,
+            maxOutputBytes,
+            maxLineBytes,
+            new BoundedProcessCleanup(
+                NativeProcessCleanup.Instance,
+                processCleanupTimeout ?? BoundedProcessCleanup.ProductionDefaultTimeout),
+            WindowsProcessIdentityVerifier.Instance)
+    {
+    }
+
+    internal WindowsProcessLauncher(
+        IDiagnosticSink diagnosticSink,
+        int maxOutputBytes,
+        int maxLineBytes,
+        IProcessCleanupPolicy cleanupPolicy,
+        IWindowsProcessIdentityVerifier identityVerifier)
     {
         ArgumentNullException.ThrowIfNull(diagnosticSink);
+        ArgumentNullException.ThrowIfNull(cleanupPolicy);
+        ArgumentNullException.ThrowIfNull(identityVerifier);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxOutputBytes);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxLineBytes);
         _diagnosticSink = diagnosticSink;
         _maxOutputBytes = maxOutputBytes;
         _maxLineBytes = maxLineBytes;
+        _cleanupPolicy = cleanupPolicy;
+        _identityVerifier = identityVerifier;
     }
 
     public ValueTask<ISupervisedProcess> LaunchAsync(
@@ -138,7 +162,7 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
             standardErrorWrite = null;
 
             cancellationToken.ThrowIfCancellationRequested();
-            var identity = WindowsProcessIdentityVerifier.Capture(
+            var identity = _identityVerifier.Capture(
                 validated.Specification.Role,
                 validated.Specification.Generation,
                 processHandle);
@@ -163,7 +187,9 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
                 standardOutput,
                 standardError,
                 validated.Specification.OutputDrainTimeout,
-                _diagnosticSink);
+                _diagnosticSink,
+                _cleanupPolicy,
+                job);
             processHandle = null;
             standardOutputRead = null;
             standardErrorRead = null;
@@ -171,17 +197,17 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
         }
         catch (OperationCanceledException)
         {
-            TerminateAndWait(processHandle);
+            EnsureCleanupCompleted(processHandle, job, validated.Specification.Role);
             throw;
         }
         catch (Win32Exception error)
         {
-            TerminateAndWait(processHandle);
+            EnsureCleanupCompleted(processHandle, job, validated.Specification.Role);
             throw new ProcessLaunchException(validated.Specification.Role, error.NativeErrorCode);
         }
         catch
         {
-            TerminateAndWait(processHandle);
+            EnsureCleanupCompleted(processHandle, job, validated.Specification.Role);
             throw;
         }
         finally
@@ -350,15 +376,26 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
         }
     }
 
-    private static void TerminateAndWait(SafeProcessHandle? processHandle)
+    private void EnsureCleanupCompleted(
+        SafeProcessHandle? processHandle,
+        WindowsJobObject job,
+        HowardLab.EbayCrm.AppHost.Protocol.Control.RuntimeRole role)
     {
         if (processHandle is null || processHandle.IsInvalid || processHandle.IsClosed)
         {
             return;
         }
 
-        _ = NativeMethods.TerminateProcess(processHandle, exitCode: 1);
-        _ = NativeMethods.WaitForSingleObject(processHandle, NativeMethods.Infinite);
+        var result = _cleanupPolicy.Cleanup(processHandle, job);
+        if (!result.Signaled)
+        {
+            throw new ProcessCleanupException(
+                role,
+                result.ProcessTerminationErrorCode,
+                result.JobTerminationErrorCode,
+                result.WaitErrorCode,
+                result.TimedOut);
+        }
     }
 
     private sealed record ValidatedLaunch(

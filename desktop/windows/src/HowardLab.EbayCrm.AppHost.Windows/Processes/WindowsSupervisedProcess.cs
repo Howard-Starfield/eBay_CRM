@@ -12,13 +12,17 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
     private readonly FileStream _standardOutputStream;
     private readonly FileStream _standardErrorStream;
     private readonly CancellationTokenSource _drainCancellation = new();
+    private readonly CancellationTokenSource _completionCancellation = new();
     private readonly TimeSpan _outputDrainTimeout;
     private readonly IDiagnosticSink _diagnosticSink;
     private readonly Task _standardOutputDrain;
     private readonly Task _standardErrorDrain;
     private readonly DrainState _standardOutputState;
     private readonly DrainState _standardErrorState;
-    private int _disposeState;
+    private readonly IProcessCleanupPolicy _cleanupPolicy;
+    private readonly IProcessTreeTerminator _job;
+    private readonly object _disposeGate = new();
+    private Task? _disposeTask;
 
     internal WindowsSupervisedProcess(
         SupervisedProcessIdentity identity,
@@ -28,7 +32,9 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
         BoundedTextCollector standardOutput,
         BoundedTextCollector standardError,
         TimeSpan outputDrainTimeout,
-        IDiagnosticSink diagnosticSink)
+        IDiagnosticSink diagnosticSink,
+        IProcessCleanupPolicy cleanupPolicy,
+        IProcessTreeTerminator job)
     {
         Identity = identity;
         ProcessHandle = processHandle;
@@ -36,6 +42,8 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
         StandardError = standardError;
         _outputDrainTimeout = outputDrainTimeout;
         _diagnosticSink = diagnosticSink;
+        _cleanupPolicy = cleanupPolicy;
+        _job = job;
         _standardOutputStream = new FileStream(
             standardOutputRead,
             FileAccess.Read,
@@ -56,7 +64,7 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
             _standardErrorStream,
             _standardErrorState,
             _drainCancellation.Token);
-        Completion = CompleteAsync();
+        Completion = CompleteAsync(_completionCancellation.Token);
     }
 
     public SupervisedProcessIdentity Identity { get; }
@@ -68,6 +76,8 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
     public BoundedTextCollector StandardOutput { get; }
 
     public BoundedTextCollector StandardError { get; }
+
+    internal Task StandardOutputLineAvailable => _standardOutputState.LineAvailable;
 
     public bool HasExited
     {
@@ -83,35 +93,50 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposeState, 1) != 0)
+        lock (_disposeGate)
         {
-            return;
+            return new ValueTask(_disposeTask ??= DisposeCoreAsync());
         }
+    }
 
+    private async Task DisposeCoreAsync()
+    {
         try
         {
             if (!HasExited)
             {
-                _ = NativeMethods.TerminateProcess(ProcessHandle, exitCode: 1);
+                var cleanup = await Task.Run(
+                    () => _cleanupPolicy.Cleanup(ProcessHandle, _job)).ConfigureAwait(false);
+                if (!cleanup.Signaled)
+                {
+                    throw new ProcessCleanupException(
+                        Identity.Role,
+                        cleanup.ProcessTerminationErrorCode,
+                        cleanup.JobTerminationErrorCode,
+                        cleanup.WaitErrorCode,
+                        cleanup.TimedOut);
+                }
             }
 
             await Completion.ConfigureAwait(false);
         }
         finally
         {
+            _completionCancellation.Cancel();
             _drainCancellation.Cancel();
             _standardOutputStream.Dispose();
             _standardErrorStream.Dispose();
             _drainCancellation.Dispose();
+            _completionCancellation.Dispose();
             ProcessHandle.Dispose();
         }
     }
 
-    private async Task<int> CompleteAsync()
+    private async Task<int> CompleteAsync(CancellationToken cancellationToken)
     {
-        await WaitForExitAsync(ProcessHandle).ConfigureAwait(false);
+        await WaitForExitAsync(ProcessHandle, cancellationToken).ConfigureAwait(false);
         if (!NativeMethods.GetExitCodeProcess(ProcessHandle, out var exitCode))
         {
             throw new Win32Exception(Marshal.GetLastPInvokeError());
@@ -198,12 +223,16 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
     {
         private readonly object _gate = new();
         private readonly BoundedTextCollector _collector;
+        private readonly TaskCompletionSource _lineAvailable =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
         private bool _stopped;
 
         internal DrainState(BoundedTextCollector collector)
         {
             _collector = collector;
         }
+
+        internal Task LineAvailable => _lineAvailable.Task;
 
         internal void Append(ReadOnlySpan<byte> bytes)
         {
@@ -212,6 +241,10 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
                 if (!_stopped)
                 {
                     _collector.Append(bytes);
+                    if (_collector.LineCount > 0)
+                    {
+                        _lineAvailable.TrySetResult();
+                    }
                 }
             }
         }
@@ -231,7 +264,9 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
         }
     }
 
-    private static Task WaitForExitAsync(SafeProcessHandle processHandle)
+    private static Task WaitForExitAsync(
+        SafeProcessHandle processHandle,
+        CancellationToken cancellationToken)
     {
         var waitHandle = new ProcessWaitHandle(processHandle);
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -241,13 +276,20 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
             completion,
             Timeout.Infinite,
             executeOnlyOnce: true);
-        return AwaitAndDisposeAsync(completion.Task, registration, waitHandle);
+        var cancellationRegistration = cancellationToken.Register(
+            () => completion.TrySetCanceled(cancellationToken));
+        return AwaitAndDisposeAsync(
+            completion.Task,
+            registration,
+            waitHandle,
+            cancellationRegistration);
     }
 
     private static async Task AwaitAndDisposeAsync(
         Task completion,
         RegisteredWaitHandle registration,
-        WaitHandle waitHandle)
+        WaitHandle waitHandle,
+        CancellationTokenRegistration cancellationRegistration)
     {
         try
         {
@@ -255,6 +297,7 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
         }
         finally
         {
+            cancellationRegistration.Dispose();
             registration.Unregister(waitObject: null);
             waitHandle.Dispose();
         }

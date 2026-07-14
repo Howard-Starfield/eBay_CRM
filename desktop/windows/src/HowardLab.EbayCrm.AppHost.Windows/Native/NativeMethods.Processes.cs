@@ -234,6 +234,12 @@ internal static unsafe partial class NativeMethods
         uint exitCode);
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool TerminateJobObject(
+        SafeJobHandle job,
+        uint exitCode);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
     internal static partial uint WaitForSingleObject(
         SafeProcessHandle handle,
         uint milliseconds);

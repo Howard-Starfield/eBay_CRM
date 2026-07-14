@@ -23,3 +23,37 @@ public sealed class ProcessLaunchException : Exception
 
     public int Win32ErrorCode { get; }
 }
+
+public sealed class ProcessCleanupException : Exception
+{
+    public ProcessCleanupException(
+        RuntimeRole role,
+        int? processTerminationErrorCode,
+        int? jobTerminationErrorCode,
+        int? waitErrorCode,
+        bool timedOut)
+        : base(
+            $"Could not complete {role} process cleanup; " +
+            $"process error {Format(processTerminationErrorCode)}, " +
+            $"job error {Format(jobTerminationErrorCode)}, " +
+            $"wait error {Format(waitErrorCode)}, timed out {timedOut}.")
+    {
+        Role = role;
+        ProcessTerminationErrorCode = processTerminationErrorCode;
+        JobTerminationErrorCode = jobTerminationErrorCode;
+        WaitErrorCode = waitErrorCode;
+        TimedOut = timedOut;
+    }
+
+    public RuntimeRole Role { get; }
+
+    public int? ProcessTerminationErrorCode { get; }
+
+    public int? JobTerminationErrorCode { get; }
+
+    public int? WaitErrorCode { get; }
+
+    public bool TimedOut { get; }
+
+    private static string Format(int? errorCode) => errorCode?.ToString() ?? "none";
+}

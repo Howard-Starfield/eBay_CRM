@@ -8,9 +8,23 @@ using Microsoft.Win32.SafeHandles;
 
 namespace HowardLab.EbayCrm.AppHost.Windows.Processes;
 
-internal static unsafe class WindowsProcessIdentityVerifier
+internal interface IWindowsProcessIdentityVerifier
 {
-    internal static SupervisedProcessIdentity Capture(
+    SupervisedProcessIdentity Capture(
+        RuntimeRole role,
+        ProcessGeneration generation,
+        SafeProcessHandle processHandle);
+}
+
+internal sealed unsafe class WindowsProcessIdentityVerifier : IWindowsProcessIdentityVerifier
+{
+    internal static WindowsProcessIdentityVerifier Instance { get; } = new();
+
+    private WindowsProcessIdentityVerifier()
+    {
+    }
+
+    public SupervisedProcessIdentity Capture(
         RuntimeRole role,
         ProcessGeneration generation,
         SafeProcessHandle processHandle)

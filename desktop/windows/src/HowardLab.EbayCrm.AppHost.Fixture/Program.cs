@@ -48,6 +48,37 @@ switch (args[0])
 
         return 0;
 
+    case "announce-tree-hold":
+        if (args.Length != 3)
+        {
+            return 4;
+        }
+
+        var treeStartInfo = new ProcessStartInfo
+        {
+            FileName = Environment.ProcessPath
+                ?? throw new InvalidOperationException("The fixture executable path is unavailable."),
+            UseShellExecute = false,
+        };
+        treeStartInfo.ArgumentList.Add("hold");
+        using (var treeChild = Process.Start(treeStartInfo)
+            ?? throw new InvalidOperationException("Could not start the fixture tree child."))
+        {
+            File.WriteAllText(args[1], JsonSerializer.Serialize(new
+            {
+                ProcessId = Environment.ProcessId,
+                GrandchildProcessId = treeChild.Id,
+            }));
+        }
+
+        using (var ready = EventWaitHandle.OpenExisting(args[2]))
+        {
+            ready.Set();
+        }
+
+        Thread.Sleep(Timeout.Infinite);
+        return 0;
+
     case "immediate-grandchild":
         var startInfo = new ProcessStartInfo
         {

@@ -18,9 +18,10 @@ public sealed class WindowsJobObjectTests
             CancellationToken.None);
         var process = Assert.IsType<WindowsSupervisedProcess>(launched);
 
-        var announcement = await WaitForJsonLineAsync<GrandchildAnnouncement>(
-            process.StandardOutput.Snapshot,
-            CancellationToken.None);
+        await process.StandardOutputLineAvailable.WaitAsync(Deadline);
+        var announcement = JsonSerializer.Deserialize<GrandchildAnnouncement>(
+            process.StandardOutput.Snapshot());
+        Assert.NotNull(announcement);
         using var grandchild = Process.GetProcessById(announcement.ProcessId);
         _ = grandchild.SafeHandle;
         Assert.True(job.Contains(process.ProcessHandle));
@@ -54,30 +55,6 @@ public sealed class WindowsJobObjectTests
         duplicate.Dispose();
 
         await process.Completion.WaitAsync(Deadline);
-    }
-
-    private static async Task<T> WaitForJsonLineAsync<T>(
-        Func<string> snapshot,
-        CancellationToken cancellationToken)
-    {
-        var deadline = DateTime.UtcNow + Deadline;
-        while (DateTime.UtcNow < deadline)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var text = snapshot();
-            if (!string.IsNullOrWhiteSpace(text))
-            {
-                var value = JsonSerializer.Deserialize<T>(text);
-                if (value is not null)
-                {
-                    return value;
-                }
-            }
-
-            await Task.Delay(TimeSpan.FromMilliseconds(10), cancellationToken);
-        }
-
-        throw new TimeoutException("The fixture did not publish its grandchild identity before the deadline.");
     }
 
     private sealed record GrandchildAnnouncement(int ProcessId);

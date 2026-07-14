@@ -6,7 +6,7 @@ using Microsoft.Win32.SafeHandles;
 
 namespace HowardLab.EbayCrm.AppHost.Windows.Processes;
 
-public sealed class WindowsJobObject : IProcessGroup
+public sealed class WindowsJobObject : IProcessGroup, IProcessTreeTerminator
 {
     private readonly SafeJobHandle _handle;
 
@@ -71,6 +71,23 @@ public sealed class WindowsJobObject : IProcessGroup
         }
 
         return new SafeJobHandle(duplicate, ownsHandle: true);
+    }
+
+    NativeCallResult IProcessTreeTerminator.TerminateTree(uint exitCode) =>
+        TerminateTree(exitCode);
+
+    internal NativeCallResult TerminateTree(uint exitCode)
+    {
+        try
+        {
+            return NativeMethods.TerminateJobObject(_handle, exitCode)
+                ? NativeCallResult.Success
+                : NativeCallResult.Failure(Marshal.GetLastPInvokeError());
+        }
+        catch (ObjectDisposedException)
+        {
+            return NativeCallResult.Failure(6);
+        }
     }
 
     public void Dispose() => _handle.Dispose();
