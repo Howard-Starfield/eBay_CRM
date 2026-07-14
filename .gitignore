@@ -66,3 +66,9 @@ screenshots/
 
 # Local isolated implementation worktrees
 .worktrees/
+
+# .NET desktop host artifacts
+**/bin/
+**/obj/
+desktop/windows/artifacts/
+.tools/
