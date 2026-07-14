@@ -25,6 +25,27 @@ export type LogicalJobStart =
   | { kind: 'fenced' }
   | { kind: 'stall-exhausted' };
 
+export type LogicalPhysicalArgs = {
+  queueName: MessageQueue;
+  physicalJobId: string;
+};
+
+export type LogicalStartArgs = LogicalPhysicalArgs & {
+  envelope: LogicalPgBossEnvelope;
+  transportRetryCount: number;
+  workerInstanceId: string;
+};
+
+export type LogicalSettlementArgs = LogicalPhysicalArgs & {
+  logicalJobId: string;
+  generation: number;
+  executionToken: string;
+};
+
+export type LogicalDeadLetterArgs = LogicalPhysicalArgs & {
+  envelope: LogicalPgBossEnvelope;
+};
+
 export type LogicalTransport = {
   send: (args: {
     queueName: MessageQueue;

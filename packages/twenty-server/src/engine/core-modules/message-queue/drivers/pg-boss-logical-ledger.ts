@@ -3,12 +3,20 @@ import { type Db as PgBossDatabase } from 'pg-boss';
 import { v4, v5 } from 'uuid';
 
 import { type QueueJobOptions } from 'src/engine/core-modules/message-queue/drivers/interfaces/job-options.interface';
+import { type MessageQueueJobRecord } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-job-record.type';
+import { type MessageQueueJobState } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-job-state.type';
+import { type MessageQueueStats } from 'src/engine/core-modules/message-queue/drivers/interfaces/message-queue-stats.type';
 import { type MessageQueueJobData } from 'src/engine/core-modules/message-queue/interfaces/message-queue-job.interface';
 import { type MessageQueueWorkerOptions } from 'src/engine/core-modules/message-queue/interfaces/message-queue-worker-options.interface';
 import { type MessageQueue } from 'src/engine/core-modules/message-queue/message-queue.constants';
 
 import {
+  type LogicalDeadLetterArgs,
+  type LogicalJobStart,
+  type LogicalPhysicalArgs,
   type LogicalQueuePolicy,
+  type LogicalSettlementArgs,
+  type LogicalStartArgs,
   type LogicalTransport,
 } from './pg-boss-logical-ledger.types';
 
@@ -21,6 +29,44 @@ type PgBossLogicalLedgerOptions = {
 type PersistedQueuePolicy = {
   stall_recovery_limit: number;
   heartbeat_seconds: number | null;
+};
+
+type StartableQueueJob = {
+  id: string;
+  generation: number;
+  current_physical_job_id: string;
+  status: string;
+  stall_count: number;
+  stall_recovery_limit: number;
+  transport_retry_count: number;
+  job_name?: string;
+  payload?: MessageQueueJobData;
+};
+
+type SettlementQueueJob = {
+  id: string;
+  generation: number;
+  current_physical_job_id: string;
+  current_execution_token: string | null;
+  status: string;
+  handler_failure_count: number;
+  handler_retry_limit: number;
+  stall_count: number;
+  stall_recovery_limit: number;
+  priority: number;
+};
+
+type QueueJobInspectionRow = {
+  id: string;
+  job_name: string;
+  payload: MessageQueueJobData;
+  status: string;
+  started_count: number;
+  created_at: Date;
+  updated_at: Date;
+  completed_at: Date | null;
+  failed_at: Date | null;
+  last_error: { name?: string; message?: string } | null;
 };
 
 type PostgreSqlError = Error & {
@@ -171,6 +217,643 @@ export class PgBossLogicalLedger {
     }
   }
 
+  async startAttempt(args: LogicalStartArgs): Promise<LogicalJobStart> {
+    await this.initialize();
+
+    const client = await this.options.pool.connect();
+
+    try {
+      await client.query('BEGIN');
+
+      const result = await client.query<StartableQueueJob>({
+        text: `
+          SELECT id, generation, current_physical_job_id, status, stall_count,
+            stall_recovery_limit, transport_retry_count
+          FROM ${this.options.schema}.queue_job
+          WHERE id = $1
+          FOR UPDATE
+        `,
+        values: [args.envelope.logicalJobId],
+      });
+      const job = result.rows[0];
+
+      if (
+        !job ||
+        job.id !== args.envelope.logicalJobId ||
+        job.generation !== args.envelope.generation ||
+        job.current_physical_job_id !== args.physicalJobId ||
+        !['queued', 'retry_wait', 'active'].includes(job.status)
+      ) {
+        await this.completeFencedEnvelopeWithClient(client, args);
+        await client.query('COMMIT');
+
+        return { kind: 'fenced' };
+      }
+
+      const retryDelta = Math.max(
+        0,
+        args.transportRetryCount - job.transport_retry_count,
+      );
+      const stallCount = job.stall_count + retryDelta;
+      const executionToken = v4();
+
+      if (stallCount > job.stall_recovery_limit) {
+        await client.query({
+          text: `
+            UPDATE ${this.options.schema}.queue_job
+            SET status = 'failed',
+              stall_count = $2,
+              transport_retry_count = $3,
+              current_execution_token = NULL,
+              failure_kind = 'stall_exhausted',
+              failed_at = now(),
+              updated_at = now()
+            WHERE id = $1
+              AND generation = $4
+              AND current_physical_job_id = $5
+              AND status IN ('queued', 'retry_wait', 'active')
+          `,
+          values: [
+            job.id,
+            stallCount,
+            Math.max(job.transport_retry_count, args.transportRetryCount),
+            job.generation,
+            args.physicalJobId,
+          ],
+        });
+        await client.query({
+          text: `
+            INSERT INTO ${this.options.schema}.queue_job_attempt (
+              id, job_id, generation, physical_job_id, worker_instance_id,
+              execution_token, transport_retry_count, started_at, finished_at,
+              outcome
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now(), 'stalled')
+          `,
+          values: [
+            v4(),
+            job.id,
+            job.generation,
+            args.physicalJobId,
+            args.workerInstanceId,
+            executionToken,
+            args.transportRetryCount,
+          ],
+        });
+        await this.completeFencedEnvelopeWithClient(client, args);
+        await client.query('COMMIT');
+
+        return { kind: 'stall-exhausted' };
+      }
+
+      const details =
+        job.job_name === undefined || job.payload === undefined
+          ? await client.query<{
+              job_name: string;
+              payload: MessageQueueJobData;
+            }>({
+              text: `
+                SELECT job_name, payload
+                FROM ${this.options.schema}.queue_job
+                WHERE id = $1
+              `,
+              values: [job.id],
+            })
+          : { rows: [{ job_name: job.job_name, payload: job.payload }] };
+      const jobDetails = details.rows[0];
+
+      if (!jobDetails) {
+        throw new Error(`logical queue job ${job.id} has no handler payload`);
+      }
+
+      await client.query({
+        text: `
+          UPDATE ${this.options.schema}.queue_job
+          SET status = 'active',
+            stall_count = $2,
+            transport_retry_count = $3,
+            started_count = started_count + 1,
+            current_execution_token = $4,
+            updated_at = now()
+          WHERE id = $1
+            AND generation = $5
+            AND current_physical_job_id = $6
+            AND status IN ('queued', 'retry_wait', 'active')
+          RETURNING id
+        `,
+        values: [
+          job.id,
+          stallCount,
+          Math.max(job.transport_retry_count, args.transportRetryCount),
+          executionToken,
+          job.generation,
+          args.physicalJobId,
+        ],
+      });
+      await client.query({
+        text: `
+          INSERT INTO ${this.options.schema}.queue_job_attempt (
+            id, job_id, generation, physical_job_id, worker_instance_id,
+            execution_token, transport_retry_count, started_at, outcome
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, now(), 'running')
+        `,
+        values: [
+          v4(),
+          job.id,
+          job.generation,
+          args.physicalJobId,
+          args.workerInstanceId,
+          executionToken,
+          args.transportRetryCount,
+        ],
+      });
+      await client.query('COMMIT');
+
+      return {
+        kind: 'execute',
+        logicalJobId: job.id,
+        jobName: jobDetails.job_name,
+        data: jobDetails.payload,
+        executionToken,
+      };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async completeFencedEnvelope(args: LogicalPhysicalArgs): Promise<void> {
+    await this.initialize();
+
+    const client = await this.options.pool.connect();
+
+    try {
+      await client.query('BEGIN');
+      await this.completeFencedEnvelopeWithClient(client, args);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async settleSuccess(
+    args: LogicalSettlementArgs,
+  ): Promise<'settled' | 'fenced'> {
+    await this.initialize();
+
+    const client = await this.options.pool.connect();
+
+    try {
+      await client.query('BEGIN');
+      const attempt = await client.query<{ id: string }>({
+        text: `
+          UPDATE ${this.options.schema}.queue_job_attempt
+          SET outcome = 'completed', finished_at = now()
+          WHERE job_id = $1
+            AND execution_token = $3
+            AND outcome = 'running'
+            AND EXISTS (
+              SELECT 1
+              FROM ${this.options.schema}.queue_job
+              WHERE id = $1
+                AND generation = $2
+                AND current_execution_token = $3
+                AND status = 'active'
+            )
+          RETURNING id
+        `,
+        values: [args.logicalJobId, args.generation, args.executionToken],
+      });
+
+      if (!attempt.rows[0]) {
+        await client.query('ROLLBACK');
+
+        return 'fenced';
+      }
+
+      const settled = await client.query<{ id: string }>({
+        text: `
+          UPDATE ${this.options.schema}.queue_job
+          SET status = 'completed',
+            current_execution_token = NULL,
+            failure_kind = NULL,
+            last_error = NULL,
+            completed_at = now(),
+            updated_at = now()
+          WHERE id = $1
+            AND generation = $2
+            AND current_execution_token = $3
+            AND status = 'active'
+          RETURNING id
+        `,
+        values: [args.logicalJobId, args.generation, args.executionToken],
+      });
+
+      if (!settled.rows[0]) {
+        await client.query('ROLLBACK');
+
+        return 'fenced';
+      }
+
+      await this.completeFencedEnvelopeWithClient(client, args);
+      await client.query('COMMIT');
+
+      return 'settled';
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async settleFailure(
+    args: LogicalSettlementArgs,
+    error: unknown,
+  ): Promise<'retried' | 'failed' | 'fenced'> {
+    await this.initialize();
+
+    const client = await this.options.pool.connect();
+
+    try {
+      await client.query('BEGIN');
+      const locked = await client.query<SettlementQueueJob>({
+        text: `
+          SELECT id, generation, current_physical_job_id,
+            current_execution_token, status, handler_failure_count,
+            handler_retry_limit, stall_count, stall_recovery_limit, priority
+          FROM ${this.options.schema}.queue_job
+          WHERE id = $1
+          FOR UPDATE
+        `,
+        values: [args.logicalJobId],
+      });
+      const job = locked.rows[0];
+
+      if (!this.matchesSettlementFence(job, args)) {
+        await client.query('COMMIT');
+
+        return 'fenced';
+      }
+
+      const sanitizedError = this.sanitizeError(error);
+      const failureCount = job.handler_failure_count + 1;
+
+      const attempt = await client.query<{ id: string }>({
+        text: `
+          UPDATE ${this.options.schema}.queue_job_attempt
+          SET outcome = 'handler_failed', finished_at = now(), error = $3::jsonb
+          WHERE job_id = $1
+            AND execution_token = $2
+            AND outcome = 'running'
+            AND EXISTS (
+              SELECT 1
+              FROM ${this.options.schema}.queue_job
+              WHERE id = $1
+                AND generation = $4
+                AND current_execution_token = $2
+                AND status = 'active'
+            )
+          RETURNING id
+        `,
+        values: [
+          args.logicalJobId,
+          args.executionToken,
+          sanitizedError,
+          args.generation,
+        ],
+      });
+
+      if (!attempt.rows[0]) {
+        await client.query('ROLLBACK');
+
+        return 'fenced';
+      }
+
+      if (failureCount <= job.handler_retry_limit) {
+        const nextGeneration = job.generation + 1;
+        const nextPhysicalJobId = this.physicalJobId(
+          args.logicalJobId,
+          nextGeneration,
+        );
+        const remainingStallAllowance = Math.max(
+          0,
+          job.stall_recovery_limit - job.stall_count,
+        );
+        const availableAt = new Date();
+        const transitioned = await client.query<{ id: string }>({
+          text: `
+            UPDATE ${this.options.schema}.queue_job
+            SET status = 'retry_wait',
+              generation = $4,
+              handler_failure_count = $5,
+              stall_count = $6,
+              transport_retry_count = 0,
+              current_physical_job_id = $7,
+              current_execution_token = NULL,
+              last_error = $8::jsonb,
+              available_at = $9,
+              updated_at = now()
+            WHERE id = $1
+              AND generation = $2
+              AND current_execution_token = $3
+              AND status = 'active'
+            RETURNING id
+          `,
+          values: [
+            args.logicalJobId,
+            args.generation,
+            args.executionToken,
+            nextGeneration,
+            failureCount,
+            job.stall_count,
+            nextPhysicalJobId,
+            sanitizedError,
+            availableAt,
+          ],
+        });
+
+        if (!transitioned.rows[0]) {
+          await client.query('ROLLBACK');
+
+          return 'fenced';
+        }
+
+        await this.options.transport.send({
+          queueName: args.queueName,
+          envelope: {
+            version: 2,
+            logicalJobId: args.logicalJobId,
+            generation: nextGeneration,
+          },
+          physicalJobId: nextPhysicalJobId,
+          stallRecoveryLimit: remainingStallAllowance,
+          priority: job.priority,
+          availableAt,
+          db: this.toPgBossDatabase(client),
+        });
+        await this.completeFencedEnvelopeWithClient(client, args);
+        await client.query('COMMIT');
+
+        return 'retried';
+      }
+
+      const transitioned = await client.query<{ id: string }>({
+        text: `
+          UPDATE ${this.options.schema}.queue_job
+          SET status = 'failed',
+            handler_failure_count = $4,
+            current_execution_token = NULL,
+            failure_kind = 'handler_exhausted',
+            last_error = $5::jsonb,
+            failed_at = now(),
+            updated_at = now()
+          WHERE id = $1
+            AND generation = $2
+            AND current_execution_token = $3
+            AND status = 'active'
+          RETURNING id
+        `,
+        values: [
+          args.logicalJobId,
+          args.generation,
+          args.executionToken,
+          failureCount,
+          sanitizedError,
+        ],
+      });
+
+      if (!transitioned.rows[0]) {
+        await client.query('ROLLBACK');
+
+        return 'fenced';
+      }
+
+      await this.completeFencedEnvelopeWithClient(client, args);
+      await client.query('COMMIT');
+
+      return 'failed';
+    } catch (caughtError) {
+      await client.query('ROLLBACK');
+      throw caughtError;
+    } finally {
+      client.release();
+    }
+  }
+
+  async getStats(queueName: MessageQueue): Promise<MessageQueueStats> {
+    await this.initialize();
+
+    const result = await this.options.pool.query<{
+      status: string;
+      count: string;
+    }>({
+      text: `
+        SELECT status, count(*)::text AS count
+        FROM ${this.options.schema}.queue_job
+        WHERE queue_name = $1
+        GROUP BY status
+      `,
+      values: [queueName],
+    });
+    const counts = {
+      queued: 0,
+      active: 0,
+      retry_wait: 0,
+      completed: 0,
+      failed: 0,
+      cancelled: 0,
+    };
+
+    for (const row of result.rows) {
+      if (row.status in counts) {
+        counts[row.status as keyof typeof counts] = Number(row.count);
+      }
+    }
+
+    return {
+      queueName,
+      created: counts.queued,
+      active: counts.active,
+      retry: counts.retry_wait,
+      completed: counts.completed,
+      failed: counts.failed + counts.cancelled,
+      healthy: true,
+    };
+  }
+
+  async findJobs(
+    queueName: MessageQueue,
+    states: MessageQueueJobState[],
+  ): Promise<MessageQueueJobRecord[]> {
+    await this.initialize();
+
+    const canonicalStates = [
+      ...new Set(states.flatMap((state) => this.toCanonicalStates(state))),
+    ];
+
+    if (canonicalStates.length === 0) {
+      return [];
+    }
+
+    const result = await this.options.pool.query<QueueJobInspectionRow>({
+      text: `
+        SELECT id, job_name, payload, status, started_count, created_at,
+          updated_at, completed_at, failed_at, last_error
+        FROM ${this.options.schema}.queue_job
+        WHERE queue_name = $1
+          AND status = ANY($2::text[])
+        ORDER BY created_at DESC
+      `,
+      values: [queueName, canonicalStates],
+    });
+
+    return result.rows.map((row) => {
+      const state = this.toNeutralState(row.status);
+      const finishedAt = row.completed_at ?? row.failed_at;
+      const record: MessageQueueJobRecord = {
+        id: row.id,
+        name: row.job_name,
+        data: row.payload,
+        state,
+        attemptsMade: row.started_count,
+        createdAt: row.created_at.getTime(),
+      };
+
+      if (row.started_count > 0) {
+        record.processedAt = row.updated_at.getTime();
+      }
+      if (finishedAt) {
+        record.finishedAt = finishedAt.getTime();
+      }
+      if (state === 'failed' && row.last_error?.message) {
+        record.failedReason = row.last_error.message;
+      }
+
+      return record;
+    });
+  }
+
+  async reconcileDeadLetter(
+    args: LogicalDeadLetterArgs,
+  ): Promise<'failed' | 'fenced'> {
+    await this.initialize();
+
+    const client = await this.options.pool.connect();
+
+    try {
+      await client.query('BEGIN');
+      const locked = await client.query<
+        Pick<
+          SettlementQueueJob,
+          | 'id'
+          | 'generation'
+          | 'current_physical_job_id'
+          | 'current_execution_token'
+          | 'status'
+        >
+      >({
+        text: `
+          SELECT id, generation, current_physical_job_id,
+            current_execution_token, status
+          FROM ${this.options.schema}.queue_job
+          WHERE id = $1
+          FOR UPDATE
+        `,
+        values: [args.envelope.logicalJobId],
+      });
+      const job = locked.rows[0];
+
+      if (
+        !job ||
+        job.id !== args.envelope.logicalJobId ||
+        job.generation !== args.envelope.generation ||
+        job.current_physical_job_id !== args.physicalJobId ||
+        job.current_execution_token === null ||
+        job.status !== 'active'
+      ) {
+        await client.query('COMMIT');
+
+        return 'fenced';
+      }
+
+      const attempt = await client.query<{ id: string }>({
+        text: `
+          UPDATE ${this.options.schema}.queue_job_attempt
+          SET outcome = 'stalled', finished_at = now()
+          WHERE job_id = $1
+            AND generation = $2
+            AND physical_job_id = $3
+            AND execution_token = $4
+            AND outcome = 'running'
+            AND EXISTS (
+              SELECT 1
+              FROM ${this.options.schema}.queue_job
+              WHERE id = $1
+                AND generation = $2
+                AND current_execution_token = $4
+                AND status = 'active'
+            )
+          RETURNING id
+        `,
+        values: [
+          job.id,
+          job.generation,
+          args.physicalJobId,
+          job.current_execution_token,
+        ],
+      });
+
+      if (!attempt.rows[0]) {
+        await client.query('ROLLBACK');
+
+        return 'fenced';
+      }
+
+      const failed = await client.query<{ id: string }>({
+        text: `
+          UPDATE ${this.options.schema}.queue_job
+          SET status = 'failed',
+            current_execution_token = NULL,
+            failure_kind = 'stall_exhausted',
+            failed_at = now(),
+            updated_at = now()
+          WHERE id = $1
+            AND generation = $2
+            AND current_execution_token = $3
+            AND status = 'active'
+            AND current_physical_job_id = $4
+          RETURNING id
+        `,
+        values: [
+          job.id,
+          job.generation,
+          job.current_execution_token,
+          args.physicalJobId,
+        ],
+      });
+
+      if (!failed.rows[0]) {
+        await client.query('ROLLBACK');
+
+        return 'fenced';
+      }
+
+      await client.query('COMMIT');
+
+      return 'failed';
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   physicalJobId(logicalJobId: string, generation: number): string {
     return v5(`${logicalJobId}:${generation}`, PHYSICAL_JOB_NAMESPACE);
   }
@@ -217,6 +900,75 @@ export class PgBossLogicalLedger {
     return {
       executeSql: async (text, values) => client.query(text, values),
     };
+  }
+
+  private async completeFencedEnvelopeWithClient(
+    client: PoolClient,
+    args: LogicalPhysicalArgs,
+  ): Promise<void> {
+    await this.options.transport.complete({
+      queueName: args.queueName,
+      physicalJobId: args.physicalJobId,
+      db: this.toPgBossDatabase(client),
+    });
+  }
+
+  private matchesSettlementFence(
+    job: SettlementQueueJob | undefined,
+    args: LogicalSettlementArgs,
+  ): job is SettlementQueueJob {
+    return (
+      job !== undefined &&
+      job.id === args.logicalJobId &&
+      job.generation === args.generation &&
+      job.current_physical_job_id === args.physicalJobId &&
+      job.current_execution_token === args.executionToken &&
+      job.status === 'active'
+    );
+  }
+
+  private sanitizeError(error: unknown): { name: string; message: string } {
+    if (error instanceof Error) {
+      return { name: error.name, message: error.message };
+    }
+
+    return {
+      name: 'Error',
+      message: typeof error === 'string' ? error : 'Unknown error',
+    };
+  }
+
+  private toCanonicalStates(state: MessageQueueJobState): string[] {
+    switch (state) {
+      case 'created':
+        return ['queued'];
+      case 'active':
+        return ['active'];
+      case 'retry':
+        return ['retry_wait'];
+      case 'completed':
+        return ['completed'];
+      case 'failed':
+        return ['failed', 'cancelled'];
+    }
+  }
+
+  private toNeutralState(status: string): MessageQueueJobState {
+    switch (status) {
+      case 'queued':
+        return 'created';
+      case 'active':
+        return 'active';
+      case 'retry_wait':
+        return 'retry';
+      case 'completed':
+        return 'completed';
+      case 'failed':
+      case 'cancelled':
+        return 'failed';
+      default:
+        throw new Error(`unknown logical queue job state: ${status}`);
+    }
   }
 
   private isWaitingDeduplicationConflict(
