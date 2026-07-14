@@ -169,7 +169,7 @@ job ID, and the generation number.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "logicalJobId": "uuid",
   "generation": 0
 }
