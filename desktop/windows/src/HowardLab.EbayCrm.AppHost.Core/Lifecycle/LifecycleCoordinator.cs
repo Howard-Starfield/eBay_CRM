@@ -1,0 +1,477 @@
+using HowardLab.EbayCrm.AppHost.Core.Time;
+using HowardLab.EbayCrm.AppHost.Protocol.Control;
+
+namespace HowardLab.EbayCrm.AppHost.Core.Lifecycle;
+
+public sealed class LifecycleCoordinator
+{
+    private readonly IClock _clock;
+    private readonly RestartBudget _restartBudget;
+    private readonly SemaphoreSlim _transitionGate = new(1, 1);
+    private readonly Dictionary<RuntimeRole, ProcessGeneration> _generations = [];
+    private readonly HashSet<RuntimeRole> _ownedRoles = [];
+    private readonly HashSet<FailureKey> _failures = [];
+    private Guid _currentOperationId;
+    private bool _stopAccepted;
+    private bool _faultEmitted;
+
+    public LifecycleCoordinator(IClock clock, RestartBudget restartBudget)
+    {
+        _clock = clock ?? throw new ArgumentNullException(nameof(clock));
+        _restartBudget = restartBudget ?? throw new ArgumentNullException(nameof(restartBudget));
+    }
+
+    public RuntimeState State { get; private set; } = RuntimeState.Stopped;
+
+    public ProcessGeneration CurrentGeneration(RuntimeRole role)
+    {
+        return _generations.TryGetValue(role, out var generation)
+            ? generation
+            : throw new InvalidOperationException($"No generation exists for role '{role}'.");
+    }
+
+    public async ValueTask<TransitionResult> DispatchAsync(
+        LifecycleEvent @event,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(@event);
+        await _transitionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return Transition(@event);
+        }
+        finally
+        {
+            _transitionGate.Release();
+        }
+    }
+
+    private TransitionResult Transition(LifecycleEvent @event)
+    {
+        var previous = State;
+        if (@event.Generation is { } eventGeneration && !IsCurrent(eventGeneration))
+        {
+            return Ignored(previous, "StaleGeneration");
+        }
+
+        return @event switch
+        {
+            StartRequested value => Start(previous, value),
+            StopRequested value => Stop(previous, value),
+            InstanceAcquired value => AdvanceOperation(previous, value.OperationId, RuntimeState.AcquiringInstance, RuntimeState.ValidatingPayload, LifecycleCommandType.ValidatePayload, LifecycleDeadlineKey.PayloadValidation),
+            PayloadValidated value => AdvanceOperation(previous, value.OperationId, RuntimeState.ValidatingPayload, RuntimeState.PreparingRuntime, LifecycleCommandType.PrepareRuntime, LifecycleDeadlineKey.RuntimePreparation),
+            RuntimePrepared value => StartRoleAfterOperation(previous, value.OperationId, RuntimeState.PreparingRuntime, RuntimeRole.Database, RuntimeState.StartingDatabase, LifecycleCommandType.StartDatabase, LifecycleDeadlineKey.DatabaseStart),
+            RoleStarted value => RoleStartedTransition(previous, value.Value),
+            RoleReady value => RoleReadyTransition(previous, value.Value),
+            MigrationCompleted value => StartRoleAfterOperation(previous, value.OperationId, RuntimeState.Migrating, RuntimeRole.Server, RuntimeState.StartingServer, LifecycleCommandType.StartServer, LifecycleDeadlineKey.ServerStart),
+            RoleExited value => Recover(previous, value.Value),
+            HealthFailed value => Recover(previous, value.Value),
+            ControlDisconnected value => Recover(previous, value.Value),
+            OperationTimedOut value => Timeout(previous, value),
+            Reconciled value => Reconcile(previous, value),
+            ShutdownCompleted value => ShutdownCompletedTransition(previous, value),
+            _ => Ignored(previous, "UnexpectedEvent"),
+        };
+    }
+
+    private TransitionResult Start(RuntimeState previous, StartRequested @event)
+    {
+        if (_stopAccepted)
+        {
+            return Ignored(previous, "StopAlreadyAccepted");
+        }
+
+        if (State != RuntimeState.Stopped)
+        {
+            return Ignored(previous, "AlreadyStarted");
+        }
+
+        _currentOperationId = @event.OperationId;
+        State = RuntimeState.AcquiringInstance;
+        return Accepted(previous, Command(LifecycleCommandType.AcquireInstance, null, @event.OperationId, LifecycleDeadlineKey.InstanceAcquisition));
+    }
+
+    private TransitionResult Stop(RuntimeState previous, StopRequested @event)
+    {
+        if (State == RuntimeState.Stopped)
+        {
+            return Ignored(previous, "AlreadyStopped");
+        }
+
+        if (_stopAccepted)
+        {
+            return Ignored(previous, "StopAlreadyAccepted");
+        }
+
+        _stopAccepted = true;
+        _currentOperationId = @event.OperationId;
+        RetargetOwnedGenerations(@event.OperationId);
+        var commands = new List<LifecycleCommand>();
+        if (_ownedRoles.Contains(RuntimeRole.Worker))
+        {
+            var worker = _generations[RuntimeRole.Worker];
+            commands.Add(Command(LifecycleCommandType.DrainWorker, worker, @event.OperationId, LifecycleDeadlineKey.WorkerDrain));
+            commands.Add(Command(LifecycleCommandType.StopWorker, worker, @event.OperationId, LifecycleDeadlineKey.WorkerStop));
+        }
+
+        if (_ownedRoles.Contains(RuntimeRole.Server))
+        {
+            var server = _generations[RuntimeRole.Server];
+            commands.Add(Command(LifecycleCommandType.StopServer, server, @event.OperationId, LifecycleDeadlineKey.ServerStop));
+        }
+
+        if (_ownedRoles.Contains(RuntimeRole.Database))
+        {
+            var database = _generations[RuntimeRole.Database];
+            commands.Add(Command(LifecycleCommandType.StopDatabaseFast, database, @event.OperationId, LifecycleDeadlineKey.DatabaseStop));
+        }
+
+        commands.Add(Command(LifecycleCommandType.ReleaseInstance, null, @event.OperationId, LifecycleDeadlineKey.None));
+        State = RuntimeState.Stopping;
+        return Result(previous, commands, false, "Accepted");
+    }
+
+    private TransitionResult AdvanceOperation(
+        RuntimeState previous,
+        Guid operationId,
+        RuntimeState expected,
+        RuntimeState next,
+        LifecycleCommandType commandType,
+        LifecycleDeadlineKey deadlineKey)
+    {
+        if (operationId != _currentOperationId)
+        {
+            return Ignored(previous, "StaleOperation");
+        }
+
+        if (State != expected || _stopAccepted)
+        {
+            return Ignored(previous, _stopAccepted ? "StopAlreadyAccepted" : "UnexpectedEvent");
+        }
+
+        State = next;
+        return Accepted(previous, Command(commandType, null, operationId, deadlineKey));
+    }
+
+    private TransitionResult StartRoleAfterOperation(
+        RuntimeState previous,
+        Guid operationId,
+        RuntimeState expected,
+        RuntimeRole role,
+        RuntimeState next,
+        LifecycleCommandType commandType,
+        LifecycleDeadlineKey deadlineKey)
+    {
+        if (operationId != _currentOperationId)
+        {
+            return Ignored(previous, "StaleOperation");
+        }
+
+        if (State != expected)
+        {
+            return Ignored(previous, "UnexpectedEvent");
+        }
+
+        var generation = CreateGeneration(role, operationId);
+        State = next;
+        return Accepted(previous, Command(commandType, generation, operationId, deadlineKey));
+    }
+
+    private TransitionResult RoleStartedTransition(RuntimeState previous, ProcessGeneration generation)
+    {
+        var expected = generation.Role switch
+        {
+            RuntimeRole.Database => RuntimeState.StartingDatabase,
+            RuntimeRole.Server => RuntimeState.StartingServer,
+            RuntimeRole.Worker => RuntimeState.StartingWorker,
+            _ => throw new ArgumentOutOfRangeException(nameof(generation)),
+        };
+        if (State != expected)
+        {
+            return Ignored(previous, "UnexpectedEvent");
+        }
+
+        State = generation.Role switch
+        {
+            RuntimeRole.Database => RuntimeState.WaitingForDatabase,
+            RuntimeRole.Server => RuntimeState.WaitingForServer,
+            RuntimeRole.Worker => RuntimeState.WaitingForWorker,
+            _ => throw new ArgumentOutOfRangeException(nameof(generation)),
+        };
+        var type = generation.Role switch
+        {
+            RuntimeRole.Database => LifecycleCommandType.WaitForDatabase,
+            RuntimeRole.Server => LifecycleCommandType.WaitForServer,
+            RuntimeRole.Worker => LifecycleCommandType.WaitForWorker,
+            _ => throw new ArgumentOutOfRangeException(nameof(generation)),
+        };
+        var deadline = generation.Role switch
+        {
+            RuntimeRole.Database => LifecycleDeadlineKey.DatabaseReadiness,
+            RuntimeRole.Server => LifecycleDeadlineKey.ServerReadiness,
+            RuntimeRole.Worker => LifecycleDeadlineKey.WorkerReadiness,
+            _ => throw new ArgumentOutOfRangeException(nameof(generation)),
+        };
+        return Accepted(previous, Command(type, generation, generation.OperationId, deadline));
+    }
+
+    private TransitionResult RoleReadyTransition(RuntimeState previous, ProcessGeneration generation)
+    {
+        if (generation.Role == RuntimeRole.Database && State == RuntimeState.WaitingForDatabase)
+        {
+            _restartBudget.RecordStable(generation.Role, _clock.UtcNow);
+            State = RuntimeState.Migrating;
+            return Accepted(previous, Command(LifecycleCommandType.RunMigrations, null, generation.OperationId, LifecycleDeadlineKey.Migration));
+        }
+
+        if (generation.Role == RuntimeRole.Server && State == RuntimeState.WaitingForServer)
+        {
+            _restartBudget.RecordStable(generation.Role, _clock.UtcNow);
+            var worker = CreateGeneration(RuntimeRole.Worker, _currentOperationId);
+            State = RuntimeState.StartingWorker;
+            return Accepted(previous, Command(LifecycleCommandType.StartWorker, worker, worker.OperationId, LifecycleDeadlineKey.WorkerStart));
+        }
+
+        if (generation.Role == RuntimeRole.Worker && State == RuntimeState.WaitingForWorker)
+        {
+            _restartBudget.RecordStable(generation.Role, _clock.UtcNow);
+            State = RuntimeState.Ready;
+            return Accepted(previous);
+        }
+
+        return Ignored(previous, "UnexpectedEvent");
+    }
+
+    private TransitionResult Recover(RuntimeState previous, ProcessGeneration generation)
+    {
+        if (_stopAccepted || State is RuntimeState.Stopping or RuntimeState.Stopped or RuntimeState.Faulted)
+        {
+            return Ignored(previous, _stopAccepted ? "StopAlreadyAccepted" : "RecoveryNotAllowed");
+        }
+
+        var failure = new FailureKey(generation.Role, generation.Value, generation.OperationId, generation.Role);
+        if (!_failures.Add(failure))
+        {
+            return Ignored(previous, "DuplicateFailure");
+        }
+
+        if (_restartBudget.TryConsume(generation.Role, _clock.UtcNow) == RestartBudgetResult.Exhausted)
+        {
+            return Fault(previous, generation, "RestartBudgetExhausted");
+        }
+
+        return generation.Role switch
+        {
+            RuntimeRole.Worker => RecoverWorker(previous),
+            RuntimeRole.Server => RecoverServer(previous),
+            RuntimeRole.Database => RecoverDatabase(previous, generation),
+            _ => throw new ArgumentOutOfRangeException(nameof(generation)),
+        };
+    }
+
+    private TransitionResult RecoverWorker(RuntimeState previous)
+    {
+        var operationId = Guid.NewGuid();
+        _currentOperationId = operationId;
+        var worker = CreateGeneration(RuntimeRole.Worker, operationId);
+        State = RuntimeState.WaitingForWorker;
+        return Accepted(
+            previous,
+            Command(LifecycleCommandType.StartWorker, worker, operationId, LifecycleDeadlineKey.WorkerStart),
+            Command(LifecycleCommandType.WaitForWorker, worker, operationId, LifecycleDeadlineKey.WorkerReadiness));
+    }
+
+    private TransitionResult RecoverServer(RuntimeState previous)
+    {
+        var operationId = Guid.NewGuid();
+        var previousWorker = _generations[RuntimeRole.Worker];
+        _currentOperationId = operationId;
+        var server = CreateGeneration(RuntimeRole.Server, operationId);
+        var worker = CreateGeneration(RuntimeRole.Worker, operationId);
+        State = RuntimeState.WaitingForWorker;
+        return Accepted(
+            previous,
+            Command(LifecycleCommandType.StopWorker, previousWorker, operationId, LifecycleDeadlineKey.WorkerStop),
+            Command(LifecycleCommandType.StartServer, server, operationId, LifecycleDeadlineKey.ServerStart),
+            Command(LifecycleCommandType.WaitForServer, server, operationId, LifecycleDeadlineKey.ServerReadiness),
+            Command(LifecycleCommandType.StartWorker, worker, operationId, LifecycleDeadlineKey.WorkerStart),
+            Command(LifecycleCommandType.WaitForWorker, worker, operationId, LifecycleDeadlineKey.WorkerReadiness));
+    }
+
+    private TransitionResult RecoverDatabase(RuntimeState previous, ProcessGeneration generation)
+    {
+        var worker = _generations[RuntimeRole.Worker];
+        var server = _generations[RuntimeRole.Server];
+        State = RuntimeState.ReconcilingDatabaseStart;
+        return Accepted(
+            previous,
+            Command(LifecycleCommandType.StopWorker, worker, generation.OperationId, LifecycleDeadlineKey.WorkerStop),
+            Command(LifecycleCommandType.StopServer, server, generation.OperationId, LifecycleDeadlineKey.ServerStop),
+            Command(LifecycleCommandType.ReconcileDatabaseStart, generation, generation.OperationId, LifecycleDeadlineKey.DatabaseReconciliation));
+    }
+
+    private TransitionResult Timeout(RuntimeState previous, OperationTimedOut @event)
+    {
+        if (@event.OperationId != @event.Value.OperationId || @event.OperationId != _currentOperationId)
+        {
+            return Ignored(previous, "StaleOperation");
+        }
+
+        if (@event.Value.Role != RuntimeRole.Database)
+        {
+            return Ignored(previous, "UnexpectedEvent");
+        }
+
+        if (State is RuntimeState.StartingDatabase or RuntimeState.WaitingForDatabase)
+        {
+            State = RuntimeState.ReconcilingDatabaseStart;
+            return Accepted(previous, Command(LifecycleCommandType.ReconcileDatabaseStart, @event.Value, @event.OperationId, LifecycleDeadlineKey.DatabaseReconciliation));
+        }
+
+        if (State == RuntimeState.ReconcilingDatabaseStart)
+        {
+            return Fault(previous, @event.Value, "DatabaseStartReconciliationTimedOut");
+        }
+
+        if (State == RuntimeState.Stopping)
+        {
+            State = RuntimeState.ReconcilingDatabaseStop;
+            return Accepted(previous, Command(LifecycleCommandType.ReconcileDatabaseStop, @event.Value, @event.OperationId, LifecycleDeadlineKey.DatabaseReconciliation));
+        }
+
+        if (State == RuntimeState.ReconcilingDatabaseStop)
+        {
+            State = RuntimeState.Faulted;
+            if (_faultEmitted)
+            {
+                return Ignored(previous, "FaultAlreadyEmitted");
+            }
+
+            _faultEmitted = true;
+            return Result(
+                previous,
+                [
+                    Command(LifecycleCommandType.EscalateJob, @event.Value, @event.OperationId, LifecycleDeadlineKey.None),
+                    Command(LifecycleCommandType.EnterFault, @event.Value, @event.OperationId, LifecycleDeadlineKey.None),
+                ],
+                false,
+                "DatabaseStopReconciliationTimedOut");
+        }
+
+        return Ignored(previous, "UnexpectedEvent");
+    }
+
+    private TransitionResult Reconcile(RuntimeState previous, Reconciled @event)
+    {
+        if (State == RuntimeState.ReconcilingDatabaseStart)
+        {
+            if (@event.State == ReconciledState.Running)
+            {
+                State = RuntimeState.WaitingForDatabase;
+                return Accepted(previous, Command(LifecycleCommandType.WaitForDatabase, @event.Value, @event.Value.OperationId, LifecycleDeadlineKey.DatabaseReadiness));
+            }
+
+            if (@event.State == ReconciledState.Stopped)
+            {
+                return Fault(previous, @event.Value, "DatabaseStartReconciledStopped");
+            }
+
+            return Accepted(previous);
+        }
+
+        if (State == RuntimeState.ReconcilingDatabaseStop)
+        {
+            if (@event.State == ReconciledState.Stopped)
+            {
+                State = RuntimeState.Stopped;
+                _ownedRoles.Clear();
+                return Accepted(previous, Command(LifecycleCommandType.ReleaseInstance, null, _currentOperationId, LifecycleDeadlineKey.None));
+            }
+
+            return Accepted(previous);
+        }
+
+        return Ignored(previous, "UnexpectedEvent");
+    }
+
+    private TransitionResult ShutdownCompletedTransition(RuntimeState previous, ShutdownCompleted @event)
+    {
+        if (@event.OperationId != _currentOperationId)
+        {
+            return Ignored(previous, "StaleOperation");
+        }
+
+        if (State != RuntimeState.Stopping)
+        {
+            return Ignored(previous, "UnexpectedEvent");
+        }
+
+        State = RuntimeState.Stopped;
+        _ownedRoles.Clear();
+        return Accepted(previous);
+    }
+
+    private TransitionResult Fault(RuntimeState previous, ProcessGeneration? generation, string reasonCode)
+    {
+        State = RuntimeState.Faulted;
+        if (_faultEmitted)
+        {
+            return Ignored(previous, "FaultAlreadyEmitted");
+        }
+
+        _faultEmitted = true;
+        return Result(previous, [Command(LifecycleCommandType.EnterFault, generation, _currentOperationId, LifecycleDeadlineKey.None)], false, reasonCode);
+    }
+
+    private ProcessGeneration CreateGeneration(RuntimeRole role, Guid operationId)
+    {
+        var value = _generations.TryGetValue(role, out var current) ? current.Value + 1 : 1;
+        var generation = new ProcessGeneration(role, value, operationId);
+        _generations[role] = generation;
+        _ownedRoles.Add(role);
+        return generation;
+    }
+
+    private void RetargetOwnedGenerations(Guid operationId)
+    {
+        foreach (var role in _ownedRoles)
+        {
+            _generations[role] = _generations[role] with { OperationId = operationId };
+        }
+    }
+
+    private bool IsCurrent(ProcessGeneration generation)
+    {
+        return _generations.TryGetValue(generation.Role, out var current) && current == generation;
+    }
+
+    private TransitionResult Accepted(RuntimeState previous, params LifecycleCommand[] commands)
+    {
+        return Result(previous, commands, false, "Accepted");
+    }
+
+    private TransitionResult Ignored(RuntimeState previous, string reasonCode)
+    {
+        return Result(previous, [], true, reasonCode);
+    }
+
+    private TransitionResult Result(RuntimeState previous, IReadOnlyList<LifecycleCommand> commands, bool ignored, string reasonCode)
+    {
+        return new TransitionResult(previous, State, commands, ignored, reasonCode);
+    }
+
+    private static LifecycleCommand Command(
+        LifecycleCommandType type,
+        ProcessGeneration? generation,
+        Guid operationId,
+        LifecycleDeadlineKey deadlineKey)
+    {
+        return new LifecycleCommand(type, generation, operationId, deadlineKey);
+    }
+
+    private readonly record struct FailureKey(
+        RuntimeRole Role,
+        long Value,
+        Guid OperationId,
+        RuntimeRole RecoveryKind);
+}
