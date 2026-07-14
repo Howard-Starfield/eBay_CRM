@@ -1,0 +1,232 @@
+using System.Text.Json;
+using HowardLab.EbayCrm.AppHost.Core.Diagnostics;
+using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
+using HowardLab.EbayCrm.AppHost.Core.Processes;
+using HowardLab.EbayCrm.AppHost.Protocol.Control;
+using HowardLab.EbayCrm.AppHost.Windows.Processes;
+
+namespace HowardLab.EbayCrm.AppHost.Windows.Tests.Processes;
+
+public sealed class WindowsProcessLauncherTests
+{
+    private static readonly TimeSpan Deadline = TimeSpan.FromSeconds(10);
+
+    [Fact]
+    public async Task LaunchAsync_RoundTripsArgumentsAndUsesOnlyExplicitEnvironment()
+    {
+        const string secret = "task-5-secret-canary";
+        var arguments = new[] { "echo-launch", "", "two words", "a\"b", "trailing slash \\", "雪だるま" };
+        var environment = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["TASK5_VISIBLE"] = "visible-value",
+        };
+        var secrets = new Dictionary<string, SecretValue>(StringComparer.Ordinal)
+        {
+            ["TASK5_SECRET"] = new(secret),
+        };
+
+        using var job = WindowsJobObject.CreateKillOnClose();
+        await using var launched = await CreateLauncher().LaunchAsync(
+            CreateSpecification(arguments, environment, secrets),
+            job,
+            CancellationToken.None);
+        var process = Assert.IsType<WindowsSupervisedProcess>(launched);
+
+        Assert.Equal(0, await process.Completion.WaitAsync(Deadline));
+        var echo = JsonSerializer.Deserialize<EchoResult>(process.StandardOutput.Snapshot());
+        Assert.NotNull(echo);
+        Assert.Equal(arguments[1..], echo.Arguments);
+        Assert.Equal(["TASK5_SECRET", "TASK5_VISIBLE"], echo.EnvironmentNames);
+        Assert.DoesNotContain("PATH", echo.EnvironmentNames, StringComparer.OrdinalIgnoreCase);
+        Assert.DoesNotContain(secret, process.StandardOutput.Snapshot(), StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, process.StandardError.Snapshot(), StringComparison.Ordinal);
+        Assert.Equal(Path.GetFullPath(FixturePath), process.Identity.VerifiedImagePath, StringComparer.OrdinalIgnoreCase);
+        Assert.True(job.Contains(process.ProcessHandle));
+    }
+
+    [Fact]
+    public async Task LaunchAsync_DrainsStdoutAndStderrIndependently()
+    {
+        using var job = WindowsJobObject.CreateKillOnClose();
+        await using var launched = await CreateLauncher().LaunchAsync(
+            CreateSpecification(["output"]),
+            job,
+            CancellationToken.None);
+        var process = Assert.IsType<WindowsSupervisedProcess>(launched);
+
+        Assert.Equal(0, await process.Completion.WaitAsync(Deadline));
+        Assert.Equal("stdout-line\n", process.StandardOutput.Snapshot());
+        Assert.Equal("stderr-line\n", process.StandardError.Snapshot());
+    }
+
+    [Fact]
+    public async Task LaunchAsync_RedactsSecretEnvironmentFromBothOutputStreams()
+    {
+        const string secret = "task-5-stream-secret";
+        using var job = WindowsJobObject.CreateKillOnClose();
+        await using var launched = await CreateLauncher().LaunchAsync(
+            CreateSpecification(
+                ["output-secret"],
+                secrets: new Dictionary<string, SecretValue>
+                {
+                    ["TASK5_SECRET"] = new(secret),
+                }),
+            job,
+            CancellationToken.None);
+
+        Assert.Equal(0, await launched.Completion.WaitAsync(Deadline));
+        Assert.Equal("[REDACTED]\n", launched.StandardOutput.Snapshot());
+        Assert.Equal("[REDACTED]\n", launched.StandardError.Snapshot());
+        Assert.DoesNotContain(secret, launched.StandardOutput.Snapshot(), StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, launched.StandardError.Snapshot(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Completion_DoesNotWaitIndefinitelyForDescendantOutputHandles()
+    {
+        var diagnostics = new CapturingDiagnosticSink();
+        using var job = WindowsJobObject.CreateKillOnClose();
+        var specification = CreateSpecification(["orphan-output-handles"]) with
+        {
+            OutputDrainTimeout = TimeSpan.FromMilliseconds(100),
+        };
+        await using var launched = await CreateLauncher(diagnostics).LaunchAsync(
+            specification,
+            job,
+            CancellationToken.None);
+
+        Assert.Equal(0, await launched.Completion.WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Throws<InvalidOperationException>(() => launched.StandardOutput.Append("late output"));
+        Assert.Throws<InvalidOperationException>(() => launched.StandardError.Append("late error"));
+        Assert.Equal(
+            "process.output_drain_timeout",
+            await diagnostics.EventName.Task.WaitAsync(TimeSpan.FromSeconds(2)));
+    }
+
+    [Fact]
+    public async Task LaunchAsync_ReportsNativeFailureUsingOnlyRoleAndErrorCode()
+    {
+        const string secret = "native-failure-secret";
+        var invalidExecutable = Path.GetTempFileName();
+        try
+        {
+            var specification = CreateSpecification(
+                ["ignored"],
+                secrets: new Dictionary<string, SecretValue>
+                {
+                    ["TASK5_SECRET"] = new(secret),
+                }) with
+            {
+                ApplicationPath = Path.GetFullPath(invalidExecutable),
+            };
+            using var job = WindowsJobObject.CreateKillOnClose();
+
+            var error = await Assert.ThrowsAsync<ProcessLaunchException>(async () =>
+                await CreateLauncher().LaunchAsync(
+                    specification,
+                    job,
+                    CancellationToken.None));
+
+            Assert.Equal(RuntimeRole.Server, error.Role);
+            Assert.NotEqual(0, error.Win32ErrorCode);
+            Assert.Equal(
+                $"Could not launch Server; Win32 error {error.Win32ErrorCode}.",
+                error.Message);
+            Assert.DoesNotContain(secret, error.ToString(), StringComparison.Ordinal);
+            Assert.DoesNotContain(invalidExecutable, error.ToString(), StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            File.Delete(invalidExecutable);
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidSpecifications))]
+    public async Task LaunchAsync_RejectsInvalidInputsBeforeLaunch(LaunchSpecification specification)
+    {
+        using var job = WindowsJobObject.CreateKillOnClose();
+
+        await Assert.ThrowsAnyAsync<ArgumentException>(async () =>
+            await CreateLauncher().LaunchAsync(
+                specification,
+                job,
+                CancellationToken.None));
+    }
+
+    public static TheoryData<LaunchSpecification> InvalidSpecifications()
+    {
+        var valid = CreateSpecification(["echo-launch"]);
+        return new TheoryData<LaunchSpecification>
+        {
+            valid with { ApplicationPath = "relative.exe" },
+            valid with { ApplicationPath = Path.Combine(Path.GetTempPath(), $"missing-{Guid.NewGuid():N}.exe") },
+            valid with { WorkingDirectory = "." },
+            valid with { WorkingDirectory = Path.Combine(Path.GetTempPath(), $"missing-{Guid.NewGuid():N}") },
+            valid with { Arguments = ["before\0after"] },
+            valid with { Environment = new Dictionary<string, string> { [""] = "value" } },
+            valid with { Environment = new Dictionary<string, string> { ["BAD=KEY"] = "value" } },
+            valid with { Environment = new Dictionary<string, string> { ["BAD\0KEY"] = "value" } },
+            valid with { Environment = new Dictionary<string, string> { ["GOOD"] = "before\0after" } },
+            valid with
+            {
+                Environment = new Dictionary<string, string>(StringComparer.Ordinal) { ["Path"] = "visible" },
+                SecretEnvironment = new Dictionary<string, SecretValue>(StringComparer.Ordinal) { ["PATH"] = new("secret") },
+            },
+            valid with { OutputDrainTimeout = TimeSpan.Zero },
+        };
+    }
+
+    internal static WindowsProcessLauncher CreateLauncher(IDiagnosticSink? diagnosticSink = null) =>
+        new(
+            diagnosticSink ?? NoopDiagnosticSink.Instance,
+            maxOutputBytes: 64 * 1024,
+            maxLineBytes: 4 * 1024);
+
+    internal static LaunchSpecification CreateSpecification(
+        IReadOnlyList<string> arguments,
+        IReadOnlyDictionary<string, string>? environment = null,
+        IReadOnlyDictionary<string, SecretValue>? secrets = null) =>
+        new(
+            RuntimeRole.Server,
+            new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid()),
+            FixturePath,
+            arguments,
+            AppContext.BaseDirectory,
+            environment ?? new Dictionary<string, string>(),
+            secrets ?? new Dictionary<string, SecretValue>(),
+            TimeSpan.FromSeconds(2));
+
+    internal static string FixturePath => Path.Combine(
+        AppContext.BaseDirectory,
+        "HowardLab.EbayCrm.AppHost.Fixture.exe");
+
+    private sealed record EchoResult(string[] Arguments, string[] EnvironmentNames);
+
+    private sealed class NoopDiagnosticSink : IDiagnosticSink
+    {
+        internal static readonly NoopDiagnosticSink Instance = new();
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        public ValueTask WriteAsync(
+            DiagnosticEvent diagnosticEvent,
+            CancellationToken cancellationToken = default) => ValueTask.CompletedTask;
+    }
+
+    private sealed class CapturingDiagnosticSink : IDiagnosticSink
+    {
+        internal TaskCompletionSource<string> EventName { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        public ValueTask WriteAsync(
+            DiagnosticEvent diagnosticEvent,
+            CancellationToken cancellationToken = default)
+        {
+            EventName.TrySetResult(diagnosticEvent.Name);
+            return ValueTask.CompletedTask;
+        }
+    }
+}
