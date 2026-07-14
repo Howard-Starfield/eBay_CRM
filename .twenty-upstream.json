@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/twentyhq/twenty.git",
+  "commit": "1b168ac1f7d466adf3be83b2676039e120d0db1c",
+  "version": "2.21.0",
+  "importedAt": "2026-07-13",
+  "verificationCommand": "node scripts/verify-upstream-pin.mjs --upstream-root %TEMP%\\twenty-upstream --local-root ."
+}

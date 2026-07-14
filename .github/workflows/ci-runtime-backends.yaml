@@ -1,0 +1,116 @@
+name: CI Runtime Backends
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  queue-contract-redis:
+    name: Queue contract / Redis compatibility
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7.2.8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      RUNTIME_BACKEND: redis
+      RUNTIME_CONTRACT_DRIVER: bullmq
+      PG_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      REDIS_URL: redis://127.0.0.1:6379/15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install dependencies
+        uses: ./.github/actions/yarn-install
+        with:
+          node-version: '24.16.0'
+      - name: Verify runtime boundaries
+        run: |
+          node --test scripts/check-runtime-backend-boundaries.test.mjs
+          yarn check:runtime-boundaries
+      - name: Run BullMQ compatibility contract
+        run: yarn nx test-runtime-contract twenty-server
+
+  queue-contract-postgres-desktop:
+    name: Queue spike / reproduce pg-boss rejection
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      RUNTIME_BACKEND: postgres-desktop
+      RUNTIME_CONTRACT_DRIVER: pg-boss
+      PG_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install dependencies
+        uses: ./.github/actions/yarn-install
+        with:
+          node-version: '24.16.0'
+      - name: Fail if Redis is listening
+        shell: bash
+        run: |
+          if ss -ltn | grep -Eq '(^|[[:space:]])[^[:space:]]*:6379[[:space:]]'; then
+            echo '::error::The PostgreSQL-only queue spike must not have a Redis listener on port 6379.'
+            exit 1
+          fi
+      - name: Verify runtime boundaries
+        run: |
+          node --test scripts/check-runtime-backend-boundaries.test.mjs
+          yarn check:runtime-boundaries
+      - name: Reproduce pg-boss rejection three times
+        shell: bash
+        run: |
+          set -uo pipefail
+          for run in 1 2 3; do
+            report="${RUNNER_TEMP}/pg-boss-rejection-${run}.json"
+            set +e
+            yarn nx test-runtime-contract twenty-server -- --json --outputFile="${report}"
+            status=$?
+            set -e
+
+            if [ "${status}" -eq 0 ]; then
+              echo '::error::pg-boss unexpectedly passed the mandatory contract; review the Phase 0 verdict.'
+              exit 1
+            fi
+
+            node scripts/verify-pg-boss-rejection.mjs --report "${report}"
+          done
