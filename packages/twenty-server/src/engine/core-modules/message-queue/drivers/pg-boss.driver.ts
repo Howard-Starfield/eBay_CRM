@@ -607,6 +607,7 @@ export class PgBossDriver
     );
 
     await this.registerLogicalDeadLetterWorker(queueName);
+    await this.logicalLedger.markWorkerReady(queueName);
   }
 
   private async registerLogicalDeadLetterWorker(

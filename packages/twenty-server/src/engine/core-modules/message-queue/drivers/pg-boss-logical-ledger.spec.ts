@@ -62,6 +62,7 @@ describe('PgBossLogicalLedger', () => {
         expect.stringContaining('queue_job_waiting_dedup_key_idx'),
       ]),
     );
+    expect(executedSql.join('\n')).toContain('worker_ready_at');
   });
 
   it('restricts ledger counters, statuses, outcomes, and attempt identity', async () => {
@@ -114,6 +115,18 @@ describe('PgBossLogicalLedger', () => {
     const lastQuery = calls[calls.length - 1]?.[0] as QueryConfig;
 
     expect(lastQuery.values).toEqual([queueName, 2, 10]);
+    expect(lastQuery.text).toContain("worker_ready_at = '-infinity'");
+  });
+
+  it('marks a registered queue policy ready only after workers exist', async () => {
+    await ledger.markWorkerReady(queueName);
+
+    expect(pool.query).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('worker_ready_at = now()'),
+        values: [queueName],
+      }),
+    );
   });
 
   it.each([-1, 1.5])(
@@ -140,7 +153,13 @@ describe('PgBossLogicalLedger', () => {
 
         if (text.includes('FROM desktop_runtime.queue_policy')) {
           return {
-            rows: [{ stall_recovery_limit: 2, heartbeat_seconds: 10 }],
+            rows: [
+              {
+                stall_recovery_limit: 2,
+                heartbeat_seconds: 10,
+                worker_ready: true,
+              },
+            ],
           };
         }
 
@@ -191,7 +210,7 @@ describe('PgBossLogicalLedger', () => {
     expect(client.release).toHaveBeenCalledTimes(1);
   });
 
-  it('materializes the default policy inside a new job transaction', async () => {
+  it('rejects a producer before worker readiness without materializing or sending', async () => {
     await ledger.initialize();
     (client.query as jest.Mock).mockClear();
     (client.query as jest.Mock).mockImplementation(
@@ -201,33 +220,26 @@ describe('PgBossLogicalLedger', () => {
         if (text.includes('FROM desktop_runtime.queue_policy')) {
           return { rows: [] };
         }
-        if (text.includes('INSERT INTO desktop_runtime.queue_policy')) {
-          return {
-            rows: [{ stall_recovery_limit: 1, heartbeat_seconds: null }],
-          };
-        }
-
         return { rows: [] };
       },
     );
 
-    await ledger.createJob({
-      queueName,
-      jobName: 'reply-to-buyer',
-      data: { orderId: 'order-1' },
-    });
-
-    expect(client.query).toHaveBeenCalledWith(
+    await expect(
+      ledger.createJob({
+        queueName,
+        jobName: 'reply-to-buyer',
+        data: { orderId: 'order-1' },
+      }),
+    ).rejects.toThrow(
+      'logical queue worker is not ready; register workers before producing jobs',
+    );
+    expect(client.query).not.toHaveBeenCalledWith(
       expect.objectContaining({
-        text: expect.stringContaining(
-          'INSERT INTO desktop_runtime.queue_policy',
-        ),
-        values: [queueName, 1, null],
+        text: expect.stringContaining('INSERT INTO desktop_runtime.queue_job'),
       }),
     );
-    expect(transport.send).toHaveBeenCalledWith(
-      expect.objectContaining({ stallRecoveryLimit: 1 }),
-    );
+    expect(transport.send).not.toHaveBeenCalled();
+    expect(client.query).toHaveBeenLastCalledWith('ROLLBACK');
   });
 
   it('rolls back logical state and the envelope when sending fails', async () => {
@@ -240,7 +252,13 @@ describe('PgBossLogicalLedger', () => {
 
         if (text.includes('FROM desktop_runtime.queue_policy')) {
           return {
-            rows: [{ stall_recovery_limit: 1, heartbeat_seconds: null }],
+            rows: [
+              {
+                stall_recovery_limit: 1,
+                heartbeat_seconds: null,
+                worker_ready: true,
+              },
+            ],
           };
         }
 
@@ -274,7 +292,13 @@ describe('PgBossLogicalLedger', () => {
 
         if (text.includes('FROM desktop_runtime.queue_policy')) {
           return {
-            rows: [{ stall_recovery_limit: 1, heartbeat_seconds: null }],
+            rows: [
+              {
+                stall_recovery_limit: 1,
+                heartbeat_seconds: null,
+                worker_ready: true,
+              },
+            ],
           };
         }
         if (text.includes('INSERT INTO desktop_runtime.queue_job')) {
@@ -1056,6 +1080,64 @@ describe('PgBossLogicalLedger', () => {
         values: [queueName, ['failed', 'cancelled']],
       }),
     );
+  });
+
+  it('terminally reconciles a matching dead letter before logical start exactly once', async () => {
+    await ledger.initialize();
+    (client.query as jest.Mock).mockClear();
+    (client.query as jest.Mock).mockImplementation(
+      async (query: string | QueryConfig) => {
+        const text = typeof query === 'string' ? query : query.text;
+
+        if (
+          text.includes('FROM desktop_runtime.queue_job') &&
+          text.includes('FOR UPDATE')
+        ) {
+          return {
+            rows: [
+              {
+                id: logicalId,
+                generation: 0,
+                current_physical_job_id: physicalJobId,
+                current_execution_token: null,
+                status: 'queued',
+              },
+            ],
+          };
+        }
+        if (
+          text.includes('UPDATE desktop_runtime.queue_job') &&
+          text.includes("status IN ('queued', 'retry_wait')")
+        ) {
+          return { rows: [{ id: logicalId }] };
+        }
+
+        return { rows: [] };
+      },
+    );
+
+    await expect(
+      ledger.reconcileDeadLetter({
+        queueName,
+        physicalJobId,
+        envelope: { version: 2, logicalJobId: logicalId, generation: 0 },
+      }),
+    ).resolves.toBe('failed');
+
+    expect(client.query).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining(
+          "VALUES ($1, $2, $3, $4, $5, $6, 0, now(), now(), 'stalled')",
+        ),
+        values: expect.arrayContaining([logicalId, 0, physicalJobId]),
+      }),
+    );
+    expect(client.query).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('ON CONFLICT (job_id, execution_token)'),
+      }),
+    );
+    expect(client.query).toHaveBeenLastCalledWith('COMMIT');
   });
 
   it('fences a dead letter for an old physical generation', async () => {

@@ -87,6 +87,111 @@ if (process.env.RUNTIME_CONTRACT_DRIVER === 'pg-boss-overlay') {
       jest.useRealTimers();
     });
 
+    it('blocks production until both logical workers are durably ready', async () => {
+      const queueName =
+        `runtime-contract-overlay-readiness-${randomUUID()}` as MessageQueue;
+      const harness = await createOverlayHarness({
+        queueName,
+        handler: () => undefined,
+      });
+      const pool = new Pool({ connectionString: connectionString() });
+      const { boss, logicalLedger } = overlayInternals(harness.driver);
+
+      try {
+        await logicalLedger.registerQueuePolicy(queueName, {});
+        await expect(
+          harness.driver.add(queueName, 'too-early', {}),
+        ).rejects.toThrow(
+          'logical queue worker is not ready; register workers before producing jobs',
+        );
+        await expect(boss.findJobs(queueName)).resolves.toHaveLength(0);
+
+        const before = await pool.query<{ ready: boolean }>({
+          text: `SELECT worker_ready_at > '-infinity'::timestamptz AS ready
+            FROM desktop_runtime.queue_policy WHERE queue_name = $1`,
+          values: [queueName],
+        });
+
+        expect(before.rows).toEqual([{ ready: false }]);
+        await harness.start();
+
+        const after = await pool.query<{ ready: boolean }>({
+          text: `SELECT worker_ready_at > '-infinity'::timestamptz AS ready
+            FROM desktop_runtime.queue_policy WHERE queue_name = $1`,
+          values: [queueName],
+        });
+
+        expect(after.rows).toEqual([{ ready: true }]);
+        await expect(
+          harness.driver.add(queueName, 'after-readiness', {}),
+        ).resolves.toBeUndefined();
+        await expect(boss.findJobs(queueName)).resolves.toHaveLength(1);
+      } finally {
+        await pool.end();
+        await harness.clear();
+      }
+    });
+
+    it('terminally reconciles physical exhaustion before logical start', async () => {
+      const queueName =
+        `runtime-contract-overlay-prestart-dead-letter-${randomUUID()}` as MessageQueue;
+      const handler = jest.fn();
+      const harness = await createOverlayHarness({ queueName, handler });
+      const pool = new Pool({ connectionString: connectionString() });
+      const { boss } = overlayInternals(harness.driver);
+
+      try {
+        await harness.start();
+        await boss.offWork(queueName);
+        await harness.driver.add(queueName, 'prestart-exhaustion', {});
+
+        const first = await fetchPhysicalJob(boss, queueName);
+
+        await boss.fail(queueName, first.id, { message: 'prestart crash 1' });
+        const retry = await fetchPhysicalJob(boss, queueName);
+
+        await boss.fail(queueName, retry.id, { message: 'prestart crash 2' });
+        await harness.waitFor(async () => {
+          const jobs = await harness.driver.findJobs(queueName, ['failed']);
+
+          return jobs.length === 1;
+        }, 15_000);
+
+        const logical = await pool.query<{
+          id: string;
+          status: string;
+          failure_kind: string;
+        }>({
+          text: `SELECT id, status, failure_kind
+            FROM desktop_runtime.queue_job WHERE queue_name = $1`,
+          values: [queueName],
+        });
+        const attempts = await pool.query<{ outcome: string }>({
+          text: `SELECT outcome FROM desktop_runtime.queue_job_attempt
+            WHERE job_id = $1 ORDER BY started_at`,
+          values: [logical.rows[0]?.id],
+        });
+
+        expect(handler).not.toHaveBeenCalled();
+        expect(logical.rows).toEqual([
+          expect.objectContaining({
+            status: 'failed',
+            failure_kind: 'stall_exhausted',
+          }),
+        ]);
+        expect(attempts.rows).toEqual([{ outcome: 'stalled' }]);
+        await expect(
+          harness.driver.findJobs(queueName, ['created', 'retry', 'active']),
+        ).resolves.toHaveLength(0);
+        await expect(fetchPhysicalJob(boss, queueName)).rejects.toThrow(
+          `No physical job was available for ${queueName}`,
+        );
+      } finally {
+        await pool.end();
+        await harness.clear();
+      }
+    });
+
     it('rolls back logical retry, replacement envelope, and current completion together', async () => {
       const queueName =
         `runtime-contract-overlay-rollback-${randomUUID()}` as MessageQueue;
@@ -104,6 +209,8 @@ if (process.env.RUNTIME_CONTRACT_DRIVER === 'pg-boss-overlay') {
       const originalSend = transport.send;
 
       try {
+        await harness.start();
+        await boss.offWork(queueName);
         await within(
           harness.driver.add(
             queueName,
@@ -223,6 +330,8 @@ if (process.env.RUNTIME_CONTRACT_DRIVER === 'pg-boss-overlay') {
       const { boss } = overlayInternals(harness.driver);
 
       try {
+        await harness.start();
+        await boss.offWork(queueName);
         await harness.driver.add(queueName, 'stale-generation', {});
         const logical = await pool.query<{ id: string }>({
           text: `SELECT id FROM desktop_runtime.queue_job
@@ -241,7 +350,7 @@ if (process.env.RUNTIME_CONTRACT_DRIVER === 'pg-boss-overlay') {
             WHERE id = $1`,
           values: [logicalJobId, randomUUID()],
         });
-        await harness.start();
+        await harness.driver.work(queueName, handler);
         await harness.waitFor(async () => {
           const jobs = await boss.findJobs(queueName);
 
@@ -275,6 +384,8 @@ if (process.env.RUNTIME_CONTRACT_DRIVER === 'pg-boss-overlay') {
       const originalComplete = transport.complete;
 
       try {
+        await harness.start();
+        await boss.offWork(queueName);
         await harness.driver.add(queueName, 'settlement-recovery', {});
         const physical = await fetchPhysicalJob(boss, queueName);
         const envelope = physical.data;

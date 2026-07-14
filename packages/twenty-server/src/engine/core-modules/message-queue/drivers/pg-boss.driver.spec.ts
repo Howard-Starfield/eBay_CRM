@@ -38,6 +38,7 @@ type BossMock = {
 type LogicalLedgerMock = {
   initialize: jest.Mock;
   registerQueuePolicy: jest.Mock;
+  markWorkerReady: jest.Mock;
   createJob: jest.Mock;
   startAttempt: jest.Mock;
   settleSuccess: jest.Mock;
@@ -130,6 +131,7 @@ describe('PgBossDriver', () => {
       registerQueuePolicy: jest
         .fn()
         .mockResolvedValue({ stallRecoveryLimit: 1 }),
+      markWorkerReady: jest.fn().mockResolvedValue(undefined),
       createJob: jest.fn().mockResolvedValue('logical-job-id'),
       startAttempt: jest.fn().mockResolvedValue({
         kind: 'execute',
@@ -328,6 +330,10 @@ describe('PgBossDriver', () => {
       queueName,
       expect.objectContaining({ includeMetadata: true }),
       expect.any(Function),
+    );
+    expect(logicalLedger.markWorkerReady).toHaveBeenCalledWith(queueName);
+    expect(boss.work.mock.invocationCallOrder[1]).toBeLessThan(
+      logicalLedger.markWorkerReady.mock.invocationCallOrder[0],
     );
     await overlayDriver.onModuleDestroy();
   });

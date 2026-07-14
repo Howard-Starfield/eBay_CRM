@@ -29,6 +29,7 @@ type PgBossLogicalLedgerOptions = {
 type PersistedQueuePolicy = {
   stall_recovery_limit: number;
   heartbeat_seconds: number | null;
+  worker_ready: boolean;
 };
 
 type StartableQueueJob = {
@@ -111,17 +112,30 @@ export class PgBossLogicalLedger {
     await this.options.pool.query({
       text: `
         INSERT INTO ${this.options.schema}.queue_policy
-          (queue_name, stall_recovery_limit, heartbeat_seconds)
-        VALUES ($1, $2, $3)
+          (queue_name, stall_recovery_limit, heartbeat_seconds, worker_ready_at)
+        VALUES ($1, $2, $3, '-infinity'::timestamptz)
         ON CONFLICT (queue_name) DO UPDATE SET
           stall_recovery_limit = EXCLUDED.stall_recovery_limit,
           heartbeat_seconds = EXCLUDED.heartbeat_seconds,
+          worker_ready_at = '-infinity'::timestamptz,
           updated_at = now()
       `,
       values: [queueName, stallRecoveryLimit, heartbeatSeconds ?? null],
     });
 
     return { stallRecoveryLimit, heartbeatSeconds };
+  }
+
+  async markWorkerReady(queueName: MessageQueue): Promise<void> {
+    await this.initialize();
+    await this.options.pool.query({
+      text: `
+        UPDATE ${this.options.schema}.queue_policy
+        SET worker_ready_at = now(), updated_at = now()
+        WHERE queue_name = $1
+      `,
+      values: [queueName],
+    });
   }
 
   async createJob<T extends MessageQueueJobData>(args: {
@@ -147,7 +161,7 @@ export class PgBossLogicalLedger {
     try {
       await client.query('BEGIN');
 
-      const policy = await this.loadOrCreateQueuePolicy(client, args.queueName);
+      const policy = await this.loadReadyQueuePolicy(client, args.queueName);
 
       await client.query({
         text: `
@@ -834,10 +848,73 @@ export class PgBossLogicalLedger {
         !job ||
         job.id !== args.envelope.logicalJobId ||
         job.generation !== args.envelope.generation ||
-        job.current_physical_job_id !== args.physicalJobId ||
-        job.current_execution_token === null ||
-        job.status !== 'active'
+        job.current_physical_job_id !== args.physicalJobId
       ) {
+        await client.query('COMMIT');
+
+        return 'fenced';
+      }
+
+      if (
+        ['queued', 'retry_wait'].includes(job.status) &&
+        job.current_execution_token === null
+      ) {
+        const failed = await client.query<{ id: string }>({
+          text: `
+            UPDATE ${this.options.schema}.queue_job
+            SET status = 'failed',
+              current_execution_token = NULL,
+              failure_kind = 'stall_exhausted',
+              failed_at = now(),
+              updated_at = now()
+            WHERE id = $1
+              AND generation = $2
+              AND current_physical_job_id = $3
+              AND current_execution_token IS NULL
+              AND status IN ('queued', 'retry_wait')
+            RETURNING id
+          `,
+          values: [job.id, job.generation, args.physicalJobId],
+        });
+
+        if (!failed.rows[0]) {
+          await client.query('ROLLBACK');
+
+          return 'fenced';
+        }
+
+        const syntheticExecutionToken = v5(
+          `${args.physicalJobId}:dead-letter-execution`,
+          PHYSICAL_JOB_NAMESPACE,
+        );
+
+        await client.query({
+          text: `
+            INSERT INTO ${this.options.schema}.queue_job_attempt (
+              id, job_id, generation, physical_job_id, worker_instance_id,
+              execution_token, transport_retry_count, started_at, finished_at,
+              outcome
+            ) VALUES ($1, $2, $3, $4, $5, $6, 0, now(), now(), 'stalled')
+            ON CONFLICT (job_id, execution_token) DO NOTHING
+          `,
+          values: [
+            v5(
+              `${args.physicalJobId}:dead-letter-attempt`,
+              PHYSICAL_JOB_NAMESPACE,
+            ),
+            job.id,
+            job.generation,
+            args.physicalJobId,
+            v5('dead-letter-reconciler', PHYSICAL_JOB_NAMESPACE),
+            syntheticExecutionToken,
+          ],
+        });
+        await client.query('COMMIT');
+
+        return 'failed';
+      }
+
+      if (job.current_execution_token === null || job.status !== 'active') {
         await client.query('COMMIT');
 
         return 'fenced';
@@ -920,13 +997,14 @@ export class PgBossLogicalLedger {
     return v5(`${logicalJobId}:${generation}`, PHYSICAL_JOB_NAMESPACE);
   }
 
-  private async loadOrCreateQueuePolicy(
+  private async loadReadyQueuePolicy(
     client: PoolClient,
     queueName: MessageQueue,
   ): Promise<PersistedQueuePolicy> {
     const result = await client.query<PersistedQueuePolicy>({
       text: `
-        SELECT stall_recovery_limit, heartbeat_seconds
+        SELECT stall_recovery_limit, heartbeat_seconds,
+          worker_ready_at > '-infinity'::timestamptz AS worker_ready
         FROM ${this.options.schema}.queue_policy
         WHERE queue_name = $1
         FOR UPDATE
@@ -934,28 +1012,13 @@ export class PgBossLogicalLedger {
       values: [queueName],
     });
 
-    if (result.rows[0]) {
-      return result.rows[0];
+    if (!result.rows[0]?.worker_ready) {
+      throw new Error(
+        'logical queue worker is not ready; register workers before producing jobs',
+      );
     }
 
-    const inserted = await client.query<PersistedQueuePolicy>({
-      text: `
-        INSERT INTO ${this.options.schema}.queue_policy
-          (queue_name, stall_recovery_limit, heartbeat_seconds)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (queue_name) DO UPDATE SET
-          queue_name = EXCLUDED.queue_name
-        RETURNING stall_recovery_limit, heartbeat_seconds
-      `,
-      values: [queueName, 1, null],
-    });
-
-    return (
-      inserted.rows[0] ?? {
-        stall_recovery_limit: 1,
-        heartbeat_seconds: null,
-      }
-    );
+    return result.rows[0];
   }
 
   private toPgBossDatabase(client: PoolClient): PgBossDatabase {
@@ -1054,8 +1117,14 @@ export class PgBossLogicalLedger {
           queue_name text PRIMARY KEY,
           stall_recovery_limit integer NOT NULL CHECK (stall_recovery_limit >= 0),
           heartbeat_seconds integer CHECK (heartbeat_seconds IS NULL OR heartbeat_seconds >= 0),
+          worker_ready_at timestamptz NOT NULL DEFAULT '-infinity'::timestamptz,
           updated_at timestamptz NOT NULL DEFAULT now()
         )
+      `);
+      await client.query(`
+        ALTER TABLE ${this.options.schema}.queue_policy
+        ADD COLUMN IF NOT EXISTS worker_ready_at timestamptz
+          NOT NULL DEFAULT '-infinity'::timestamptz
       `);
       await client.query(`
         CREATE TABLE IF NOT EXISTS ${this.options.schema}.queue_job (
