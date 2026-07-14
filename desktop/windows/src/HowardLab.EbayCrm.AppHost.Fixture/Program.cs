@@ -57,6 +57,7 @@ switch (args[0])
                     break;
                 case "shutdown-roundtrip":
                 case "child-shutdown":
+                case "frame-budget":
                     break;
                 case "oversize":
                     using (var rawClient = new NamedPipeClientStream(
@@ -111,6 +112,19 @@ switch (args[0])
                     shutdown.OperationId,
                     role,
                     generation));
+            }
+            else if (args[1] == "frame-budget")
+            {
+                var shutdown = await client.ReadAsync();
+                await client.SendAsync(CreateEmptyControlEnvelope(
+                    ControlMessageType.ShutdownAccepted,
+                    shutdown.OperationId,
+                    role,
+                    generation));
+                for (var index = 0; index < 1_021; index++)
+                {
+                    _ = await client.ReadAsync();
+                }
             }
 
             await Task.Delay(Timeout.InfiniteTimeSpan);

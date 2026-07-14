@@ -175,6 +175,27 @@ public sealed class WindowsControlChannelTests
     }
 
     [Fact]
+    public async Task CombinedReadWriteFrameBudget_RejectsFrameAfterTotalOfOneThousandTwentyFour()
+    {
+        await using var channel = CreateChannel();
+        using var job = WindowsJobObject.CreateKillOnClose();
+        await using var process = await LaunchControlClientAsync(channel, job, "frame-budget");
+        await channel.AcceptAsync(process, job, CancellationToken.None).WaitAsync(Deadline);
+        var shutdown = CreateEmptyEnvelope(channel, ControlMessageType.Shutdown, Guid.NewGuid());
+        await channel.SendAsync(shutdown);
+        Assert.Equal(ControlMessageType.ShutdownAccepted, (await channel.ReadAsync()).Type);
+        for (var index = 0; index < 1_021; index++)
+        {
+            await channel.SendAsync(shutdown);
+        }
+
+        var error = await Assert.ThrowsAsync<ControlProtocolException>(() =>
+            channel.SendAsync(shutdown));
+
+        Assert.Equal(ControlProtocolErrorCode.FrameLimitExceeded, error.Code);
+    }
+
+    [Fact]
     public async Task AcceptAsync_RejectsClientOutsideExpectedJob()
     {
         await using var channel = CreateChannel();
@@ -197,6 +218,41 @@ public sealed class WindowsControlChannelTests
                 new NeverUsedSupervisedProcess(),
                 job,
                 CancellationToken.None).WaitAsync(Deadline));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.AcceptAsync(new NeverUsedSupervisedProcess(), job, CancellationToken.None));
+    }
+
+    [Fact]
+    public void CreateBeforeLaunch_RejectsTimeoutBeyondCancelAfterRangeBeforeCreatingPipe()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => CreateChannel(TimeSpan.MaxValue));
+    }
+
+    [Fact]
+    public async Task DisposeAsync_WinsRaceBeforeAuthenticationPublicationAndAllCallersShareCompletion()
+    {
+        await using var channel = CreateChannel();
+        using var job = WindowsJobObject.CreateKillOnClose();
+        await using var process = await LaunchControlClientAsync(channel, job, "valid");
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        channel.AuthenticationPublishHook = async cancellationToken =>
+        {
+            reached.TrySetResult();
+            await release.Task.WaitAsync(cancellationToken);
+        };
+        var accept = channel.AcceptAsync(process, job, CancellationToken.None);
+        await reached.Task.WaitAsync(Deadline);
+
+        var firstDispose = channel.DisposeAsync().AsTask();
+        var secondDispose = channel.DisposeAsync().AsTask();
+        Assert.Same(firstDispose, secondDispose);
+        await Task.WhenAll(firstDispose, secondDispose).WaitAsync(Deadline);
+        release.TrySetResult();
+
+        await Assert.ThrowsAnyAsync<Exception>(() => accept);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => channel.SendAsync(
+            CreateEmptyEnvelope(channel, ControlMessageType.Shutdown, Guid.NewGuid())));
     }
 
     private static WindowsControlChannel CreateChannel(TimeSpan? timeout = null) =>

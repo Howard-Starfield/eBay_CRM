@@ -9,6 +9,10 @@ internal static unsafe partial class NativeMethods
     internal const int TokenGroups = 2;
     internal const uint SeGroupLogonId = 0xC0000000;
     internal const uint MutexAllAccess = 0x001F0001;
+    internal const uint DaclSecurityInformation = 0x00000004;
+    internal const int ErrorInsufficientBuffer = 122;
+    internal const int ErrorAlreadyExists = 183;
+    internal const int ErrorAccessDenied = 5;
     internal const uint WaitAbandoned0 = 0x00000080;
     internal const uint WaitFailed = 0xffffffff;
 
@@ -43,6 +47,15 @@ internal static unsafe partial class NativeMethods
         void* tokenInformation,
         uint tokenInformationLength,
         out uint returnLength);
+
+    [LibraryImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool GetKernelObjectSecurity(
+        SafeWaitHandle handle,
+        uint requestedInformation,
+        byte* securityDescriptor,
+        uint length,
+        out uint needed);
 
     [LibraryImport("kernel32.dll", EntryPoint = "CreateMutexExW", SetLastError = true,
         StringMarshalling = StringMarshalling.Utf16)]

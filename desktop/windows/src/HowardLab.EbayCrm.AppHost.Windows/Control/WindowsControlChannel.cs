@@ -9,6 +9,7 @@ namespace HowardLab.EbayCrm.AppHost.Windows.Control;
 
 public sealed class WindowsControlChannel : IControlChannel
 {
+    private const double MaxCancelAfterMilliseconds = uint.MaxValue - 1d;
     public const string PipeEnvironmentVariable = "HOWARDLAB_APPHOST_CONTROL_PIPE";
     public const string NonceEnvironmentVariable = "HOWARDLAB_APPHOST_CONTROL_NONCE";
     public const string RoleEnvironmentVariable = "HOWARDLAB_APPHOST_CONTROL_ROLE";
@@ -23,8 +24,10 @@ public sealed class WindowsControlChannel : IControlChannel
     private readonly SemaphoreSlim _readGate = new(1, 1);
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private readonly object _validatorGate = new();
+    private readonly object _disposeGate = new();
     private ControlSessionValidator? _validator;
     private SafeProcessHandle? _clientProcess;
+    private Task? _disposeTask;
     private int _frameCount;
     private int _state;
 
@@ -39,6 +42,8 @@ public sealed class WindowsControlChannel : IControlChannel
     }
 
     public ControlEndpointIdentity EndpointIdentity { get; }
+
+    internal Func<CancellationToken, Task>? AuthenticationPublishHook { get; set; }
 
     public static WindowsControlChannel CreateBeforeLaunch(
         RuntimeRole role,
@@ -68,7 +73,9 @@ public sealed class WindowsControlChannel : IControlChannel
             throw new ArgumentOutOfRangeException(nameof(expectedBuildIdentity));
         }
 
-        if (operationTimeout <= TimeSpan.Zero || operationTimeout == Timeout.InfiniteTimeSpan)
+        if (operationTimeout <= TimeSpan.Zero ||
+            operationTimeout == Timeout.InfiniteTimeSpan ||
+            operationTimeout.TotalMilliseconds > MaxCancelAfterMilliseconds)
         {
             throw new ArgumentOutOfRangeException(nameof(operationTimeout));
         }
@@ -109,9 +116,10 @@ public sealed class WindowsControlChannel : IControlChannel
             throw new InvalidOperationException("This control endpoint generation has already been accepted or faulted.");
         }
 
-        using var boundedCancellation = CreateBoundedCancellation(cancellationToken);
+        CancellationTokenSource? boundedCancellation = null;
         try
         {
+            boundedCancellation = CreateBoundedCancellation(cancellationToken);
             await _pipe.WaitForConnectionAsync(boundedCancellation.Token).ConfigureAwait(false);
             VerifyExpectedGeneration(expectedProcess.Identity);
             _clientProcess = PipeClientIdentityVerifier.Instance.Verify(
@@ -136,17 +144,29 @@ public sealed class WindowsControlChannel : IControlChannel
                 throw new InvalidDataException($"Control Hello rejected: {validation.ReasonCode}.");
             }
 
+            if (AuthenticationPublishHook is { } hook)
+            {
+                await hook(boundedCancellation.Token).ConfigureAwait(false);
+            }
+
             _validator = validator;
-            Volatile.Write(ref _state, 2);
+            if (Interlocked.CompareExchange(ref _state, 2, 1) != 1)
+            {
+                throw new ObjectDisposedException(nameof(WindowsControlChannel));
+            }
+
             return this;
         }
         catch
         {
-            Volatile.Write(ref _state, 3);
-            _clientProcess?.Dispose();
-            _clientProcess = null;
+            TransitionToFaulted();
+            Interlocked.Exchange(ref _clientProcess, null)?.Dispose();
             _pipe.Dispose();
             throw;
+        }
+        finally
+        {
+            boundedCancellation?.Dispose();
         }
     }
 
@@ -211,14 +231,17 @@ public sealed class WindowsControlChannel : IControlChannel
 
     public ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _state, 4) == 4)
+        lock (_disposeGate)
         {
-            return ValueTask.CompletedTask;
+            return new ValueTask(_disposeTask ??= DisposeCoreAsync());
         }
+    }
 
-        _clientProcess?.Dispose();
-        _clientProcess = null;
-        return _pipe.DisposeAsync();
+    private async Task DisposeCoreAsync()
+    {
+        Interlocked.Exchange(ref _state, 4);
+        Interlocked.Exchange(ref _clientProcess, null)?.Dispose();
+        await _pipe.DisposeAsync().ConfigureAwait(false);
     }
 
     private CancellationTokenSource CreateBoundedCancellation(CancellationToken cancellationToken)
@@ -301,9 +324,25 @@ public sealed class WindowsControlChannel : IControlChannel
 
     private void Fault()
     {
-        Volatile.Write(ref _state, 3);
-        _clientProcess?.Dispose();
-        _clientProcess = null;
+        TransitionToFaulted();
+        Interlocked.Exchange(ref _clientProcess, null)?.Dispose();
         _pipe.Dispose();
+    }
+
+    private void TransitionToFaulted()
+    {
+        while (true)
+        {
+            var state = Volatile.Read(ref _state);
+            if (state == 4 || state == 3)
+            {
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref _state, 3, state) == state)
+            {
+                return;
+            }
+        }
     }
 }

@@ -10,6 +10,80 @@ using Microsoft.Win32.SafeHandles;
 
 namespace HowardLab.EbayCrm.AppHost.Windows.Instance;
 
+internal interface IProfileLockFileSystem
+{
+    void CreateDirectory(string path, CancellationToken cancellationToken);
+
+    FileStream OpenLockFile(string path, CancellationToken cancellationToken);
+
+    void ValidateProfilePath(string path, CancellationToken cancellationToken);
+
+    void WriteDiagnostic(
+        FileStream lockFile,
+        string profileHash,
+        CancellationToken cancellationToken);
+}
+
+internal sealed class WindowsProfileLockFileSystem : IProfileLockFileSystem
+{
+    internal static WindowsProfileLockFileSystem Instance { get; } = new();
+
+    private WindowsProfileLockFileSystem()
+    {
+    }
+
+    public void CreateDirectory(string path, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Directory.CreateDirectory(path);
+        cancellationToken.ThrowIfCancellationRequested();
+    }
+
+    public FileStream OpenLockFile(string path, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var stream = new FileStream(
+            path,
+            FileMode.OpenOrCreate,
+            FileAccess.ReadWrite,
+            FileShare.None);
+        if (cancellationToken.IsCancellationRequested)
+        {
+            stream.Dispose();
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+
+        return stream;
+    }
+
+    public void ValidateProfilePath(string path, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        DataProfileIdentity.EnsureNoReparsePoints(path, WindowsProfilePathInspector.Instance);
+        cancellationToken.ThrowIfCancellationRequested();
+    }
+
+    public void WriteDiagnostic(
+        FileStream lockFile,
+        string profileHash,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lockFile.SetLength(0);
+        lockFile.Position = 0;
+        using var process = Process.GetCurrentProcess();
+        JsonSerializer.Serialize(lockFile, new
+        {
+            ProcessId = Environment.ProcessId,
+            ProcessCreationTimeUtcTicks = process.StartTime.ToUniversalTime().Ticks,
+            ProfileHash = profileHash,
+        });
+        cancellationToken.ThrowIfCancellationRequested();
+        lockFile.Flush();
+        cancellationToken.ThrowIfCancellationRequested();
+    }
+}
+
 public sealed class UserProfileInstanceLock : IInstanceLock
 {
     private readonly ManualResetEventSlim _release;
@@ -30,15 +104,22 @@ public sealed class UserProfileInstanceLock : IInstanceLock
 
     public static ValueTask<UserProfileInstanceLock?> TryAcquireAsync(
         DataProfileIdentity identity,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken) =>
+        TryAcquireAsync(identity, cancellationToken, WindowsProfileLockFileSystem.Instance);
+
+    internal static ValueTask<UserProfileInstanceLock?> TryAcquireAsync(
+        DataProfileIdentity identity,
+        CancellationToken cancellationToken,
+        IProfileLockFileSystem fileSystem)
     {
         ArgumentNullException.ThrowIfNull(identity);
+        ArgumentNullException.ThrowIfNull(fileSystem);
         if (cancellationToken.IsCancellationRequested)
         {
             return ValueTask.FromCanceled<UserProfileInstanceLock?>(cancellationToken);
         }
 
-        var acquisition = new Acquisition(identity, cancellationToken);
+        var acquisition = new Acquisition(identity, cancellationToken, fileSystem);
         var thread = new Thread(acquisition.Run)
         {
             IsBackground = true,
@@ -72,14 +153,21 @@ public sealed class UserProfileInstanceLock : IInstanceLock
     {
         private readonly DataProfileIdentity _identity;
         private readonly CancellationToken _cancellationToken;
+        private readonly IProfileLockFileSystem _fileSystem;
+        private readonly object _publicationGate = new();
         private readonly ManualResetEventSlim _release = new(initialState: false);
         private readonly TaskCompletionSource _ownerCompletion =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private bool _cancellationObserved;
 
-        internal Acquisition(DataProfileIdentity identity, CancellationToken cancellationToken)
+        internal Acquisition(
+            DataProfileIdentity identity,
+            CancellationToken cancellationToken,
+            IProfileLockFileSystem fileSystem)
         {
             _identity = identity;
             _cancellationToken = cancellationToken;
+            _fileSystem = fileSystem;
         }
 
         internal TaskCompletionSource<UserProfileInstanceLock?> Result { get; } =
@@ -90,6 +178,13 @@ public sealed class UserProfileInstanceLock : IInstanceLock
             SafeWaitHandle? mutex = null;
             FileStream? lockFile = null;
             var ownsMutex = false;
+            var published = false;
+            var canceled = false;
+            var notAcquired = false;
+            Exception? failure = null;
+            using var cancellationRegistration = _cancellationToken.Register(
+                static state => ((Acquisition)state!).ObserveCancellation(),
+                this);
             try
             {
                 _cancellationToken.ThrowIfCancellationRequested();
@@ -106,56 +201,80 @@ public sealed class UserProfileInstanceLock : IInstanceLock
                     mutexName,
                     flags: 0,
                     NativeMethods.MutexAllAccess);
+                var creationError = Marshal.GetLastPInvokeError();
                 if (mutex.IsInvalid)
                 {
-                    throw new Win32Exception(Marshal.GetLastPInvokeError());
+                    if (creationError == NativeMethods.ErrorAccessDenied)
+                    {
+                        throw new ProfileOwnershipException(
+                            ProfileOwnershipErrorCode.ProfileMutexSecurityMismatch);
+                    }
+
+                    throw new Win32Exception(creationError);
                 }
+
+                if (creationError is not (0 or NativeMethods.ErrorAlreadyExists))
+                {
+                    throw new Win32Exception(creationError);
+                }
+
+                ValidateMutexSecurity(mutex);
 
                 var wait = NativeMethods.WaitForSingleObjectHandle(mutex, milliseconds: 0);
                 if (wait == NativeMethods.WaitTimeout)
                 {
-                    Result.TrySetResult(null);
-                    return;
+                    notAcquired = true;
                 }
-
-                if (wait is not (NativeMethods.WaitObject0 or NativeMethods.WaitAbandoned0))
+                else if (wait is not (NativeMethods.WaitObject0 or NativeMethods.WaitAbandoned0))
                 {
                     throw new Win32Exception(Marshal.GetLastPInvokeError());
                 }
-
-                ownsMutex = true;
-                _cancellationToken.ThrowIfCancellationRequested();
-                var runtimeDirectory = Path.Combine(_identity.CanonicalPath, "runtime");
-                Directory.CreateDirectory(runtimeDirectory);
-                try
+                else
                 {
-                    lockFile = new FileStream(
-                        Path.Combine(runtimeDirectory, "profile.lock"),
-                        FileMode.OpenOrCreate,
-                        FileAccess.ReadWrite,
-                        FileShare.None);
-                }
-                catch (IOException error) when (IsSharingViolation(error))
-                {
-                    Result.TrySetResult(null);
-                    return;
-                }
+                    ownsMutex = true;
+                    _cancellationToken.ThrowIfCancellationRequested();
+                    var runtimeDirectory = Path.Combine(_identity.CanonicalPath, "runtime");
+                    _fileSystem.CreateDirectory(runtimeDirectory, _cancellationToken);
+                    _cancellationToken.ThrowIfCancellationRequested();
+                    _fileSystem.ValidateProfilePath(_identity.CanonicalPath, _cancellationToken);
+                    _cancellationToken.ThrowIfCancellationRequested();
+                    try
+                    {
+                        lockFile = _fileSystem.OpenLockFile(
+                            Path.Combine(runtimeDirectory, "profile.lock"),
+                            _cancellationToken);
+                        _cancellationToken.ThrowIfCancellationRequested();
+                    }
+                    catch (IOException error) when (IsSharingViolation(error))
+                    {
+                        notAcquired = true;
+                    }
 
-                WriteDiagnosticContents(lockFile, _identity.ProfileHash);
-                var instanceLock = new UserProfileInstanceLock(
-                    _identity,
-                    _release,
-                    _ownerCompletion.Task);
-                Result.TrySetResult(instanceLock);
-                _release.Wait();
+                    if (!notAcquired)
+                    {
+                        _cancellationToken.ThrowIfCancellationRequested();
+                        _fileSystem.WriteDiagnostic(
+                            lockFile!,
+                            _identity.ProfileHash,
+                            _cancellationToken);
+                        _cancellationToken.ThrowIfCancellationRequested();
+                        var instanceLock = new UserProfileInstanceLock(
+                            _identity,
+                            _release,
+                            _ownerCompletion.Task);
+                        Publish(instanceLock);
+                        published = true;
+                        _release.Wait();
+                    }
+                }
             }
             catch (OperationCanceledException)
             {
-                Result.TrySetCanceled(_cancellationToken);
+                canceled = true;
             }
             catch (Exception error)
             {
-                Result.TrySetException(error);
+                failure = error;
             }
             finally
             {
@@ -169,20 +288,65 @@ public sealed class UserProfileInstanceLock : IInstanceLock
                 _ownerCompletion.TrySetResult();
                 _release.Dispose();
             }
+
+            if (!published)
+            {
+                if (canceled)
+                {
+                    Result.TrySetCanceled(_cancellationToken);
+                }
+                else if (failure is not null)
+                {
+                    Result.TrySetException(failure);
+                }
+                else
+                {
+                    Result.TrySetResult(null);
+                }
+            }
         }
 
-        private static void WriteDiagnosticContents(FileStream lockFile, string profileHash)
+        private void ObserveCancellation()
         {
-            lockFile.SetLength(0);
-            lockFile.Position = 0;
-            using var process = Process.GetCurrentProcess();
-            JsonSerializer.Serialize(lockFile, new
+            lock (_publicationGate)
             {
-                ProcessId = Environment.ProcessId,
-                ProcessCreationTimeUtcTicks = process.StartTime.ToUniversalTime().Ticks,
-                ProfileHash = profileHash,
-            });
-            lockFile.Flush(flushToDisk: true);
+                _cancellationObserved = true;
+            }
+        }
+
+        private static void ValidateMutexSecurity(SafeWaitHandle mutex)
+        {
+            try
+            {
+                if (!NativeMutexSecurity.IsCurrentUserOnly(mutex))
+                {
+                    throw new ProfileOwnershipException(
+                        ProfileOwnershipErrorCode.ProfileMutexSecurityMismatch);
+                }
+            }
+            catch (ProfileOwnershipException)
+            {
+                throw;
+            }
+            catch (Exception error) when (error is Win32Exception or ArgumentException or OverflowException)
+            {
+                throw new ProfileOwnershipException(
+                    ProfileOwnershipErrorCode.ProfileMutexSecurityMismatch);
+            }
+        }
+
+        private void Publish(UserProfileInstanceLock instanceLock)
+        {
+            lock (_publicationGate)
+            {
+                if (_cancellationObserved || _cancellationToken.IsCancellationRequested)
+                {
+                    _cancellationToken.ThrowIfCancellationRequested();
+                    throw new OperationCanceledException(_cancellationToken);
+                }
+
+                Result.TrySetResult(instanceLock);
+            }
         }
 
         private static bool IsSharingViolation(IOException error)
