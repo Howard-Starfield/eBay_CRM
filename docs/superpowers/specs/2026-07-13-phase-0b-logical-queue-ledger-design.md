@@ -6,6 +6,9 @@ Status: Approved for implementation planning
 
 Base commit: `0c7180bb0605e1c01fe81d2a8ec7b891bb208232`
 
+Evidence report:
+[`phase-0b-logical-queue-ledger-report.md`](../../architecture/phase-0b-logical-queue-ledger-report.md)
+
 ## Decision being tested
 
 Phase 0 proved `REJECT_PG_BOSS` for a direct BullMQ-compatible adapter because
