@@ -220,10 +220,79 @@ public sealed class LifecycleCoordinatorTests
         Assert.Equal(RestartBudgetResult.Allowed, harness.Budget.TryConsume(RuntimeRole.Worker, harness.Clock.UtcNow));
     }
 
+    [Theory]
+    [InlineData("HealthFailed")]
+    [InlineData("ControlDisconnected")]
+    public async Task RequestedWorkerFailureSignalsDuringServerRecoveryDoNotRestartOrConsumeBudget(string signalType)
+    {
+        var harness = await CoordinatorHarness.ReadyAsync(maxRetries: 1);
+        var worker = harness.Coordinator.CurrentGeneration(RuntimeRole.Worker);
+        var server = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
+        await harness.Coordinator.DispatchAsync(new RoleExited(server, 1));
+
+        var result = await harness.Coordinator.DispatchAsync(CreateFailureSignal(signalType, worker));
+
+        Assert.True(result.Ignored);
+        Assert.Equal("RequestedExit", result.ReasonCode);
+        Assert.Empty(result.Commands);
+        Assert.Equal(RuntimeState.WaitingForServer, harness.Coordinator.State);
+        Assert.Equal(RestartBudgetResult.Allowed, harness.Budget.TryConsume(RuntimeRole.Worker, harness.Clock.UtcNow));
+    }
+
+    [Theory]
+    [InlineData("HealthFailed")]
+    [InlineData("ControlDisconnected")]
+    public async Task RequestedServerFailureSignalsDuringDatabaseReconciliationDoNotRestartOrConsumeBudget(string signalType)
+    {
+        var harness = await CoordinatorHarness.ReadyAsync(maxRetries: 1);
+        var database = harness.Coordinator.CurrentGeneration(RuntimeRole.Database);
+        var server = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
+        await harness.Coordinator.DispatchAsync(new RoleExited(database, 1));
+
+        var result = await harness.Coordinator.DispatchAsync(CreateFailureSignal(signalType, server));
+
+        Assert.True(result.Ignored);
+        Assert.Equal("RequestedExit", result.ReasonCode);
+        Assert.Empty(result.Commands);
+        Assert.Equal(RuntimeState.ReconcilingDatabaseStart, harness.Coordinator.State);
+        Assert.Equal(RestartBudgetResult.Allowed, harness.Budget.TryConsume(RuntimeRole.Server, harness.Clock.UtcNow));
+    }
+
+    [Theory]
+    [InlineData(RuntimeRole.Worker)]
+    [InlineData(RuntimeRole.Server)]
+    public async Task DatabaseRecoveryRestoresItsOperationAfterAppTierRecovery(RuntimeRole recoveredRole)
+    {
+        var harness = await CoordinatorHarness.ReadyAsync();
+        var database = harness.Coordinator.CurrentGeneration(RuntimeRole.Database);
+        await harness.RecoverAppTierAndReturnReadyAsync(recoveredRole);
+        Assert.NotEqual(database.OperationId, harness.Coordinator.CurrentGeneration(recoveredRole).OperationId);
+
+        var databaseFailure = await harness.Coordinator.DispatchAsync(new RoleExited(database, 1));
+        Assert.Equal(RuntimeState.ReconcilingDatabaseStart, databaseFailure.Current);
+        var unrelatedTimeout = await harness.Coordinator.DispatchAsync(new OperationTimedOut(database, Guid.NewGuid()));
+        Assert.True(unrelatedTimeout.Ignored);
+        Assert.Equal("StaleOperation", unrelatedTimeout.ReasonCode);
+
+        var reconciled = await harness.Coordinator.DispatchAsync(new Reconciled(database, ReconciledState.Running));
+        var ready = await harness.Coordinator.DispatchAsync(new RoleReady(database));
+        var migrated = await harness.Coordinator.DispatchAsync(new MigrationCompleted(database.OperationId));
+
+        Assert.Equal(RuntimeState.WaitingForDatabase, reconciled.Current);
+        Assert.Equal(LifecycleCommandType.WaitForDatabase, Assert.Single(reconciled.Commands).Type);
+        Assert.Equal(RuntimeState.Migrating, ready.Current);
+        Assert.Equal(LifecycleCommandType.RunMigrations, Assert.Single(ready.Commands).Type);
+        Assert.Equal(RuntimeState.StartingServer, migrated.Current);
+        Assert.Equal(LifecycleCommandType.StartServer, Assert.Single(migrated.Commands).Type);
+    }
+
     [Fact]
     public async Task StableServerReadinessResetsItsExhaustedRetryWindow()
     {
-        var harness = await CoordinatorHarness.ReadyAsync(maxRetries: 1);
+        var harness = await CoordinatorHarness.ReadyAsync(
+            maxRetries: 1,
+            window: TimeSpan.FromMinutes(10),
+            stableResetPeriod: TimeSpan.FromMinutes(5));
         var server = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
         await harness.Coordinator.DispatchAsync(new RoleExited(server, 1));
         var replacementServer = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
@@ -509,6 +578,16 @@ public sealed class LifecycleCoordinatorTests
             or LifecycleCommandType.StartWorker;
     }
 
+    private static LifecycleEvent CreateFailureSignal(string signalType, ProcessGeneration generation)
+    {
+        return signalType switch
+        {
+            "HealthFailed" => new HealthFailed(generation, "probe-failed"),
+            "ControlDisconnected" => new ControlDisconnected(generation),
+            _ => throw new ArgumentOutOfRangeException(nameof(signalType)),
+        };
+    }
+
     private sealed class CoordinatorHarness
     {
         private static readonly DateTimeOffset Epoch = new(2026, 7, 14, 0, 0, 0, TimeSpan.Zero);
@@ -526,16 +605,25 @@ public sealed class LifecycleCoordinatorTests
 
         public RestartBudget Budget { get; }
 
-        public static CoordinatorHarness Create(int maxRetries = 2)
+        public static CoordinatorHarness Create(
+            int maxRetries = 2,
+            TimeSpan? window = null,
+            TimeSpan? stableResetPeriod = null)
         {
             var clock = new TestClock(Epoch);
-            var budget = new RestartBudget(maxRetries, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(5));
+            var budget = new RestartBudget(
+                maxRetries,
+                window ?? TimeSpan.FromMinutes(1),
+                stableResetPeriod ?? TimeSpan.FromMinutes(5));
             return new CoordinatorHarness(new LifecycleCoordinator(clock, budget), clock, budget);
         }
 
-        public static async Task<CoordinatorHarness> ReadyAsync(int maxRetries = 2)
+        public static async Task<CoordinatorHarness> ReadyAsync(
+            int maxRetries = 2,
+            TimeSpan? window = null,
+            TimeSpan? stableResetPeriod = null)
         {
-            var harness = Create(maxRetries);
+            var harness = Create(maxRetries, window, stableResetPeriod);
             var operationId = Guid.Parse("30000000-0000-0000-0000-000000000003");
             await harness.AdvanceToDatabaseStartAsync(operationId);
             var database = harness.Coordinator.CurrentGeneration(RuntimeRole.Database);
@@ -560,6 +648,27 @@ public sealed class LifecycleCoordinatorTests
             await Coordinator.DispatchAsync(new RoleReady(database));
             await Coordinator.DispatchAsync(new MigrationCompleted(operationId));
             Assert.Equal(RuntimeState.StartingServer, Coordinator.State);
+        }
+
+        public async Task RecoverAppTierAndReturnReadyAsync(RuntimeRole role)
+        {
+            var generation = Coordinator.CurrentGeneration(role);
+            await Coordinator.DispatchAsync(new RoleExited(generation, 1));
+            if (role == RuntimeRole.Server)
+            {
+                var server = Coordinator.CurrentGeneration(RuntimeRole.Server);
+                await Coordinator.DispatchAsync(new RoleReady(server));
+                var worker = Coordinator.CurrentGeneration(RuntimeRole.Worker);
+                await Coordinator.DispatchAsync(new RoleStarted(worker));
+                await Coordinator.DispatchAsync(new RoleReady(worker));
+            }
+            else
+            {
+                var worker = Coordinator.CurrentGeneration(RuntimeRole.Worker);
+                await Coordinator.DispatchAsync(new RoleReady(worker));
+            }
+
+            Assert.Equal(RuntimeState.Ready, Coordinator.State);
         }
 
         public async Task AdvanceToDatabaseStartAsync(Guid operationId)

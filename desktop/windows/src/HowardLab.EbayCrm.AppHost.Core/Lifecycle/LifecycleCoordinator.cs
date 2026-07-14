@@ -66,9 +66,9 @@ public sealed class LifecycleCoordinator
             RoleStarted value => RoleStartedTransition(previous, value.Value),
             RoleReady value => RoleReadyTransition(previous, value.Value),
             MigrationCompleted value => StartRoleAfterOperation(previous, value.OperationId, RuntimeState.Migrating, RuntimeRole.Server, RuntimeState.StartingServer, LifecycleCommandType.StartServer, LifecycleDeadlineKey.ServerStart),
-            RoleExited value => Recover(previous, value.Value, requestedExitEligible: true),
-            HealthFailed value => Recover(previous, value.Value, requestedExitEligible: false),
-            ControlDisconnected value => Recover(previous, value.Value, requestedExitEligible: false),
+            RoleExited value => Recover(previous, value.Value),
+            HealthFailed value => Recover(previous, value.Value),
+            ControlDisconnected value => Recover(previous, value.Value),
             OperationTimedOut value => Timeout(previous, value),
             Reconciled value => Reconcile(previous, value),
             ShutdownCompleted value => ShutdownCompletedTransition(previous, value),
@@ -246,12 +246,9 @@ public sealed class LifecycleCoordinator
         return Ignored(previous, "UnexpectedEvent");
     }
 
-    private TransitionResult Recover(
-        RuntimeState previous,
-        ProcessGeneration generation,
-        bool requestedExitEligible)
+    private TransitionResult Recover(RuntimeState previous, ProcessGeneration generation)
     {
-        if (requestedExitEligible && _requestedExits.Contains(generation))
+        if (_requestedExits.Contains(generation))
         {
             return Ignored(previous, "RequestedExit");
         }
@@ -314,6 +311,7 @@ public sealed class LifecycleCoordinator
 
     private TransitionResult RecoverDatabase(RuntimeState previous, ProcessGeneration generation)
     {
+        _currentOperationId = generation.OperationId;
         var commands = new List<LifecycleCommand>();
         if (_ownedRoles.Contains(RuntimeRole.Worker)
             && _generations.TryGetValue(RuntimeRole.Worker, out var worker))
