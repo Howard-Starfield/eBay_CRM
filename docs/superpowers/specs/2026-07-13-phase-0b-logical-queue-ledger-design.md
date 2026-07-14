@@ -78,55 +78,56 @@ Phase 0B owns three tables in schema `desktop_runtime`.
 
 ### `queue_policy`
 
-| Column | Type | Meaning |
-| --- | --- | --- |
-| `queue_name` | `text primary key` | Neutral queue name |
-| `stall_recovery_limit` | `integer not null` | Materialized worker crash-recovery policy |
-| `heartbeat_seconds` | `integer` | Explicit pg-boss heartbeat policy |
-| `worker_ready_at` | `timestamptz not null` | Last successful worker policy registration |
-| `updated_at` | `timestamptz not null` | Last policy update |
+| Column                 | Type                   | Meaning                                                             |
+| ---------------------- | ---------------------- | ------------------------------------------------------------------- |
+| `queue_name`           | `text primary key`     | Neutral queue name                                                  |
+| `stall_recovery_limit` | `integer not null`     | Materialized worker crash-recovery policy                           |
+| `heartbeat_seconds`    | `integer`              | Explicit pg-boss heartbeat policy                                   |
+| `worker_ready_at`      | `timestamptz not null` | Durable readiness sentinel; `-infinity` until both workers register |
+| `updated_at`           | `timestamptz not null` | Last policy update                                                  |
 
 The default stall recovery limit is explicitly stored as one. `work()` upserts
-the queue policy before accepting jobs. The local desktop launcher waits for
-worker readiness before the server accepts enqueue traffic. `add()` reads the
-persisted policy in its creation transaction and assigns that stall limit to
-both the logical job and its physical envelope. This is required because the
-producer and worker are separate processes and cannot share an in-memory
-options map.
+the queue policy and atomically resets `worker_ready_at` to `-infinity` before
+registration. It marks the policy ready only after both the main worker and its
+dead-letter reconciler register successfully. `add()` rejects production while
+the policy is absent or not ready; once ready, it reads the persisted policy in
+its creation transaction and assigns that stall limit to both the logical job
+and its physical envelope. This durable gate is required because the producer
+and worker are separate processes and cannot share an in-memory options map.
 
-If an explicit worker policy has not been registered, local mode uses the
-materialized default of one. A future hosted overlay would require a stronger
+Local mode therefore uses the materialized default of one only after successful
+worker registration. A future hosted overlay would require a stronger
 deployment-wide policy registration protocol; hosted mode remains BullMQ in
 this design.
 
 ### `queue_job`
 
-| Column | Type | Meaning |
-| --- | --- | --- |
-| `id` | `uuid primary key` | Stable logical job ID |
-| `queue_name` | `text not null` | Neutral queue name |
-| `job_name` | `text not null` | Registered Twenty job name |
-| `payload` | `jsonb not null` | Versioned handler input |
-| `payload_version` | `integer not null` | Envelope/schema version |
-| `status` | `text not null` | `queued`, `active`, `retry_wait`, `completed`, `failed`, or `cancelled` |
-| `generation` | `integer not null` | Current physical generation, starting at zero |
-| `handler_failure_count` | `integer not null` | Completed handler failures |
-| `handler_retry_limit` | `integer not null` | Additional handler retries allowed |
-| `stall_count` | `integer not null` | Accounted lost-worker recoveries |
-| `stall_recovery_limit` | `integer not null` | Lost-worker recoveries allowed |
-| `started_count` | `integer not null` | Business-handler starts |
-| `transport_retry_count` | `integer not null` | Highest pg-boss retry count accounted for the current generation |
-| `priority` | `integer not null` | Neutral priority |
-| `available_at` | `timestamptz not null` | Earliest logical execution time |
-| `dedup_key` | `text` | Optional logical waiting-job deduplication key |
-| `current_physical_job_id` | `uuid not null` | Current pg-boss envelope ID |
-| `current_execution_token` | `uuid` | Fencing token for the active handler start |
-| `failure_kind` | `text` | `handler_exhausted`, `stall_exhausted`, `cancelled`, `hard_timeout`, or `invalid_payload` |
-| `last_error` | `jsonb` | Sanitized last failure metadata |
-| `created_at` | `timestamptz not null` | Creation time |
-| `updated_at` | `timestamptz not null` | Last canonical transition |
-| `completed_at` | `timestamptz` | Successful terminal time |
-| `failed_at` | `timestamptz` | Failed terminal time |
+| Column                    | Type                   | Meaning                                                                                   |
+| ------------------------- | ---------------------- | ----------------------------------------------------------------------------------------- |
+| `id`                      | `uuid primary key`     | Stable logical job ID                                                                     |
+| `queue_name`              | `text not null`        | Neutral queue name                                                                        |
+| `job_name`                | `text not null`        | Registered Twenty job name                                                                |
+| `payload`                 | `jsonb not null`       | Versioned handler input                                                                   |
+| `payload_version`         | `integer not null`     | Envelope/schema version                                                                   |
+| `status`                  | `text not null`        | `queued`, `active`, `retry_wait`, `completed`, `failed`, or `cancelled`                   |
+| `generation`              | `integer not null`     | Current physical generation, starting at zero                                             |
+| `handler_failure_count`   | `integer not null`     | Completed handler failures                                                                |
+| `handler_retry_limit`     | `integer not null`     | Additional handler retries allowed                                                        |
+| `stall_count`             | `integer not null`     | Accounted lost-worker recoveries                                                          |
+| `stall_recovery_limit`    | `integer not null`     | Lost-worker recoveries allowed                                                            |
+| `started_count`           | `integer not null`     | Business-handler starts                                                                   |
+| `transport_retry_count`   | `integer not null`     | Highest pg-boss retry count accounted for the current generation                          |
+| `priority`                | `integer not null`     | Neutral priority                                                                          |
+| `available_at`            | `timestamptz not null` | Earliest logical execution time                                                           |
+| `dedup_key`               | `text`                 | Optional logical waiting-job deduplication key                                            |
+| `current_physical_job_id` | `uuid not null`        | Current pg-boss envelope ID                                                               |
+| `current_execution_token` | `uuid`                 | Fencing token for the active handler start                                                |
+| `failure_kind`            | `text`                 | `handler_exhausted`, `stall_exhausted`, `cancelled`, `hard_timeout`, or `invalid_payload` |
+| `last_error`              | `jsonb`                | Sanitized last failure metadata                                                           |
+| `created_at`              | `timestamptz not null` | Creation time                                                                             |
+| `updated_at`              | `timestamptz not null` | Last canonical transition                                                                 |
+| `completed_at`            | `timestamptz`          | Successful terminal time                                                                  |
+| `failed_at`               | `timestamptz`          | Failed terminal time                                                                      |
 
 Checks enforce non-negative counters, non-negative limits, and generation zero
 or greater. A partial unique index protects waiting-job deduplication:
@@ -143,19 +144,19 @@ the Phase 0 contract.
 
 ### `queue_job_attempt`
 
-| Column | Type | Meaning |
-| --- | --- | --- |
-| `id` | `uuid primary key` | Attempt receipt ID |
-| `job_id` | `uuid not null` | Logical job ID |
-| `generation` | `integer not null` | Physical generation |
-| `physical_job_id` | `uuid not null` | pg-boss envelope ID |
-| `worker_instance_id` | `uuid not null` | Worker process identity |
-| `execution_token` | `uuid not null` | Fencing token for this start |
-| `transport_retry_count` | `integer not null` | pg-boss metadata at start |
-| `started_at` | `timestamptz not null` | Handler-start time |
-| `finished_at` | `timestamptz` | Attempt settlement time |
-| `outcome` | `text` | `running`, `completed`, `handler_failed`, `stalled`, `fenced`, or `cancelled` |
-| `error` | `jsonb` | Sanitized attempt error |
+| Column                  | Type                   | Meaning                                                                       |
+| ----------------------- | ---------------------- | ----------------------------------------------------------------------------- |
+| `id`                    | `uuid primary key`     | Attempt receipt ID                                                            |
+| `job_id`                | `uuid not null`        | Logical job ID                                                                |
+| `generation`            | `integer not null`     | Physical generation                                                           |
+| `physical_job_id`       | `uuid not null`        | pg-boss envelope ID                                                           |
+| `worker_instance_id`    | `uuid not null`        | Worker process identity                                                       |
+| `execution_token`       | `uuid not null`        | Fencing token for this start                                                  |
+| `transport_retry_count` | `integer not null`     | pg-boss metadata at start                                                     |
+| `started_at`            | `timestamptz not null` | Handler-start time                                                            |
+| `finished_at`           | `timestamptz`          | Attempt settlement time                                                       |
+| `outcome`               | `text`                 | `running`, `completed`, `handler_failed`, `stalled`, `fenced`, or `cancelled` |
+| `error`                 | `jsonb`                | Sanitized attempt error                                                       |
 
 `(job_id, execution_token)` is unique. History is append-oriented; the current
 job row is not used as the attempt log.
@@ -251,6 +252,13 @@ dedicated dead-letter reconciliation path must mark the logical job failed with
 `failure_kind = 'stall_exhausted'`. If this cannot be implemented with public
 APIs and deterministic receipts, the experiment stops with rejection.
 
+Exhaustion may occur before logical `startAttempt` commits. When the dead-letter
+envelope matches the canonical physical ID and generation, the canonical job is
+`queued` or `retry_wait`, and its execution token is null, reconciliation must
+atomically mark it failed and insert exactly one deterministic synthetic
+terminal `stalled` receipt. Repeated delivery is idempotent. The existing
+active-attempt reconciliation remains fenced by the current execution token.
+
 ## External side effects
 
 The ledger provides at-least-once execution with fenced PostgreSQL settlement.
@@ -281,6 +289,12 @@ The PostgreSQL overlay suite runs twice at the final gate. The BullMQ
 compatibility contract runs once. Focused TypeScript, formatting, runtime
 boundary, and diff checks run once. Full frontend, full server, and long soak
 suites are outside this fast experiment.
+
+Final whole-branch review adds two non-substituting service regressions: one
+proves that production is blocked until both logical workers are durably ready;
+the other proves deterministic terminal reconciliation when physical
+exhaustion precedes logical start. These supplement rather than alter the six
+mandatory semantic cases.
 
 ## Immediate rejection conditions
 

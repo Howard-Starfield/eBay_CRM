@@ -4,15 +4,16 @@ Date: 2026-07-13
 
 Base commit: `0c7180bb0605e1c01fe81d2a8ec7b891bb208232`
 
-Final implementation evidence commit: `f038261e9782e72ed0f967f5fbe0e09c7ec16b2a`
+Final implementation evidence commit: `362f443a`
 
 ## Mechanical verdict
 
 ADOPT_LOGICAL_LEDGER_OVERLAY_FOR_HARDENING
 
 All six approved semantic acceptance cases passed the required two-run adoption
-matrix at `0164ebc6`, then passed one covering run after each later correction
-at `48e87db7` and `f038261e`. The BullMQ compatibility contract passed once, the
+matrix at `0164ebc6`, passed one covering run after each later correction at
+`48e87db7` and `f038261e`, and passed twice at final correction `362f443a`. The
+BullMQ compatibility contract passed once after the final correction, the
 overlay uses only public pg-boss APIs, and none of the design's immediate
 rejection conditions occurred. This is an adoption decision for a hardening
 phase, not a production-readiness claim.
@@ -37,7 +38,10 @@ UUIDv5, while the business handler sees the stable logical UUID.
 Logical start and settlement lock and fence the canonical row. Logical failure,
 replacement-envelope send, and current-envelope completion compose through the
 same PostgreSQL transaction adapter. A deterministic dead-letter queue closes a
-current stall-exhausted generation. The overlay is opt-in; the default direct
+current stall-exhausted generation, including exhaustion before logical start;
+that path creates one deterministic synthetic terminal receipt. Durable
+`worker_ready_at` policy state blocks producers until both the main and
+dead-letter workers register successfully. The overlay is opt-in; the default direct
 pg-boss path and the BullMQ implementation remain unchanged.
 
 ## Explicit non-goals
@@ -78,20 +82,28 @@ covered by one further exact six-case run: 6 passed, 0 failed, 20 skipped; Jest
 13.985 seconds and wall 15.303 seconds. The report therefore does not represent
 the two-run matrix as having executed at final head.
 
+Final correction `362f443a` then ran the preserved matrix twice: run 1 reported
+6 passed, 0 failed, 22 skipped (Jest 12.980 seconds; wall 14.318 seconds), and
+run 2 reported 6 passed, 0 failed, 22 skipped (Jest 13.955 seconds; wall 15.173
+seconds). Two additional service regressions for durable readiness and
+pre-start physical exhaustion passed together (Jest 6.936 seconds; wall 8.239
+seconds).
+
 ## BullMQ compatibility
 
-The single approved BullMQ compatibility run passed 20 tests and failed 0; 3
-selector placeholders were skipped. Jest duration was 43.594 seconds and wall
-duration was 48.653 seconds. The ignored `twenty-shared` build artifact was
+The final BullMQ compatibility run passed 20 tests and failed 0; 3 selector
+placeholders were skipped. Jest duration was 43.474 seconds and wall duration
+was 49.187 seconds. The ignored `twenty-shared` build artifact was
 prepared before this run; no extra suite was used for that preparation.
 
 ## Public pg-boss surface and private-table confirmation
 
 The overlay composes through public `PgBoss` methods `start`, `stop`, `send`,
-`complete`, `updateQueue`, `supervise`, and `work`; public `work()` metadata
-(`includeMetadata`, `retryCount`, and dead-letter `sourceId`); the public
-`deadLetter` send option; and the exported public `Db.executeSql` transaction
-adapter. Final cleanup inspection used public `getQueues()`.
+`complete`, `updateQueue`, `supervise`, `work`, `offWork`, `fetch`, and `fail`;
+public `work()` metadata (`includeMetadata`, `retryCount`, and dead-letter
+`sourceId`); the public `deadLetter` send option; and the exported public
+`Db.executeSql` transaction adapter. Final cleanup inspection used public
+`getQueues()`.
 
 Application SQL reads and writes only the owned
 `desktop_runtime.queue_policy`, `desktop_runtime.queue_job`, and
@@ -157,6 +169,17 @@ Task 1-3 reports and the Task 4 gate:
     forms for CommonJS `pg` and the installed `pg-boss` export shape. A CommonJS
     probe using the same public `getQueues()` API corrected the audit tooling;
     no product or database state was changed by either failed probe.
+12. Final whole-branch review found two correctness gaps: physical exhaustion
+    before logical start could leave a matching canonical job queued, and a
+    materialized queue policy did not prove that both required workers were
+    registered. Six focused RED tests captured dead-letter reconciliation,
+    durable readiness, producer gating, and driver ordering. Correction commit
+    `362f443a` atomically closes the pre-start case with one deterministic
+    synthetic `stalled` receipt and adds a non-null readiness sentinel that is
+    reset before registration and marked ready only after the main and
+    dead-letter workers register. The implementation uses only public pg-boss
+    `offWork`, `fetch`, and `fail` APIs. Both new real-service regressions and
+    the preserved six-case matrix then passed as recorded above.
 
 No observed failure met an immediate semantic rejection condition after the
 corresponding fix. The remaining unrelated workspace diagnostics prevent a
@@ -165,21 +188,24 @@ evidence.
 
 ## Focused final verification
 
-Only the Task 4 focused non-service checks were run. No frontend or full test
-suite was run.
+Only focused checks and the explicitly approved service contracts were run. No
+frontend or full test suite was run.
 
-| Check                                                                | Result                                                                                       | Duration                                                |
-| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| Ledger and pg-boss driver focused Jest suites after final correction | PASS: 2 suites, 56 tests, 0 failures                                                         | 2.106 s wall                                            |
-| Direct server `tsgo --noEmit` after final correction                 | Global FAIL: exit 2 with 13 unrelated workspace diagnostics; exactly 0 Task-file diagnostics | Duration not captured by the independent final verifier |
-| Runtime backend boundary check                                       | PASS                                                                                         | 8.212 s wall                                            |
-| `git diff --check` before documentation                              | PASS                                                                                         | 0.138 s wall                                            |
+| Check                                                                     | Result                                                                                       | Duration                                |
+| ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------- |
+| Ledger and pg-boss driver focused Jest suites after final correction      | PASS: 2 suites, 58 tests, 0 failures                                                         | Jest 1.493 s                            |
+| Durable-readiness and pre-start-exhaustion real-service regressions       | PASS: 2 tests, 0 failures                                                                    | Jest 6.936 s; wall 8.239 s              |
+| Preserved six-case PostgreSQL overlay matrix, final run 1                 | PASS: 6 selected, 0 failures, 22 skipped                                                     | Jest 12.980 s; wall 14.318 s            |
+| Preserved six-case PostgreSQL overlay matrix, final run 2                 | PASS: 6 selected, 0 failures, 22 skipped                                                     | Jest 13.955 s; wall 15.173 s            |
+| BullMQ compatibility contract                                             | PASS: 20 tests, 0 failures, 3 selector placeholders skipped                                  | Jest 43.474 s; wall 49.187 s            |
+| Direct server `tsgo --noEmit` after final correction                      | Global FAIL: exit 2 with 15 unrelated workspace diagnostics; exactly 0 Task-file diagnostics | 9.7 s                                   |
+| Runtime backend boundary, formatting, and `git diff --check` final checks | PASS                                                                                         | Individual final durations not recorded |
 
 The global typecheck failure is intentionally reported as a failure. It was not
 waived into a passing result; only the filtered Task-file diagnostic result is
-green. No full-suite claim is made. An additional exact approved six-case
-overlay pass after the runtime-neutral type correction passed 6 selected tests
-with 0 failures and 20 skipped (13.985 seconds Jest; 15.303 seconds wall).
+green. No full-suite claim is made. The final correction was covered by two
+fresh exact runs of the approved six-case overlay matrix, the two added
+real-service regressions, and one fresh BullMQ compatibility run.
 
 ## Cleanup evidence
 
@@ -191,6 +217,7 @@ and `pg_stat_activity`.
 - `desktop_runtime.queue_job_attempt` rows belonging to those jobs: 0.
 - `desktop_runtime.queue_policy` rows with those queue names: 0.
 - Public pg-boss queue metadata names beginning `runtime-contract-`: 0.
+- Redis keys created by the compatibility contract: 0.
 - Active runtime-contract or Task 4 audit PostgreSQL sessions after the audit
   pg-boss instance stopped: 0.
 
@@ -216,3 +243,9 @@ No test artifact or test session required cleanup at the Task 4 final audit.
    diagnostics.
 8. Add cancellation, migrations, backup/restore safety, Windows sleep/resume,
    repair commands, and crash-boundary soak coverage before production use.
+9. Preserve the primary transaction error if rollback itself fails, while
+   retaining the rollback failure as diagnostic context; apply one policy to
+   every logical-ledger transaction helper.
+10. Add and validate a database `CHECK` constraint for canonical
+    `failure_kind` values through an explicit migration rather than relying on
+    TypeScript-only narrowing.
