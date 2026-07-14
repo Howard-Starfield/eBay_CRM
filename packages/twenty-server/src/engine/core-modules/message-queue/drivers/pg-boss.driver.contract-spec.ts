@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
+import { Pool } from 'pg';
 import { PgBoss } from 'pg-boss';
 
 import {
@@ -108,19 +109,31 @@ const within = async <T>(
   }
 };
 
-const createHarness: CreateMessageQueueDriverTestHarness = async ({
-  queueName,
-  handler,
-  workerOptions,
-  shutdownDrainMs = 250,
-}) => {
+export const createPgBossContractHarness = async (
+  {
+    queueName,
+    handler,
+    workerOptions,
+    shutdownDrainMs = 250,
+  }: Parameters<CreateMessageQueueDriverTestHarness>[0],
+  {
+    logicalLedgerEnabled = false,
+    applicationPrefix = 'ebaycrm-runtime-contract',
+  }: {
+    logicalLedgerEnabled?: boolean;
+    applicationPrefix?: string;
+  } = {},
+): Promise<MessageQueueDriverTestHarness> => {
   const connectionString = runtimeContractConnectionString();
 
   const driverOptions: PgBossDriverOptions = {
     connectionString,
     schema: 'desktop_runtime',
-    applicationName: 'ebaycrm-runtime-contract',
+    applicationName: logicalLedgerEnabled
+      ? `${applicationPrefix}-${randomUUID()}`
+      : applicationPrefix,
     intervalPollMs: 250,
+    logicalLedgerEnabled,
   };
   const metricsService = {} as MetricsService;
   const twentyConfigService = {
@@ -178,7 +191,11 @@ const createHarness: CreateMessageQueueDriverTestHarness = async ({
 
     const internals = driver as unknown as PgBossDriverInternals;
 
-    await internals.boss.stop({ close: true, graceful: false, timeout: 1_000 });
+    await internals.boss.stop({
+      close: true,
+      graceful: false,
+      timeout: 1_000,
+    });
     internals.started = false;
     await driver.onModuleDestroy();
     workerStarted = false;
@@ -195,6 +212,25 @@ const createHarness: CreateMessageQueueDriverTestHarness = async ({
     async clear() {
       await stop();
       await deletePgBossQueue(queueName);
+      if (logicalLedgerEnabled) {
+        await deletePgBossQueue(
+          `${queueName}-logical-dead-letter` as MessageQueue,
+        );
+        const cleanupPool = new Pool({ connectionString });
+
+        try {
+          await cleanupPool.query(
+            'DELETE FROM desktop_runtime.queue_job WHERE queue_name = $1',
+            [queueName],
+          );
+          await cleanupPool.query(
+            'DELETE FROM desktop_runtime.queue_policy WHERE queue_name = $1',
+            [queueName],
+          );
+        } finally {
+          await cleanupPool.end();
+        }
+      }
     },
     async waitFor(predicate, timeoutMs) {
       const deadline = Date.now() + timeoutMs;
@@ -221,6 +257,9 @@ const createHarness: CreateMessageQueueDriverTestHarness = async ({
 
   return harness;
 };
+
+const createHarness: CreateMessageQueueDriverTestHarness = (args) =>
+  createPgBossContractHarness(args);
 
 if (process.env.RUNTIME_CONTRACT_DRIVER === 'pg-boss') {
   beforeAll(async () => {

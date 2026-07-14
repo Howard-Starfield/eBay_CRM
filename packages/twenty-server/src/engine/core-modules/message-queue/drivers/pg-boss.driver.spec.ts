@@ -6,6 +6,7 @@ import { MessageQueue } from 'src/engine/core-modules/message-queue/message-queu
 import { type TwentyConfigService } from 'src/engine/core-modules/twenty-config/twenty-config.service';
 
 import { PgBossDriver, type PgBossDriverOptions } from './pg-boss.driver';
+import { PgBossLogicalLedger } from './pg-boss-logical-ledger';
 
 jest.mock('pg-boss', () => ({
   PgBoss: jest.fn(),
@@ -13,12 +14,16 @@ jest.mock('pg-boss', () => ({
 jest.mock('pg', () => ({
   Pool: jest.fn(),
 }));
+jest.mock('./pg-boss-logical-ledger', () => ({
+  PgBossLogicalLedger: jest.fn(),
+}));
 
 type BossMock = {
   start: jest.Mock;
   stop: jest.Mock;
   createQueue: jest.Mock;
   send: jest.Mock;
+  complete: jest.Mock;
   work: jest.Mock;
   findJobs: jest.Mock;
   getQueueStats: jest.Mock;
@@ -28,6 +33,18 @@ type BossMock = {
   unschedule: jest.Mock;
   updateQueue: jest.Mock;
   supervise: jest.Mock;
+};
+
+type LogicalLedgerMock = {
+  initialize: jest.Mock;
+  registerQueuePolicy: jest.Mock;
+  createJob: jest.Mock;
+  startAttempt: jest.Mock;
+  settleSuccess: jest.Mock;
+  settleFailure: jest.Mock;
+  reconcileDeadLetter: jest.Mock;
+  getStats: jest.Mock;
+  findJobs: jest.Mock;
 };
 
 type RetentionJob = {
@@ -60,6 +77,7 @@ const createBossMock = (): BossMock => ({
   stop: jest.fn().mockResolvedValue(undefined),
   createQueue: jest.fn().mockResolvedValue(undefined),
   send: jest.fn().mockResolvedValue('job-id'),
+  complete: jest.fn().mockResolvedValue({}),
   work: jest.fn().mockResolvedValue('worker-id'),
   findJobs: jest.fn().mockResolvedValue([]),
   getQueueStats: jest.fn().mockResolvedValue([]),
@@ -92,6 +110,7 @@ describe('PgBossDriver', () => {
   let boss: BossMock;
   let pool: PoolMock;
   let poolClient: PoolClientMock;
+  let logicalLedger: LogicalLedgerMock;
   let driver: PgBossDriver;
 
   beforeEach(() => {
@@ -106,8 +125,30 @@ describe('PgBossDriver', () => {
       query: jest.fn().mockResolvedValue({ rows: [] }),
       end: jest.fn().mockResolvedValue(undefined),
     };
+    logicalLedger = {
+      initialize: jest.fn().mockResolvedValue(undefined),
+      registerQueuePolicy: jest
+        .fn()
+        .mockResolvedValue({ stallRecoveryLimit: 1 }),
+      createJob: jest.fn().mockResolvedValue('logical-job-id'),
+      startAttempt: jest.fn().mockResolvedValue({
+        kind: 'execute',
+        logicalJobId: 'logical-job-id',
+        jobName: 'reply-to-buyer',
+        data: { messageId: 'message-1' },
+        executionToken: 'execution-token',
+      }),
+      settleSuccess: jest.fn().mockResolvedValue('settled'),
+      settleFailure: jest.fn().mockResolvedValue('failed'),
+      reconcileDeadLetter: jest.fn().mockResolvedValue('failed'),
+      getStats: jest.fn(),
+      findJobs: jest.fn(),
+    };
     jest.mocked(PgBoss).mockImplementation(() => boss as never);
     jest.mocked(Pool).mockImplementation(() => pool as never);
+    jest
+      .mocked(PgBossLogicalLedger)
+      .mockImplementation(() => logicalLedger as never);
     driver = new PgBossDriver(options, metricsService, twentyConfigService);
   });
 
@@ -222,6 +263,286 @@ describe('PgBossDriver', () => {
     expect(sendOptions.startAfter.getTime()).toBeLessThanOrEqual(
       Date.now() + 325,
     );
+  });
+
+  it('initializes the logical ledger after pg-boss starts when the overlay is enabled', async () => {
+    const overlayDriver = new PgBossDriver(
+      { ...options, logicalLedgerEnabled: true },
+      metricsService,
+      twentyConfigService,
+    );
+
+    await overlayDriver.onModuleInit();
+
+    expect(logicalLedger.initialize).toHaveBeenCalledTimes(1);
+    expect(boss.start.mock.invocationCallOrder[0]).toBeLessThan(
+      logicalLedger.initialize.mock.invocationCallOrder[0],
+    );
+    await overlayDriver.onModuleDestroy();
+  });
+
+  it('creates logical jobs instead of sending direct envelopes in overlay mode', async () => {
+    const overlayDriver = new PgBossDriver(
+      { ...options, logicalLedgerEnabled: true },
+      metricsService,
+      twentyConfigService,
+    );
+
+    await overlayDriver.add(
+      queueName,
+      'reply-to-buyer',
+      { messageId: 'message-1' },
+      { retryLimit: 0 },
+    );
+
+    expect(logicalLedger.createJob).toHaveBeenCalledWith({
+      queueName,
+      jobName: 'reply-to-buyer',
+      data: { messageId: 'message-1' },
+      options: { retryLimit: 0 },
+    });
+    expect(boss.send).not.toHaveBeenCalled();
+    await overlayDriver.onModuleDestroy();
+  });
+
+  it('materializes logical queue policy before registering the physical worker', async () => {
+    const overlayDriver = new PgBossDriver(
+      { ...options, logicalLedgerEnabled: true },
+      metricsService,
+      twentyConfigService,
+    );
+
+    await overlayDriver.work(queueName, jest.fn(), {
+      lockDuration: 10_100,
+      maxStalledCount: 2,
+    });
+
+    expect(logicalLedger.registerQueuePolicy).toHaveBeenCalledWith(queueName, {
+      lockDuration: 10_100,
+      maxStalledCount: 2,
+    });
+    expect(
+      logicalLedger.registerQueuePolicy.mock.invocationCallOrder[0],
+    ).toBeLessThan(boss.work.mock.invocationCallOrder[0]);
+    expect(boss.work).toHaveBeenCalledWith(
+      queueName,
+      expect.objectContaining({ includeMetadata: true }),
+      expect.any(Function),
+    );
+    await overlayDriver.onModuleDestroy();
+  });
+
+  it('passes stable logical ids to handlers and settles logical success', async () => {
+    const overlayDriver = new PgBossDriver(
+      { ...options, logicalLedgerEnabled: true },
+      metricsService,
+      twentyConfigService,
+    );
+    const handler = jest.fn().mockResolvedValue(undefined);
+    const signal = new AbortController().signal;
+
+    await overlayDriver.work(queueName, handler);
+    const workHandler = boss.work.mock.calls[0][2] as (
+      jobs: Array<Record<string, unknown>>,
+    ) => Promise<void>;
+    await workHandler([
+      {
+        id: 'physical-job-id',
+        retryCount: 0,
+        signal,
+        data: { version: 2, logicalJobId: 'logical-job-id', generation: 0 },
+      },
+    ]);
+
+    expect(handler).toHaveBeenCalledWith({
+      id: 'logical-job-id',
+      name: 'reply-to-buyer',
+      data: { messageId: 'message-1' },
+      abortSignal: signal,
+    });
+    expect(logicalLedger.settleSuccess).toHaveBeenCalledWith({
+      queueName,
+      physicalJobId: 'physical-job-id',
+      logicalJobId: 'logical-job-id',
+      generation: 0,
+      executionToken: 'execution-token',
+    });
+    await overlayDriver.onModuleDestroy();
+  });
+
+  it('catches handler exceptions and settles logical failure', async () => {
+    const overlayDriver = new PgBossDriver(
+      { ...options, logicalLedgerEnabled: true },
+      metricsService,
+      twentyConfigService,
+    );
+    const failure = new Error('handler failed');
+
+    await overlayDriver.work(queueName, async () => {
+      throw failure;
+    });
+    const workHandler = boss.work.mock.calls[0][2] as (
+      jobs: Array<Record<string, unknown>>,
+    ) => Promise<void>;
+    await expect(
+      workHandler([
+        {
+          id: 'physical-job-id',
+          retryCount: 0,
+          signal: new AbortController().signal,
+          data: { version: 2, logicalJobId: 'logical-job-id', generation: 0 },
+        },
+      ]),
+    ).resolves.toBeUndefined();
+
+    expect(logicalLedger.settleFailure).toHaveBeenCalledWith(
+      {
+        queueName,
+        physicalJobId: 'physical-job-id',
+        logicalJobId: 'logical-job-id',
+        generation: 0,
+        executionToken: 'execution-token',
+      },
+      failure,
+    );
+    expect(logicalLedger.settleSuccess).not.toHaveBeenCalled();
+    await overlayDriver.onModuleDestroy();
+  });
+
+  it('propagates settlement interruption without reclassifying it as a handler failure', async () => {
+    const overlayDriver = new PgBossDriver(
+      { ...options, logicalLedgerEnabled: true },
+      metricsService,
+      twentyConfigService,
+    );
+    const interruption = new Error('settlement interrupted');
+
+    logicalLedger.settleSuccess.mockRejectedValue(interruption);
+    await overlayDriver.work(queueName, jest.fn().mockResolvedValue(undefined));
+    const workHandler = boss.work.mock.calls[0][2] as (
+      jobs: Array<Record<string, unknown>>,
+    ) => Promise<void>;
+
+    await expect(
+      workHandler([
+        {
+          id: 'physical-job-id',
+          retryCount: 0,
+          signal: new AbortController().signal,
+          data: { version: 2, logicalJobId: 'logical-job-id', generation: 0 },
+        },
+      ]),
+    ).rejects.toBe(interruption);
+    expect(logicalLedger.settleFailure).not.toHaveBeenCalled();
+    await overlayDriver.onModuleDestroy();
+  });
+
+  it('uses public transactional transport callbacks and a deterministic dead-letter queue', async () => {
+    const overlayDriver = new PgBossDriver(
+      { ...options, logicalLedgerEnabled: true },
+      metricsService,
+      twentyConfigService,
+    );
+    const ledgerOptions = jest
+      .mocked(PgBossLogicalLedger)
+      .mock.calls.at(-1)?.[0];
+    const db = { executeSql: jest.fn() };
+
+    if (!ledgerOptions) {
+      throw new Error('Expected logical ledger construction options');
+    }
+
+    await ledgerOptions.transport.send({
+      queueName,
+      envelope: { version: 2, logicalJobId: 'logical-job-id', generation: 0 },
+      physicalJobId: 'physical-job-id',
+      stallRecoveryLimit: 2,
+      priority: 3,
+      availableAt: new Date('2026-07-13T01:00:00.000Z'),
+      db,
+    });
+    await ledgerOptions.transport.complete({
+      queueName,
+      physicalJobId: 'physical-job-id',
+      db,
+    });
+
+    expect(boss.send).toHaveBeenCalledWith(
+      queueName,
+      { version: 2, logicalJobId: 'logical-job-id', generation: 0 },
+      {
+        id: 'physical-job-id',
+        retryLimit: 2,
+        priority: -3,
+        startAfter: new Date('2026-07-13T01:00:00.000Z'),
+        deadLetter: `${queueName}-logical-dead-letter`,
+        deleteAfterSeconds: 604_800,
+        db,
+      },
+    );
+    expect(boss.complete).toHaveBeenCalledWith(
+      queueName,
+      'physical-job-id',
+      undefined,
+      { db },
+    );
+    await overlayDriver.onModuleDestroy();
+  });
+
+  it('reconciles deterministic dead letters from public metadata', async () => {
+    const overlayDriver = new PgBossDriver(
+      { ...options, logicalLedgerEnabled: true },
+      metricsService,
+      twentyConfigService,
+    );
+
+    await overlayDriver.work(queueName, jest.fn());
+    expect(boss.createQueue).toHaveBeenCalledWith(
+      `${queueName}-logical-dead-letter`,
+      { retryLimit: 0 },
+    );
+    expect(boss.work).toHaveBeenNthCalledWith(
+      2,
+      `${queueName}-logical-dead-letter`,
+      { includeMetadata: true },
+      expect.any(Function),
+    );
+    const deadLetterHandler = boss.work.mock.calls[1][2] as (
+      jobs: Array<Record<string, unknown>>,
+    ) => Promise<void>;
+
+    await deadLetterHandler([
+      {
+        id: 'dead-letter-id',
+        sourceId: 'physical-job-id',
+        data: { version: 2, logicalJobId: 'logical-job-id', generation: 0 },
+      },
+    ]);
+
+    expect(logicalLedger.reconcileDeadLetter).toHaveBeenCalledWith({
+      queueName,
+      physicalJobId: 'physical-job-id',
+      envelope: { version: 2, logicalJobId: 'logical-job-id', generation: 0 },
+    });
+    await overlayDriver.onModuleDestroy();
+  });
+
+  it('rejects physical retry and delete operations in logical overlay mode', async () => {
+    const overlayDriver = new PgBossDriver(
+      { ...options, logicalLedgerEnabled: true },
+      metricsService,
+      twentyConfigService,
+    );
+
+    await expect(
+      overlayDriver.retryJob(queueName, 'logical-job-id'),
+    ).rejects.toThrow('retryJob is unsupported');
+    await expect(
+      overlayDriver.deleteJob(queueName, 'logical-job-id'),
+    ).rejects.toThrow('deleteJob is unsupported');
+    expect(boss.retry).not.toHaveBeenCalled();
+    expect(boss.deleteJob).not.toHaveBeenCalled();
+    await overlayDriver.onModuleDestroy();
   });
 
   it('maps concurrency and unwraps the envelope while forwarding abort signal', async () => {

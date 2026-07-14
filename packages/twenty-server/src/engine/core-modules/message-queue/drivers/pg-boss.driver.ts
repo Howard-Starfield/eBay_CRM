@@ -4,6 +4,8 @@ import {
   type OnModuleInit,
 } from '@nestjs/common';
 
+import { randomUUID } from 'node:crypto';
+
 import { Pool, type PoolClient } from 'pg';
 import {
   type Db as PgBossDatabase,
@@ -33,11 +35,15 @@ import { getJobKey } from 'src/engine/core-modules/message-queue/utils/get-job-k
 import { type MetricsService } from 'src/engine/core-modules/metrics/metrics.service';
 import { type TwentyConfigService } from 'src/engine/core-modules/twenty-config/twenty-config.service';
 
+import { PgBossLogicalLedger } from './pg-boss-logical-ledger';
+import { type LogicalPgBossEnvelope } from './pg-boss-logical-ledger.types';
+
 export type PgBossDriverOptions = {
   connectionString: string;
   schema: 'desktop_runtime';
   applicationName: string;
   intervalPollMs?: number;
+  logicalLedgerEnabled?: boolean;
 };
 
 type PgBossJobEnvelope<T extends MessageQueueJobData = MessageQueueJobData> = {
@@ -62,7 +68,10 @@ export class PgBossDriver
   private readonly boss: PgBoss;
   private readonly coordinationPool: Pool;
   private readonly intervalScheduler: PgBossIntervalScheduler;
+  private readonly logicalLedger?: PgBossLogicalLedger;
+  private readonly workerInstanceId = randomUUID();
   private readonly registeredQueues = new Set<MessageQueue>();
+  private readonly registeredDeadLetterWorkers = new Set<MessageQueue>();
   private readonly queueCreationPromises = new Map<
     MessageQueue,
     Promise<void>
@@ -94,6 +103,38 @@ export class PgBossDriver
       query_timeout: 1_000,
       statement_timeout: 1_000,
     });
+    if (options.logicalLedgerEnabled === true) {
+      this.logicalLedger = new PgBossLogicalLedger({
+        pool: this.coordinationPool,
+        schema: options.schema,
+        transport: {
+          send: async ({
+            queueName,
+            envelope,
+            physicalJobId,
+            stallRecoveryLimit,
+            priority,
+            availableAt,
+            db,
+          }) => {
+            await this.boss.send(queueName, envelope, {
+              id: physicalJobId,
+              retryLimit: stallRecoveryLimit,
+              priority: -priority,
+              startAfter: availableAt,
+              deadLetter: this.logicalDeadLetterQueue(queueName),
+              deleteAfterSeconds: QUEUE_RETENTION.failedMaxAge,
+              db,
+            });
+          },
+          complete: async ({ queueName, physicalJobId, db }) => {
+            await this.boss.complete(queueName, physicalJobId, undefined, {
+              db,
+            });
+          },
+        },
+      });
+    }
     this.intervalScheduler = new PgBossIntervalScheduler({
       pool: this.coordinationPool,
       schema: options.schema,
@@ -133,10 +174,11 @@ export class PgBossDriver
       this.startPromise = (async () => {
         await this.boss.start();
         this.started = true;
+        await this.logicalLedger?.initialize();
         await this.intervalScheduler.start();
         await Promise.all(
           [...this.registeredQueues].map((queueName) =>
-            this.ensureQueue(queueName),
+            this.ensureDriverQueues(queueName),
           ),
         );
         if (!this.destroying) {
@@ -198,6 +240,17 @@ export class PgBossDriver
   ): Promise<void> {
     await this.ensureStartedQueue(queueName);
 
+    if (this.logicalLedger) {
+      await this.logicalLedger.createJob({
+        queueName,
+        jobName,
+        data,
+        ...(options === undefined ? {} : { options }),
+      });
+
+      return;
+    }
+
     const envelope: PgBossJobEnvelope<T> = {
       version: 1,
       jobName,
@@ -238,6 +291,13 @@ export class PgBossDriver
   ): Promise<void> {
     await this.ensureStartedQueue(queueName);
     this.boundedShutdownDrain ||= options?.boundedShutdownDrain === true;
+
+    if (this.logicalLedger) {
+      await this.workWithLogicalLedger(queueName, handler, options);
+
+      return;
+    }
+
     const heartbeatSeconds =
       options?.lockDuration === undefined
         ? undefined
@@ -409,6 +469,9 @@ export class PgBossDriver
 
     try {
       await this.ensureStartedQueue(queueName);
+      if (this.logicalLedger) {
+        return await this.logicalLedger.getStats(queueName);
+      }
       await this.boss.getQueueStats(queueName, { force: true });
       const jobs = await this.boss.findJobs(queueName);
 
@@ -427,6 +490,9 @@ export class PgBossDriver
     states: MessageQueueJobState[],
   ): Promise<MessageQueueJobRecord[]> {
     await this.ensureStartedQueue(queueName);
+    if (this.logicalLedger) {
+      return this.logicalLedger.findJobs(queueName, states);
+    }
     const jobs = await this.boss.findJobs<PgBossJobEnvelope>(queueName);
 
     return jobs
@@ -435,11 +501,21 @@ export class PgBossDriver
   }
 
   async retryJob(queueName: MessageQueue, jobId: string): Promise<void> {
+    if (this.logicalLedger) {
+      throw new Error(
+        'retryJob is unsupported while the pg-boss logical ledger overlay is enabled',
+      );
+    }
     await this.ensureStartedQueue(queueName);
     await this.boss.retry(queueName, jobId);
   }
 
   async deleteJob(queueName: MessageQueue, jobId: string): Promise<void> {
+    if (this.logicalLedger) {
+      throw new Error(
+        'deleteJob is unsupported while the pg-boss logical ledger overlay is enabled',
+      );
+    }
     await this.ensureStartedQueue(queueName);
     await this.boss.deleteJob(queueName, jobId);
   }
@@ -447,7 +523,140 @@ export class PgBossDriver
   private async ensureStartedQueue(queueName: MessageQueue): Promise<void> {
     this.register(queueName);
     await this.onModuleInit();
+    await this.ensureDriverQueues(queueName);
+  }
+
+  private async workWithLogicalLedger<T extends MessageQueueJobData>(
+    queueName: MessageQueue,
+    handler: (job: MessageQueueJob<T>) => Promise<void> | void,
+    options: MessageQueueWorkerOptions = {},
+  ): Promise<void> {
+    if (!this.logicalLedger) {
+      throw new Error('logical ledger overlay is not enabled');
+    }
+
+    const policy = await this.logicalLedger.registerQueuePolicy(
+      queueName,
+      options,
+    );
+    if (policy.heartbeatSeconds !== undefined) {
+      await this.boss.updateQueue(queueName, {
+        heartbeatSeconds: policy.heartbeatSeconds,
+      });
+      await this.boss.supervise(queueName);
+    }
+
+    await this.boss.work<LogicalPgBossEnvelope>(
+      queueName,
+      {
+        includeMetadata: true,
+        ...(options.concurrency === undefined
+          ? {}
+          : { localConcurrency: options.concurrency }),
+        ...(policy.heartbeatSeconds === undefined
+          ? {}
+          : { heartbeatRefreshSeconds: policy.heartbeatSeconds / 2 }),
+      },
+      async ([job]) => {
+        if (!job) {
+          return;
+        }
+
+        const envelope = this.readLogicalEnvelope(job.data);
+        const start = await this.logicalLedger?.startAttempt({
+          queueName,
+          envelope,
+          physicalJobId: job.id,
+          transportRetryCount: job.retryCount,
+          workerInstanceId: this.workerInstanceId,
+        });
+
+        if (!start || start.kind !== 'execute') {
+          return;
+        }
+
+        const settlement = {
+          queueName,
+          physicalJobId: job.id,
+          logicalJobId: start.logicalJobId,
+          generation: envelope.generation,
+          executionToken: start.executionToken,
+        };
+
+        try {
+          await handler({
+            id: start.logicalJobId,
+            name: start.jobName,
+            data: start.data as T,
+            abortSignal: job.signal,
+          });
+        } catch (error) {
+          await this.logicalLedger?.settleFailure(settlement, error);
+
+          return;
+        }
+
+        await this.logicalLedger?.settleSuccess(settlement);
+      },
+    );
+
+    await this.registerLogicalDeadLetterWorker(queueName);
+  }
+
+  private async registerLogicalDeadLetterWorker(
+    queueName: MessageQueue,
+  ): Promise<void> {
+    if (
+      !this.logicalLedger ||
+      this.registeredDeadLetterWorkers.has(queueName)
+    ) {
+      return;
+    }
+
+    const deadLetterQueue = this.logicalDeadLetterQueue(queueName);
+
+    await this.boss.work<LogicalPgBossEnvelope>(
+      deadLetterQueue,
+      { includeMetadata: true },
+      async ([job]) => {
+        if (!job?.sourceId) {
+          return;
+        }
+
+        await this.logicalLedger?.reconcileDeadLetter({
+          queueName,
+          physicalJobId: job.sourceId,
+          envelope: this.readLogicalEnvelope(job.data),
+        });
+      },
+    );
+    this.registeredDeadLetterWorkers.add(queueName);
+  }
+
+  private readLogicalEnvelope(
+    value: LogicalPgBossEnvelope,
+  ): LogicalPgBossEnvelope {
+    if (
+      value.version !== 2 ||
+      typeof value.logicalJobId !== 'string' ||
+      !Number.isInteger(value.generation) ||
+      value.generation < 0
+    ) {
+      throw new Error('Unsupported pg-boss logical ledger envelope');
+    }
+
+    return value;
+  }
+
+  private logicalDeadLetterQueue(queueName: MessageQueue): MessageQueue {
+    return `${queueName}-logical-dead-letter` as MessageQueue;
+  }
+
+  private async ensureDriverQueues(queueName: MessageQueue): Promise<void> {
     await this.ensureQueue(queueName);
+    if (this.logicalLedger) {
+      await this.ensureQueue(this.logicalDeadLetterQueue(queueName));
+    }
   }
 
   private async sendWaitingJobOnce<T extends MessageQueueJobData>(
