@@ -563,7 +563,7 @@ export class PgBossDriver
           ? {}
           : { heartbeatRefreshSeconds: policy.heartbeatSeconds / 2 }),
       },
-      async ([job]) => {
+      async ([job]: PgBossJobWithMetadata<LogicalPgBossEnvelope>[]) => {
         if (!job) {
           return;
         }
@@ -624,7 +624,7 @@ export class PgBossDriver
     await this.boss.work<LogicalPgBossEnvelope>(
       deadLetterQueue,
       { includeMetadata: true },
-      async ([job]) => {
+      async ([job]: PgBossJobWithMetadata<LogicalPgBossEnvelope>[]) => {
         if (!job?.sourceId) {
           return;
         }

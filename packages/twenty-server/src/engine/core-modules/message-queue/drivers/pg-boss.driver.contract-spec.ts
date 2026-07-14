@@ -14,6 +14,7 @@ import {
 } from 'src/engine/core-modules/message-queue/drivers/testing/message-queue-driver-test-harness';
 import { type MetricsService } from 'src/engine/core-modules/metrics/metrics.service';
 import { type TwentyConfigService } from 'src/engine/core-modules/twenty-config/twenty-config.service';
+import { type MessageQueue } from 'src/engine/core-modules/message-queue/message-queue.constants';
 
 type PgBossDriverInternals = {
   boss: PgBoss;

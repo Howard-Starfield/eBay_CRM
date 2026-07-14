@@ -443,9 +443,9 @@ describe('PgBossDriver', () => {
       metricsService,
       twentyConfigService,
     );
-    const ledgerOptions = jest
-      .mocked(PgBossLogicalLedger)
-      .mock.calls.at(-1)?.[0];
+    const ledgerConstructorCalls = jest.mocked(PgBossLogicalLedger).mock.calls;
+    const ledgerOptions =
+      ledgerConstructorCalls[ledgerConstructorCalls.length - 1]?.[0];
     const db = { executeSql: jest.fn() };
 
     if (!ledgerOptions) {
