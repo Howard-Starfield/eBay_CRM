@@ -10,10 +10,12 @@ Final implementation evidence commit: `f038261e9782e72ed0f967f5fbe0e09c7ec16b2a`
 
 ADOPT_LOGICAL_LEDGER_OVERLAY_FOR_HARDENING
 
-All six approved semantic acceptance cases passed twice, the BullMQ compatibility
-contract passed once, the overlay uses only public pg-boss APIs, and none of the
-design's immediate rejection conditions occurred. This is an adoption decision
-for a hardening phase, not a production-readiness claim.
+All six approved semantic acceptance cases passed the required two-run adoption
+matrix at `0164ebc6`, then passed one covering run after each later correction
+at `48e87db7` and `f038261e`. The BullMQ compatibility contract passed once, the
+overlay uses only public pg-boss APIs, and none of the design's immediate
+rejection conditions occurred. This is an adoption decision for a hardening
+phase, not a production-readiness claim.
 
 The reviewed Phase 0 report and its direct-adapter rejection diagnostic remain
 unchanged. Their file hashes at the final Task 4 gate were:
@@ -52,12 +54,14 @@ pg-boss path and the BullMQ implementation remain unchanged.
 
 ## Six-case acceptance evidence
 
-Jest reported suite-level rather than per-test durations. Accordingly, each row
-records the exact duration of the encompassing approved six-case run; no
-per-case duration is inferred. Both commands executed only these six selected
-cases; 20 discovered cases were skipped in each run.
+The required two-run adoption matrix ran at implementation commit `0164ebc6`
+before the later cron-guard and metadata-typing corrections. Jest reported
+suite-level rather than per-test durations. Accordingly, each row records the
+exact duration of the encompassing approved six-case run; no per-case duration
+is inferred. Both matrix commands executed only these six selected cases; 20
+discovered cases were skipped in each run.
 
-| Acceptance case                                                                           | Final run 1                        | Final run 2                        |
+| Acceptance case                                                                           | Matrix run 1 at `0164ebc6`         | Matrix run 2 at `0164ebc6`         |
 | ----------------------------------------------------------------------------------------- | ---------------------------------- | ---------------------------------- |
 | Keeps stalled-recovery allowance independent from ordinary handler failures               | PASS; Jest 12.029 s, wall 12.989 s | PASS; Jest 11.864 s, wall 12.848 s |
 | Keeps crash recovery available when handler `retryLimit` is zero                          | PASS; Jest 12.029 s, wall 12.989 s | PASS; Jest 11.864 s, wall 12.848 s |
@@ -66,7 +70,13 @@ cases; 20 discovered cases were skipped in each run.
 | Fences a stale generation before handler invocation and settlement                        | PASS; Jest 12.029 s, wall 12.989 s | PASS; Jest 11.864 s, wall 12.848 s |
 | Recovers settlement interruption without losing the job or duplicating a terminal receipt | PASS; Jest 12.029 s, wall 12.989 s | PASS; Jest 11.864 s, wall 12.848 s |
 
-Run totals were 6 passed, 0 failed, and 20 skipped on each final run.
+Matrix totals were 6 passed, 0 failed, and 20 skipped in each run. The early
+overlay-only cron guard at `48e87db7` was then covered by one exact six-case run:
+6 passed, 0 failed, 20 skipped; Jest 12.158 seconds and wall 13.195 seconds. The
+public-metadata type correction at final implementation commit `f038261e` was
+covered by one further exact six-case run: 6 passed, 0 failed, 20 skipped; Jest
+13.985 seconds and wall 15.303 seconds. The report therefore does not represent
+the two-run matrix as having executed at final head.
 
 ## BullMQ compatibility
 
@@ -91,48 +101,59 @@ pg-boss internal API was used.
 
 ## Failures observed and fixes applied
 
-The following is the complete failure/fix ledger from the durable Task 1-3
-reports and the Task 4 gate:
+The following is the exhaustive failure/fix chronology recorded by the durable
+Task 1-3 reports and the Task 4 gate:
 
 1. Task 1 began with the ledger module absent, then exposed unimplemented
    identity, validation, creation, rollback, deduplication, and retry-limit
    behavior. The schema test also found nullable attempt outcomes. The ledger,
    validation, transactional creation, deduplication conversion, and non-null
    outcome constraint fixed those failures.
-2. Task 2 RED runs found all lifecycle methods absent and then found that a
+2. Task 1's direct full server typecheck exited 1 with thousands of unrelated
+   missing generated/internal-package resolution and cascade diagnostics. A
+   filtered repeat also found two Task 1 test uses of `Array.at()` incompatible
+   with the project target. Replacing both with compatible index access removed
+   all filtered `pg-boss-logical-ledger` diagnostics; the unrelated global
+   workspace failures remained, so Task 1 did not claim a passing full
+   typecheck.
+3. Task 2 RED runs found all lifecycle methods absent and then found that a
    zero-row attempt update incorrectly reported settlement. The lifecycle and
    row-count fencing checks fixed those failures.
-3. Important-review tests then found zero-row canonical starts accepted in both
+4. Important-review tests then found zero-row canonical starts accepted in both
    normal and stall-exhausted branches, success settlement lacked a canonical
    lock, and stale physical IDs could mutate receipts. Canonical row-count
    checks plus lock/order and physical-ID fencing fixed all four cases.
-4. Task 3 initially had five driver failures covering startup ordering, logical
+5. Task 3 initially had five driver failures covering startup ordering, logical
    creation routing, worker-policy materialization, logical handler identity,
    and handler-failure settlement. Wiring the opt-in overlay fixed them.
-5. A settlement-classification test found a rejected success settlement was
+6. A settlement-classification test found a rejected success settlement was
    caught and reclassified as handler failure. Narrowing the handler catch
    boundary made transport settlement interruption propagate for recovery.
-6. The first service teardown timed out because fake timers leaked into the
+7. The first service teardown timed out because fake timers leaked into the
    pg-boss shutdown path. Scoping the service gate to real timers fixed the
    harness; the rollback gate then passed in 1.350 seconds and the stale-fence
    plus settlement-recovery gates passed together in 1.884 seconds.
-7. Earlier forcibly killed diagnostic processes left three logical jobs, three
+8. Earlier forcibly killed diagnostic processes left three logical jobs, three
    policies, and five attempts. They were transactionally removed before the
    clean final service audit.
-8. Review found logical `addCron()` could create a version-1 envelope for a
+9. Review found logical `addCron()` could create a version-1 envelope for a
    version-2-only overlay worker. A RED test proved the path was reachable; an
    early overlay-only unsupported guard fixed it without changing direct mode.
-9. The first Task 4 full server typecheck exited 2 in 27.079 seconds. Unbuilt
-   workspace packages caused unrelated module-resolution failures, and five
-   filtered Task-file diagnostics remained: a missing `MessageQueue` type in
-   the contract spec, unsupported `Array.at()` in the driver spec, and three
-   pg-boss job-metadata type errors for `retryCount`/`sourceId`. Correction
-   commit `f038261e` imported the existing public `MessageQueue` and
-   `JobWithMetadata` types and replaced `.at(-1)` with target-compatible
-   indexing. Final independent type verification still exited 2 globally with
-   13 unrelated workspace diagnostics, but reported exactly zero diagnostics
-   in the three corrected Task files.
-10. Two initial read-only cleanup-audit probes used incompatible ESM import
+10. The first Task 4 full server typecheck exited 2 in 27.079 seconds. Unbuilt
+    workspace packages caused unrelated module-resolution failures, and five
+    filtered Task-file diagnostics remained: a missing `MessageQueue` type in
+    the contract spec, unsupported `Array.at()` in the driver spec, and three
+    pg-boss job-metadata type errors for `retryCount`/`sourceId`. Correction
+    commit `f038261e` imported the existing public `MessageQueue` and
+    `JobWithMetadata` types and replaced `.at(-1)` with target-compatible
+    indexing. The Task 3 correction report's immediate repeat still exited 2
+    globally with 15 unrelated unbuilt-workspace diagnostics, but reported zero
+    diagnostics in the three corrected Task files. A later independent Task 4
+    verification observed global exit 2 with 13 unrelated workspace diagnostics
+    and again exactly zero Task-file diagnostics. Neither global run was reported
+    as passing; the differing unrelated counts reflect the observed workspace
+    state at each run.
+11. Two initial read-only cleanup-audit probes used incompatible ESM import
     forms for CommonJS `pg` and the installed `pg-boss` export shape. A CommonJS
     probe using the same public `getQueues()` API corrected the audit tooling;
     no product or database state was changed by either failed probe.
