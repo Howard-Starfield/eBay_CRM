@@ -441,6 +441,108 @@ describe('PgBossLogicalLedger', () => {
     );
   });
 
+  it('fences a start when the active canonical transition affects zero rows', async () => {
+    await ledger.initialize();
+    (client.query as jest.Mock).mockClear();
+    (client.query as jest.Mock).mockImplementation(
+      async (query: string | QueryConfig) => {
+        const text = typeof query === 'string' ? query : query.text;
+
+        if (text.includes('FROM desktop_runtime.queue_job')) {
+          return {
+            rows: [
+              {
+                id: logicalId,
+                generation: 0,
+                current_physical_job_id: physicalJobId,
+                status: 'queued',
+                stall_count: 0,
+                stall_recovery_limit: 2,
+                transport_retry_count: 0,
+                job_name: 'reply-to-buyer',
+                payload: { orderId: 'order-1' },
+              },
+            ],
+          };
+        }
+        if (text.includes('UPDATE desktop_runtime.queue_job')) {
+          return { rows: [], rowCount: 0 };
+        }
+
+        return { rows: [] };
+      },
+    );
+
+    await expect(
+      ledger.startAttempt({
+        queueName,
+        physicalJobId,
+        envelope: { version: 2, logicalJobId: logicalId, generation: 0 },
+        transportRetryCount: 0,
+        workerInstanceId,
+      }),
+    ).resolves.toEqual({ kind: 'fenced' });
+
+    expect(client.query).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining(
+          'INSERT INTO desktop_runtime.queue_job_attempt',
+        ),
+      }),
+    );
+    expect(transport.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it('fences stall exhaustion when the canonical transition affects zero rows', async () => {
+    await ledger.initialize();
+    (client.query as jest.Mock).mockClear();
+    (client.query as jest.Mock).mockImplementation(
+      async (query: string | QueryConfig) => {
+        const text = typeof query === 'string' ? query : query.text;
+
+        if (text.includes('FROM desktop_runtime.queue_job')) {
+          return {
+            rows: [
+              {
+                id: logicalId,
+                generation: 0,
+                current_physical_job_id: physicalJobId,
+                status: 'active',
+                stall_count: 0,
+                stall_recovery_limit: 0,
+                transport_retry_count: 0,
+              },
+            ],
+          };
+        }
+        if (text.includes('UPDATE desktop_runtime.queue_job')) {
+          return { rows: [], rowCount: 0 };
+        }
+
+        return { rows: [] };
+      },
+    );
+
+    await expect(
+      ledger.startAttempt({
+        queueName,
+        physicalJobId,
+        envelope: { version: 2, logicalJobId: logicalId, generation: 0 },
+        transportRetryCount: 1,
+        workerInstanceId,
+      }),
+    ).resolves.toEqual({ kind: 'fenced' });
+
+    expect(client.query).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining(
+          'INSERT INTO desktop_runtime.queue_job_attempt',
+        ),
+      }),
+    );
+    expect(transport.complete).toHaveBeenCalledTimes(1);
+  });
+
   it('settles logical success and physical completion in one transaction', async () => {
     await ledger.initialize();
     (client.query as jest.Mock).mockClear();
@@ -448,6 +550,23 @@ describe('PgBossLogicalLedger', () => {
     (client.query as jest.Mock).mockImplementation(
       async (query: string | QueryConfig) => {
         const text = typeof query === 'string' ? query : query.text;
+
+        if (
+          text.includes('FROM desktop_runtime.queue_job') &&
+          text.includes('FOR UPDATE')
+        ) {
+          return {
+            rows: [
+              {
+                id: logicalId,
+                generation: 0,
+                current_physical_job_id: physicalJobId,
+                current_execution_token: executionToken,
+                status: 'active',
+              },
+            ],
+          };
+        }
 
         if (
           text.includes('UPDATE desktop_runtime.queue_job') &&
@@ -480,7 +599,7 @@ describe('PgBossLogicalLedger', () => {
     expect(client.query).toHaveBeenCalledWith(
       expect.objectContaining({
         text: expect.stringContaining("status = 'completed'"),
-        values: [logicalId, 0, executionToken],
+        values: [logicalId, 0, executionToken, physicalJobId],
       }),
     );
     expect(client.query).toHaveBeenCalledWith(
@@ -497,6 +616,115 @@ describe('PgBossLogicalLedger', () => {
       }),
     );
     expect(client.query).toHaveBeenLastCalledWith('COMMIT');
+  });
+
+  it('locks and fences the canonical job before mutating a success attempt', async () => {
+    await ledger.initialize();
+    (client.query as jest.Mock).mockClear();
+    const executionToken = 'ce3c741c-62b3-46d1-9f47-d313e27a8560';
+    (client.query as jest.Mock).mockImplementation(
+      async (query: string | QueryConfig) => {
+        const text = typeof query === 'string' ? query : query.text;
+
+        if (
+          text.includes('FROM desktop_runtime.queue_job') &&
+          text.includes('FOR UPDATE')
+        ) {
+          return {
+            rows: [
+              {
+                id: logicalId,
+                generation: 0,
+                current_physical_job_id: physicalJobId,
+                current_execution_token: executionToken,
+                status: 'active',
+              },
+            ],
+          };
+        }
+
+        if (text.includes('UPDATE desktop_runtime.queue_job_attempt')) {
+          return { rows: [{ id: 'attempt-id' }] };
+        }
+        if (
+          text.includes('UPDATE desktop_runtime.queue_job') &&
+          !text.includes('UPDATE desktop_runtime.queue_job_attempt')
+        ) {
+          return { rows: [{ id: logicalId }] };
+        }
+
+        return { rows: [] };
+      },
+    );
+
+    await ledger.settleSuccess({
+      queueName,
+      logicalJobId: logicalId,
+      generation: 0,
+      physicalJobId,
+      executionToken,
+    });
+
+    const sqlCalls = (client.query as jest.Mock).mock.calls.map(([query]) =>
+      typeof query === 'string' ? query : query.text,
+    );
+    const lockIndex = sqlCalls.findIndex(
+      (text) =>
+        text.includes('FROM desktop_runtime.queue_job') &&
+        text.includes('FOR UPDATE'),
+    );
+    const attemptIndex = sqlCalls.findIndex((text) =>
+      text.includes('UPDATE desktop_runtime.queue_job_attempt'),
+    );
+
+    expect(lockIndex).toBeGreaterThan(-1);
+    expect(lockIndex).toBeLessThan(attemptIndex);
+  });
+
+  it('fences success settlement when the physical job id is stale', async () => {
+    await ledger.initialize();
+    (client.query as jest.Mock).mockClear();
+    const executionToken = 'ce3c741c-62b3-46d1-9f47-d313e27a8560';
+    (client.query as jest.Mock).mockImplementation(
+      async (query: string | QueryConfig) => {
+        const text = typeof query === 'string' ? query : query.text;
+
+        if (text.includes('FROM desktop_runtime.queue_job')) {
+          return {
+            rows: [
+              {
+                id: logicalId,
+                generation: 0,
+                current_physical_job_id: physicalJobId,
+                current_execution_token: executionToken,
+                status: 'active',
+              },
+            ],
+          };
+        }
+
+        return { rows: [] };
+      },
+    );
+
+    await expect(
+      ledger.settleSuccess({
+        queueName,
+        logicalJobId: logicalId,
+        generation: 0,
+        physicalJobId: stalePhysicalId,
+        executionToken,
+      }),
+    ).resolves.toBe('fenced');
+
+    expect(client.query).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining(
+          'UPDATE desktop_runtime.queue_job_attempt',
+        ),
+      }),
+    );
+    expect(transport.complete).not.toHaveBeenCalled();
   });
 
   it('creates the next generation without consuming stall allowance', async () => {
@@ -587,6 +815,23 @@ describe('PgBossLogicalLedger', () => {
         const text = typeof query === 'string' ? query : query.text;
 
         if (
+          text.includes('FROM desktop_runtime.queue_job') &&
+          text.includes('FOR UPDATE')
+        ) {
+          return {
+            rows: [
+              {
+                id: logicalId,
+                generation: 0,
+                current_physical_job_id: physicalJobId,
+                current_execution_token: executionToken,
+                status: 'active',
+              },
+            ],
+          };
+        }
+
+        if (
           text.includes('UPDATE desktop_runtime.queue_job') &&
           !text.includes('UPDATE desktop_runtime.queue_job_attempt') &&
           text.includes("status = 'completed'")
@@ -644,6 +889,24 @@ describe('PgBossLogicalLedger', () => {
           }
 
           const current = transaction ?? committed;
+
+          if (
+            text.includes('FROM desktop_runtime.queue_job') &&
+            text.includes('FOR UPDATE')
+          ) {
+            return {
+              rows: [
+                {
+                  id: logicalId,
+                  generation: 0,
+                  current_physical_job_id: physicalJobId,
+                  current_execution_token:
+                    'ce3c741c-62b3-46d1-9f47-d313e27a8560',
+                  status: current.logicalStatus,
+                },
+              ],
+            };
+          }
 
           if (
             text.includes('UPDATE desktop_runtime.queue_job') &&

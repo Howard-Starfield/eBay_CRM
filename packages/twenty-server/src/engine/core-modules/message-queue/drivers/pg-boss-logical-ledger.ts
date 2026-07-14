@@ -258,7 +258,7 @@ export class PgBossLogicalLedger {
       const executionToken = v4();
 
       if (stallCount > job.stall_recovery_limit) {
-        await client.query({
+        const transitioned = await client.query({
           text: `
             UPDATE ${this.options.schema}.queue_job
             SET status = 'failed',
@@ -281,6 +281,14 @@ export class PgBossLogicalLedger {
             args.physicalJobId,
           ],
         });
+
+        if (transitioned.rowCount === 0) {
+          await this.completeFencedEnvelopeWithClient(client, args);
+          await client.query('COMMIT');
+
+          return { kind: 'fenced' };
+        }
+
         await client.query({
           text: `
             INSERT INTO ${this.options.schema}.queue_job_attempt (
@@ -325,7 +333,7 @@ export class PgBossLogicalLedger {
         throw new Error(`logical queue job ${job.id} has no handler payload`);
       }
 
-      await client.query({
+      const transitioned = await client.query({
         text: `
           UPDATE ${this.options.schema}.queue_job
           SET status = 'active',
@@ -349,6 +357,14 @@ export class PgBossLogicalLedger {
           args.physicalJobId,
         ],
       });
+
+      if (transitioned.rowCount === 0) {
+        await this.completeFencedEnvelopeWithClient(client, args);
+        await client.query('COMMIT');
+
+        return { kind: 'fenced' };
+      }
+
       await client.query({
         text: `
           INSERT INTO ${this.options.schema}.queue_job_attempt (
@@ -409,6 +425,40 @@ export class PgBossLogicalLedger {
 
     try {
       await client.query('BEGIN');
+      const locked = await client.query<
+        Pick<
+          SettlementQueueJob,
+          | 'id'
+          | 'generation'
+          | 'current_physical_job_id'
+          | 'current_execution_token'
+          | 'status'
+        >
+      >({
+        text: `
+          SELECT id, generation, current_physical_job_id,
+            current_execution_token, status
+          FROM ${this.options.schema}.queue_job
+          WHERE id = $1
+          FOR UPDATE
+        `,
+        values: [args.logicalJobId],
+      });
+      const job = locked.rows[0];
+
+      if (
+        !job ||
+        job.id !== args.logicalJobId ||
+        job.generation !== args.generation ||
+        job.current_physical_job_id !== args.physicalJobId ||
+        job.current_execution_token !== args.executionToken ||
+        job.status !== 'active'
+      ) {
+        await client.query('COMMIT');
+
+        return 'fenced';
+      }
+
       const attempt = await client.query<{ id: string }>({
         text: `
           UPDATE ${this.options.schema}.queue_job_attempt
@@ -423,10 +473,16 @@ export class PgBossLogicalLedger {
                 AND generation = $2
                 AND current_execution_token = $3
                 AND status = 'active'
+                AND current_physical_job_id = $4
             )
           RETURNING id
         `,
-        values: [args.logicalJobId, args.generation, args.executionToken],
+        values: [
+          args.logicalJobId,
+          args.generation,
+          args.executionToken,
+          args.physicalJobId,
+        ],
       });
 
       if (!attempt.rows[0]) {
@@ -448,9 +504,15 @@ export class PgBossLogicalLedger {
             AND generation = $2
             AND current_execution_token = $3
             AND status = 'active'
+            AND current_physical_job_id = $4
           RETURNING id
         `,
-        values: [args.logicalJobId, args.generation, args.executionToken],
+        values: [
+          args.logicalJobId,
+          args.generation,
+          args.executionToken,
+          args.physicalJobId,
+        ],
       });
 
       if (!settled.rows[0]) {
