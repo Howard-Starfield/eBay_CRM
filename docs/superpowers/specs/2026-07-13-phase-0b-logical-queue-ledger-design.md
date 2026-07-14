@@ -71,7 +71,30 @@ IDs are never exposed as canonical IDs and document the exact follow-on work.
 
 ## Canonical data model
 
-Phase 0B owns two tables in schema `desktop_runtime`.
+Phase 0B owns three tables in schema `desktop_runtime`.
+
+### `queue_policy`
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `queue_name` | `text primary key` | Neutral queue name |
+| `stall_recovery_limit` | `integer not null` | Materialized worker crash-recovery policy |
+| `heartbeat_seconds` | `integer` | Explicit pg-boss heartbeat policy |
+| `worker_ready_at` | `timestamptz not null` | Last successful worker policy registration |
+| `updated_at` | `timestamptz not null` | Last policy update |
+
+The default stall recovery limit is explicitly stored as one. `work()` upserts
+the queue policy before accepting jobs. The local desktop launcher waits for
+worker readiness before the server accepts enqueue traffic. `add()` reads the
+persisted policy in its creation transaction and assigns that stall limit to
+both the logical job and its physical envelope. This is required because the
+producer and worker are separate processes and cannot share an in-memory
+options map.
+
+If an explicit worker policy has not been registered, local mode uses the
+materialized default of one. A future hosted overlay would require a stronger
+deployment-wide policy registration protocol; hosted mode remains BullMQ in
+this design.
 
 ### `queue_job`
 
@@ -279,4 +302,3 @@ schedules, cancellation, retention, repair commands, Windows sleep/resume,
 backup restoration safety, schema migrations, and crash-boundary soak tests.
 
 Only after queue hardening may the project move to the next Redis surface.
-
