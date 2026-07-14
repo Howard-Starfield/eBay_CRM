@@ -645,6 +645,30 @@ describe('PgBossDriver', () => {
     );
   });
 
+  it('rejects cron before physical scheduling in logical overlay mode', async () => {
+    const overlayDriver = new PgBossDriver(
+      { ...options, logicalLedgerEnabled: true },
+      metricsService,
+      twentyConfigService,
+    );
+
+    await expect(
+      overlayDriver.addCron({
+        queueName,
+        jobName: 'logical-cron',
+        data: {},
+        options: { repeat: { pattern: '*/1 * * * * *' } },
+      }),
+    ).rejects.toThrow(
+      'addCron is unsupported while the pg-boss logical ledger overlay is enabled because logical cron is not implemented',
+    );
+    expect(boss.schedule).not.toHaveBeenCalled();
+    expect(boss.unschedule).not.toHaveBeenCalled();
+    expect(boss.send).not.toHaveBeenCalled();
+    expect(pool.query).not.toHaveBeenCalled();
+    await overlayDriver.onModuleDestroy();
+  });
+
   it('persists interval schedules and rejects ambiguous repeat definitions', async () => {
     await driver.addCron({
       queueName,

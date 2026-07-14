@@ -358,6 +358,12 @@ export class PgBossDriver
     options: QueueCronJobOptions;
     jobId?: string;
   }): Promise<void> {
+    if (this.logicalLedger) {
+      throw new Error(
+        'addCron is unsupported while the pg-boss logical ledger overlay is enabled because logical cron is not implemented',
+      );
+    }
+
     const { every, pattern, limit } = options.repeat;
 
     if ((every === undefined) === (pattern === undefined)) {
