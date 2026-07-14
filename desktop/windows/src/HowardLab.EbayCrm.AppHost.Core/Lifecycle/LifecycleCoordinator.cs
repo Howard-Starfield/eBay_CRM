@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using HowardLab.EbayCrm.AppHost.Core.Time;
 using HowardLab.EbayCrm.AppHost.Protocol.Control;
 
@@ -8,9 +9,10 @@ public sealed class LifecycleCoordinator
     private readonly IClock _clock;
     private readonly RestartBudget _restartBudget;
     private readonly SemaphoreSlim _transitionGate = new(1, 1);
-    private readonly Dictionary<RuntimeRole, ProcessGeneration> _generations = [];
+    private readonly ConcurrentDictionary<RuntimeRole, ProcessGeneration> _generations = [];
     private readonly HashSet<RuntimeRole> _ownedRoles = [];
     private readonly HashSet<FailureKey> _failures = [];
+    private readonly HashSet<ProcessGeneration> _requestedExits = [];
     private Guid _currentOperationId;
     private bool _stopAccepted;
     private bool _faultEmitted;
@@ -64,9 +66,9 @@ public sealed class LifecycleCoordinator
             RoleStarted value => RoleStartedTransition(previous, value.Value),
             RoleReady value => RoleReadyTransition(previous, value.Value),
             MigrationCompleted value => StartRoleAfterOperation(previous, value.OperationId, RuntimeState.Migrating, RuntimeRole.Server, RuntimeState.StartingServer, LifecycleCommandType.StartServer, LifecycleDeadlineKey.ServerStart),
-            RoleExited value => Recover(previous, value.Value),
-            HealthFailed value => Recover(previous, value.Value),
-            ControlDisconnected value => Recover(previous, value.Value),
+            RoleExited value => Recover(previous, value.Value, requestedExitEligible: true),
+            HealthFailed value => Recover(previous, value.Value, requestedExitEligible: false),
+            ControlDisconnected value => Recover(previous, value.Value, requestedExitEligible: false),
             OperationTimedOut value => Timeout(previous, value),
             Reconciled value => Reconcile(previous, value),
             ShutdownCompleted value => ShutdownCompletedTransition(previous, value),
@@ -111,12 +113,14 @@ public sealed class LifecycleCoordinator
         {
             var worker = _generations[RuntimeRole.Worker];
             commands.Add(Command(LifecycleCommandType.DrainWorker, worker, @event.OperationId, LifecycleDeadlineKey.WorkerDrain));
+            _requestedExits.Add(worker);
             commands.Add(Command(LifecycleCommandType.StopWorker, worker, @event.OperationId, LifecycleDeadlineKey.WorkerStop));
         }
 
         if (_ownedRoles.Contains(RuntimeRole.Server))
         {
             var server = _generations[RuntimeRole.Server];
+            _requestedExits.Add(server);
             commands.Add(Command(LifecycleCommandType.StopServer, server, @event.OperationId, LifecycleDeadlineKey.ServerStop));
         }
 
@@ -242,8 +246,16 @@ public sealed class LifecycleCoordinator
         return Ignored(previous, "UnexpectedEvent");
     }
 
-    private TransitionResult Recover(RuntimeState previous, ProcessGeneration generation)
+    private TransitionResult Recover(
+        RuntimeState previous,
+        ProcessGeneration generation,
+        bool requestedExitEligible)
     {
+        if (requestedExitEligible && _requestedExits.Contains(generation))
+        {
+            return Ignored(previous, "RequestedExit");
+        }
+
         if (_stopAccepted || State is RuntimeState.Stopping or RuntimeState.Stopped or RuntimeState.Faulted)
         {
             return Ignored(previous, _stopAccepted ? "StopAlreadyAccepted" : "RecoveryNotAllowed");
@@ -284,30 +296,42 @@ public sealed class LifecycleCoordinator
     private TransitionResult RecoverServer(RuntimeState previous)
     {
         var operationId = Guid.NewGuid();
-        var previousWorker = _generations[RuntimeRole.Worker];
         _currentOperationId = operationId;
         var server = CreateGeneration(RuntimeRole.Server, operationId);
-        var worker = CreateGeneration(RuntimeRole.Worker, operationId);
-        State = RuntimeState.WaitingForWorker;
-        return Accepted(
-            previous,
-            Command(LifecycleCommandType.StopWorker, previousWorker, operationId, LifecycleDeadlineKey.WorkerStop),
-            Command(LifecycleCommandType.StartServer, server, operationId, LifecycleDeadlineKey.ServerStart),
-            Command(LifecycleCommandType.WaitForServer, server, operationId, LifecycleDeadlineKey.ServerReadiness),
-            Command(LifecycleCommandType.StartWorker, worker, operationId, LifecycleDeadlineKey.WorkerStart),
-            Command(LifecycleCommandType.WaitForWorker, worker, operationId, LifecycleDeadlineKey.WorkerReadiness));
+        var commands = new List<LifecycleCommand>();
+        if (_ownedRoles.Contains(RuntimeRole.Worker)
+            && _generations.TryGetValue(RuntimeRole.Worker, out var previousWorker))
+        {
+            _requestedExits.Add(previousWorker);
+            commands.Add(Command(LifecycleCommandType.StopWorker, previousWorker, operationId, LifecycleDeadlineKey.WorkerStop));
+        }
+
+        commands.Add(Command(LifecycleCommandType.StartServer, server, operationId, LifecycleDeadlineKey.ServerStart));
+        commands.Add(Command(LifecycleCommandType.WaitForServer, server, operationId, LifecycleDeadlineKey.ServerReadiness));
+        State = RuntimeState.WaitingForServer;
+        return Result(previous, commands, false, "Accepted");
     }
 
     private TransitionResult RecoverDatabase(RuntimeState previous, ProcessGeneration generation)
     {
-        var worker = _generations[RuntimeRole.Worker];
-        var server = _generations[RuntimeRole.Server];
+        var commands = new List<LifecycleCommand>();
+        if (_ownedRoles.Contains(RuntimeRole.Worker)
+            && _generations.TryGetValue(RuntimeRole.Worker, out var worker))
+        {
+            _requestedExits.Add(worker);
+            commands.Add(Command(LifecycleCommandType.StopWorker, worker, generation.OperationId, LifecycleDeadlineKey.WorkerStop));
+        }
+
+        if (_ownedRoles.Contains(RuntimeRole.Server)
+            && _generations.TryGetValue(RuntimeRole.Server, out var server))
+        {
+            _requestedExits.Add(server);
+            commands.Add(Command(LifecycleCommandType.StopServer, server, generation.OperationId, LifecycleDeadlineKey.ServerStop));
+        }
+
+        commands.Add(Command(LifecycleCommandType.ReconcileDatabaseStart, generation, generation.OperationId, LifecycleDeadlineKey.DatabaseReconciliation));
         State = RuntimeState.ReconcilingDatabaseStart;
-        return Accepted(
-            previous,
-            Command(LifecycleCommandType.StopWorker, worker, generation.OperationId, LifecycleDeadlineKey.WorkerStop),
-            Command(LifecycleCommandType.StopServer, server, generation.OperationId, LifecycleDeadlineKey.ServerStop),
-            Command(LifecycleCommandType.ReconcileDatabaseStart, generation, generation.OperationId, LifecycleDeadlineKey.DatabaseReconciliation));
+        return Result(previous, commands, false, "Accepted");
     }
 
     private TransitionResult Timeout(RuntimeState previous, OperationTimedOut @event)

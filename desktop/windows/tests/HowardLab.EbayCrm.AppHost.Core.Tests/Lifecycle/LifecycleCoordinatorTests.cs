@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
 using HowardLab.EbayCrm.AppHost.Protocol.Control;
 
@@ -83,13 +84,53 @@ public sealed class LifecycleCoordinatorTests
         var server = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
         var worker = harness.Coordinator.CurrentGeneration(RuntimeRole.Worker);
 
-        var results = await Task.WhenAll(
-            harness.Coordinator.DispatchAsync(new RoleExited(server, 1)).AsTask(),
-            harness.Coordinator.DispatchAsync(new HealthFailed(server, "probe-failed")).AsTask(),
-            harness.Coordinator.DispatchAsync(new ControlDisconnected(server)).AsTask());
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var readyCount = 0;
+        var events = new LifecycleEvent[]
+        {
+            new RoleExited(server, 1),
+            new HealthFailed(server, "probe-failed"),
+            new ControlDisconnected(server),
+        };
+        var dispatches = events.Select(@event => Task.Run(async () =>
+        {
+            if (Interlocked.Increment(ref readyCount) == events.Length)
+            {
+                allReady.SetResult();
+            }
 
-        var commands = results.SelectMany(result => result.Commands).ToArray();
-        Assert.Equal(1, commands.Count(command => command.Type == LifecycleCommandType.StopWorker));
+            await release.Task;
+            return await harness.Coordinator.DispatchAsync(@event);
+        })).ToArray();
+        await allReady.Task;
+        release.SetResult();
+        var results = await Task.WhenAll(dispatches);
+
+        var recovery = Assert.Single(results, result => result.Commands.Count > 0);
+        Assert.Equal(
+            new[]
+            {
+                LifecycleCommandType.StopWorker,
+                LifecycleCommandType.StartServer,
+                LifecycleCommandType.WaitForServer,
+            },
+            recovery.Commands.Select(command => command.Type));
+        Assert.Equal(2, results.Count(result => result.Ignored));
+        Assert.Equal(RuntimeState.WaitingForServer, harness.Coordinator.State);
+        Assert.Equal(worker, recovery.Commands[0].Generation);
+        Assert.Equal(recovery.Commands[1].Generation, recovery.Commands[2].Generation);
+
+        var replacementServer = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
+        var serverReady = await harness.Coordinator.DispatchAsync(new RoleReady(replacementServer));
+        Assert.Equal(RuntimeState.StartingWorker, serverReady.Current);
+        Assert.Equal(LifecycleCommandType.StartWorker, Assert.Single(serverReady.Commands).Type);
+        var replacementWorker = harness.Coordinator.CurrentGeneration(RuntimeRole.Worker);
+        var workerStarted = await harness.Coordinator.DispatchAsync(new RoleStarted(replacementWorker));
+        var workerReady = await harness.Coordinator.DispatchAsync(new RoleReady(replacementWorker));
+
+        Assert.Equal(LifecycleCommandType.WaitForWorker, Assert.Single(workerStarted.Commands).Type);
+        Assert.Equal(RuntimeState.Ready, workerReady.Current);
         Assert.Equal(
             new[]
             {
@@ -99,11 +140,167 @@ public sealed class LifecycleCoordinatorTests
                 LifecycleCommandType.StartWorker,
                 LifecycleCommandType.WaitForWorker,
             },
-            commands.Select(command => command.Type));
-        Assert.Equal(2, results.Count(result => result.Ignored));
-        Assert.Equal(worker, commands[0].Generation);
-        Assert.Equal(commands[1].Generation, commands[2].Generation);
-        Assert.Equal(commands[3].Generation, commands[4].Generation);
+            recovery.Commands.Concat(serverReady.Commands).Concat(workerStarted.Commands).Select(command => command.Type));
+    }
+
+    [Fact]
+    public async Task ServerFailureBeforeWorkerExistsRecoversWithoutThrowing()
+    {
+        var harness = CoordinatorHarness.Create();
+        var operationId = Guid.Parse("81000000-0000-0000-0000-000000000001");
+        await harness.AdvanceToServerStartAsync(operationId);
+        var server = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
+
+        var result = await harness.Coordinator.DispatchAsync(new RoleExited(server, 1));
+
+        Assert.Equal(RuntimeState.WaitingForServer, result.Current);
+        Assert.Equal(
+            new[] { LifecycleCommandType.StartServer, LifecycleCommandType.WaitForServer },
+            result.Commands.Select(command => command.Type));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DatabaseFailureBeforeAppTierExistsReconcilesWithoutThrowing(bool databaseStarted)
+    {
+        var harness = CoordinatorHarness.Create();
+        var operationId = Guid.Parse("82000000-0000-0000-0000-000000000002");
+        await harness.AdvanceToDatabaseStartAsync(operationId);
+        var database = harness.Coordinator.CurrentGeneration(RuntimeRole.Database);
+        if (databaseStarted)
+        {
+            await harness.Coordinator.DispatchAsync(new RoleStarted(database));
+        }
+
+        var result = await harness.Coordinator.DispatchAsync(new RoleExited(database, 1));
+
+        Assert.Equal(RuntimeState.ReconcilingDatabaseStart, result.Current);
+        Assert.Equal(LifecycleCommandType.ReconcileDatabaseStart, Assert.Single(result.Commands).Type);
+        Assert.Equal(database, result.Commands[0].Generation);
+    }
+
+    [Fact]
+    public async Task RequestedAppTierExitsDuringDatabaseReconciliationDoNotRestartOrConsumeBudget()
+    {
+        var harness = await CoordinatorHarness.ReadyAsync(maxRetries: 1);
+        var database = harness.Coordinator.CurrentGeneration(RuntimeRole.Database);
+        var worker = harness.Coordinator.CurrentGeneration(RuntimeRole.Worker);
+        var server = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
+        await harness.Coordinator.DispatchAsync(new RoleExited(database, 1));
+
+        var workerExit = await harness.Coordinator.DispatchAsync(new RoleExited(worker, 0));
+        var serverExit = await harness.Coordinator.DispatchAsync(new RoleExited(server, 0));
+
+        Assert.True(workerExit.Ignored);
+        Assert.True(serverExit.Ignored);
+        Assert.Equal("RequestedExit", workerExit.ReasonCode);
+        Assert.Equal("RequestedExit", serverExit.ReasonCode);
+        Assert.Empty(workerExit.Commands);
+        Assert.Empty(serverExit.Commands);
+        Assert.Equal(RuntimeState.ReconcilingDatabaseStart, harness.Coordinator.State);
+        Assert.Equal(RestartBudgetResult.Allowed, harness.Budget.TryConsume(RuntimeRole.Worker, harness.Clock.UtcNow));
+        Assert.Equal(RestartBudgetResult.Allowed, harness.Budget.TryConsume(RuntimeRole.Server, harness.Clock.UtcNow));
+    }
+
+    [Fact]
+    public async Task WorkerExitRequestedByServerRecoveryDoesNotRestartOrConsumeBudget()
+    {
+        var harness = await CoordinatorHarness.ReadyAsync(maxRetries: 1);
+        var worker = harness.Coordinator.CurrentGeneration(RuntimeRole.Worker);
+        var server = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
+        await harness.Coordinator.DispatchAsync(new RoleExited(server, 1));
+
+        var workerExit = await harness.Coordinator.DispatchAsync(new RoleExited(worker, 0));
+
+        Assert.True(workerExit.Ignored);
+        Assert.Equal("RequestedExit", workerExit.ReasonCode);
+        Assert.Empty(workerExit.Commands);
+        Assert.Equal(RuntimeState.WaitingForServer, harness.Coordinator.State);
+        Assert.Equal(RestartBudgetResult.Allowed, harness.Budget.TryConsume(RuntimeRole.Worker, harness.Clock.UtcNow));
+    }
+
+    [Fact]
+    public async Task StableServerReadinessResetsItsExhaustedRetryWindow()
+    {
+        var harness = await CoordinatorHarness.ReadyAsync(maxRetries: 1);
+        var server = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
+        await harness.Coordinator.DispatchAsync(new RoleExited(server, 1));
+        var replacementServer = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
+        var serverReady = await harness.Coordinator.DispatchAsync(new RoleReady(replacementServer));
+        var replacementWorker = harness.Coordinator.CurrentGeneration(RuntimeRole.Worker);
+        await harness.Coordinator.DispatchAsync(new RoleStarted(replacementWorker));
+        await harness.Coordinator.DispatchAsync(new RoleReady(replacementWorker));
+        Assert.Equal(LifecycleCommandType.StartWorker, Assert.Single(serverReady.Commands).Type);
+        Assert.Equal(RuntimeState.Ready, harness.Coordinator.State);
+
+        harness.Clock.Advance(TimeSpan.FromMinutes(5));
+        var retryAfterStablePeriod = await harness.Coordinator.DispatchAsync(new RoleExited(replacementServer, 1));
+
+        Assert.NotEqual(RuntimeState.Faulted, retryAfterStablePeriod.Current);
+        Assert.Equal(
+            new[]
+            {
+                LifecycleCommandType.StopWorker,
+                LifecycleCommandType.StartServer,
+                LifecycleCommandType.WaitForServer,
+            },
+            retryAfterStablePeriod.Commands.Select(command => command.Type));
+    }
+
+    [Fact]
+    public async Task CurrentGenerationReadsRemainConsistentWhileWorkerGenerationAdvances()
+    {
+        const int generationAdvances = 20_000;
+        var harness = await CoordinatorHarness.ReadyAsync(maxRetries: generationAdvances + 1);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var observations = new ConcurrentQueue<string>();
+        var done = 0;
+        var readers = Enumerable.Range(0, 4).Select(_ => Task.Run(async () =>
+        {
+            await release.Task;
+            var previous = harness.Coordinator.CurrentGeneration(RuntimeRole.Worker);
+            while (Volatile.Read(ref done) == 0)
+            {
+                var current = harness.Coordinator.CurrentGeneration(RuntimeRole.Worker);
+                if (current.Role != RuntimeRole.Worker || current.Value <= 0 || current.OperationId == Guid.Empty)
+                {
+                    observations.Enqueue($"Invalid generation: {current}");
+                }
+
+                if (current.Value < previous.Value)
+                {
+                    observations.Enqueue($"Generation regressed from {previous} to {current}");
+                }
+                else if (current.Value == previous.Value && current.OperationId != previous.OperationId)
+                {
+                    observations.Enqueue($"Operation changed without generation advance: {previous} to {current}");
+                }
+                else if (current.Value > previous.Value && current.OperationId == previous.OperationId)
+                {
+                    observations.Enqueue($"Generation advanced without operation change: {previous} to {current}");
+                }
+
+                previous = current;
+            }
+        })).ToArray();
+        var writer = Task.Run(async () =>
+        {
+            await release.Task;
+            for (var index = 0; index < generationAdvances; index++)
+            {
+                var worker = harness.Coordinator.CurrentGeneration(RuntimeRole.Worker);
+                await harness.Coordinator.DispatchAsync(new RoleExited(worker, 1));
+            }
+
+            Volatile.Write(ref done, 1);
+        });
+
+        release.SetResult();
+        await Task.WhenAll(readers.Append(writer));
+
+        Assert.Empty(observations);
+        Assert.Equal(generationAdvances + 1, harness.Coordinator.CurrentGeneration(RuntimeRole.Worker).Value);
     }
 
     [Fact]
@@ -316,23 +513,29 @@ public sealed class LifecycleCoordinatorTests
     {
         private static readonly DateTimeOffset Epoch = new(2026, 7, 14, 0, 0, 0, TimeSpan.Zero);
 
-        private CoordinatorHarness(LifecycleCoordinator coordinator)
+        private CoordinatorHarness(LifecycleCoordinator coordinator, TestClock clock, RestartBudget budget)
         {
             Coordinator = coordinator;
+            Clock = clock;
+            Budget = budget;
         }
 
         public LifecycleCoordinator Coordinator { get; }
 
-        public static CoordinatorHarness Create()
+        public TestClock Clock { get; }
+
+        public RestartBudget Budget { get; }
+
+        public static CoordinatorHarness Create(int maxRetries = 2)
         {
             var clock = new TestClock(Epoch);
-            var budget = new RestartBudget(2, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(5));
-            return new CoordinatorHarness(new LifecycleCoordinator(clock, budget));
+            var budget = new RestartBudget(maxRetries, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(5));
+            return new CoordinatorHarness(new LifecycleCoordinator(clock, budget), clock, budget);
         }
 
-        public static async Task<CoordinatorHarness> ReadyAsync()
+        public static async Task<CoordinatorHarness> ReadyAsync(int maxRetries = 2)
         {
-            var harness = Create();
+            var harness = Create(maxRetries);
             var operationId = Guid.Parse("30000000-0000-0000-0000-000000000003");
             await harness.AdvanceToDatabaseStartAsync(operationId);
             var database = harness.Coordinator.CurrentGeneration(RuntimeRole.Database);
@@ -347,6 +550,16 @@ public sealed class LifecycleCoordinatorTests
             await harness.Coordinator.DispatchAsync(new RoleReady(worker));
             Assert.Equal(RuntimeState.Ready, harness.Coordinator.State);
             return harness;
+        }
+
+        public async Task AdvanceToServerStartAsync(Guid operationId)
+        {
+            await AdvanceToDatabaseStartAsync(operationId);
+            var database = Coordinator.CurrentGeneration(RuntimeRole.Database);
+            await Coordinator.DispatchAsync(new RoleStarted(database));
+            await Coordinator.DispatchAsync(new RoleReady(database));
+            await Coordinator.DispatchAsync(new MigrationCompleted(operationId));
+            Assert.Equal(RuntimeState.StartingServer, Coordinator.State);
         }
 
         public async Task AdvanceToDatabaseStartAsync(Guid operationId)
