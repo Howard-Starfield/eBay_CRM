@@ -204,7 +204,7 @@ public sealed class UserProfileInstanceLock : IInstanceLock
                 var creationError = Marshal.GetLastPInvokeError();
                 if (mutex.IsInvalid)
                 {
-                    if (creationError == NativeMethods.ErrorAccessDenied)
+                    if (creationError is NativeMethods.ErrorAccessDenied or NativeMethods.ErrorInvalidHandle)
                     {
                         throw new ProfileOwnershipException(
                             ProfileOwnershipErrorCode.ProfileMutexSecurityMismatch);
@@ -234,15 +234,22 @@ public sealed class UserProfileInstanceLock : IInstanceLock
                     ownsMutex = true;
                     _cancellationToken.ThrowIfCancellationRequested();
                     var runtimeDirectory = Path.Combine(_identity.CanonicalPath, "runtime");
+                    _fileSystem.ValidateProfilePath(runtimeDirectory, _cancellationToken);
+                    _cancellationToken.ThrowIfCancellationRequested();
                     _fileSystem.CreateDirectory(runtimeDirectory, _cancellationToken);
                     _cancellationToken.ThrowIfCancellationRequested();
-                    _fileSystem.ValidateProfilePath(_identity.CanonicalPath, _cancellationToken);
+                    _fileSystem.ValidateProfilePath(runtimeDirectory, _cancellationToken);
+                    _cancellationToken.ThrowIfCancellationRequested();
+                    var lockPath = Path.Combine(runtimeDirectory, "profile.lock");
+                    _fileSystem.ValidateProfilePath(lockPath, _cancellationToken);
                     _cancellationToken.ThrowIfCancellationRequested();
                     try
                     {
                         lockFile = _fileSystem.OpenLockFile(
-                            Path.Combine(runtimeDirectory, "profile.lock"),
+                            lockPath,
                             _cancellationToken);
+                        _cancellationToken.ThrowIfCancellationRequested();
+                        _fileSystem.ValidateProfilePath(lockPath, _cancellationToken);
                         _cancellationToken.ThrowIfCancellationRequested();
                     }
                     catch (IOException error) when (IsSharingViolation(error))

@@ -11,7 +11,7 @@ internal static unsafe class NativeSecurityDescriptor
         using var identity = WindowsIdentity.GetCurrent(TokenAccessLevels.Query);
         var userSid = identity.User?.Value
             ?? throw new InvalidOperationException("The current Windows identity has no user SID.");
-        return Create($"D:P(A;;GA;;;{userSid})");
+        return Create($"O:{userSid}D:P(A;;GA;;;{userSid})");
     }
 
     internal static SafeLocalAllocHandle CreateForCurrentUserAndLogon()

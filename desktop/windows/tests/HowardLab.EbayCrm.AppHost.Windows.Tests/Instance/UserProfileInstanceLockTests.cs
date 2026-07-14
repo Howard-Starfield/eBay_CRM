@@ -3,6 +3,7 @@ using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
 using HowardLab.EbayCrm.AppHost.Windows.Instance;
+using HowardLab.EbayCrm.AppHost.Windows.Native;
 
 namespace HowardLab.EbayCrm.AppHost.Windows.Tests.Instance;
 
@@ -154,6 +155,8 @@ public sealed class UserProfileInstanceLockTests
         var mutexName = UserProfileInstanceLock.BuildMutexName(identity);
         var security = new MutexSecurity();
         using var current = WindowsIdentity.GetCurrent();
+        security.SetOwner(current.User!);
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
         security.AddAccessRule(new MutexAccessRule(
             current.User!,
             MutexRights.FullControl,
@@ -242,7 +245,24 @@ public sealed class UserProfileInstanceLockTests
     }
 
     [Fact]
-    public async Task TryAcquireAsync_ProductionMutexDaclValidatesAndSecondContenderIsRejectedNormally()
+    public async Task TryAcquireAsync_RejectsPreExistingDifferentKernelObjectTypeWithStableError()
+    {
+        using var directory = new TemporaryDirectory();
+        var identity = DataProfileIdentity.Create(directory.Path);
+        using var squatter = new EventWaitHandle(
+            initialState: false,
+            EventResetMode.AutoReset,
+            UserProfileInstanceLock.BuildMutexName(identity));
+
+        var error = await Assert.ThrowsAsync<ProfileOwnershipException>(() =>
+            UserProfileInstanceLock.TryAcquireAsync(identity, CancellationToken.None).AsTask());
+
+        Assert.Equal(ProfileOwnershipErrorCode.ProfileMutexSecurityMismatch, error.Code);
+        Assert.Equal("Data profile ownership error: ProfileMutexSecurityMismatch.", error.Message);
+    }
+
+    [Fact]
+    public async Task TryAcquireAsync_ProductionMutexOwnerAndDaclValidateAndSecondContenderIsRejectedNormally()
     {
         using var directory = new TemporaryDirectory();
         var identity = DataProfileIdentity.Create(directory.Path);
@@ -250,6 +270,29 @@ public sealed class UserProfileInstanceLockTests
 
         Assert.NotNull(first);
         Assert.Null(await UserProfileInstanceLock.TryAcquireAsync(identity, CancellationToken.None));
+    }
+
+    [Fact]
+    public void NativeMutexSecurity_RejectsCorrectDaclOwnedByDifferentPrincipal()
+    {
+        using var current = WindowsIdentity.GetCurrent();
+        var currentSid = current.User!;
+        var wrongOwner = new SecurityIdentifier(WellKnownSidType.WorldSid, domainSid: null);
+        var descriptor = new RawSecurityDescriptor(
+            $"O:{wrongOwner.Value}D:P(A;;GA;;;{currentSid.Value})");
+
+        Assert.False(NativeMutexSecurity.IsCurrentUserOnly(descriptor, currentSid));
+    }
+
+    [Fact]
+    public void NativeMutexSecurity_RejectsUnprotectedCurrentUserDacl()
+    {
+        using var current = WindowsIdentity.GetCurrent();
+        var currentSid = current.User!;
+        var descriptor = new RawSecurityDescriptor(
+            $"O:{currentSid.Value}D:(A;;GA;;;{currentSid.Value})");
+
+        Assert.False(NativeMutexSecurity.IsCurrentUserOnly(descriptor, currentSid));
     }
 
     [Fact]
@@ -281,17 +324,130 @@ public sealed class UserProfileInstanceLockTests
     {
         using var directory = new TemporaryDirectory();
         var identity = DataProfileIdentity.Create(directory.Path);
-        var fileSystem = new ReparseAfterCreateProfileLockFileSystem();
+        var runtimePath = Path.Combine(identity.CanonicalPath, "runtime");
+        var fileSystem = new RecordingProfileLockFileSystem(runtimePath, rejectOccurrence: 2);
 
-        var error = await Assert.ThrowsAsync<ProfileOwnershipException>(() =>
-            UserProfileInstanceLock.TryAcquireAsync(
-                identity,
-                CancellationToken.None,
-                fileSystem).AsTask());
+        var error = await CaptureAcquireFailureAsync(identity, fileSystem);
         await using var next = await UserProfileInstanceLock.TryAcquireAsync(identity, CancellationToken.None);
 
-        Assert.Equal(ProfileOwnershipErrorCode.ProfileMustBeLocalFixedStorage, error.Code);
+        var ownershipError = Assert.IsType<ProfileOwnershipException>(error);
+        Assert.Equal(ProfileOwnershipErrorCode.ProfileMustBeLocalFixedStorage, ownershipError.Code);
         Assert.NotNull(next);
+    }
+
+    [Fact]
+    public async Task TryAcquireAsync_ValidatesRuntimeAndLockPathsAtEveryBoundary()
+    {
+        using var directory = new TemporaryDirectory();
+        var identity = DataProfileIdentity.Create(directory.Path);
+        var runtimePath = Path.Combine(identity.CanonicalPath, "runtime");
+        var lockPath = Path.Combine(runtimePath, "profile.lock");
+        var fileSystem = new RecordingProfileLockFileSystem();
+
+        await using var acquired = await UserProfileInstanceLock.TryAcquireAsync(
+            identity,
+            CancellationToken.None,
+            fileSystem);
+
+        Assert.NotNull(acquired);
+        Assert.Equal(
+            [
+                $"validate:{runtimePath}",
+                $"create:{runtimePath}",
+                $"validate:{runtimePath}",
+                $"validate:{lockPath}",
+                $"open:{lockPath}",
+                $"validate:{lockPath}",
+                $"write:{lockPath}",
+            ],
+            fileSystem.Operations);
+    }
+
+    [Fact]
+    public async Task TryAcquireAsync_PreExistingRuntimeReparseReleasesOwnership()
+    {
+        using var directory = new TemporaryDirectory();
+        var identity = DataProfileIdentity.Create(directory.Path);
+        var runtimePath = Path.Combine(identity.CanonicalPath, "runtime");
+        var fileSystem = new RecordingProfileLockFileSystem(runtimePath, rejectOccurrence: 1);
+
+        var error = await CaptureAcquireFailureAsync(identity, fileSystem);
+        await using var next = await UserProfileInstanceLock.TryAcquireAsync(identity, CancellationToken.None);
+
+        var ownershipError = Assert.IsType<ProfileOwnershipException>(error);
+        Assert.Equal(ProfileOwnershipErrorCode.ProfileMustBeLocalFixedStorage, ownershipError.Code);
+        Assert.Equal([$"validate:{runtimePath}"], fileSystem.Operations);
+        Assert.NotNull(next);
+    }
+
+    [Fact]
+    public async Task TryAcquireAsync_PreExistingLockFileReparseReleasesOwnershipWithoutOpeningIt()
+    {
+        using var directory = new TemporaryDirectory();
+        var identity = DataProfileIdentity.Create(directory.Path);
+        var runtimePath = Path.Combine(identity.CanonicalPath, "runtime");
+        var lockPath = Path.Combine(runtimePath, "profile.lock");
+        var fileSystem = new RecordingProfileLockFileSystem(lockPath, rejectOccurrence: 1);
+
+        var error = await CaptureAcquireFailureAsync(identity, fileSystem);
+        await using var next = await UserProfileInstanceLock.TryAcquireAsync(identity, CancellationToken.None);
+
+        var ownershipError = Assert.IsType<ProfileOwnershipException>(error);
+        Assert.Equal(ProfileOwnershipErrorCode.ProfileMustBeLocalFixedStorage, ownershipError.Code);
+        Assert.Equal(
+            [
+                $"validate:{runtimePath}",
+                $"create:{runtimePath}",
+                $"validate:{runtimePath}",
+                $"validate:{lockPath}",
+            ],
+            fileSystem.Operations);
+        Assert.NotNull(next);
+    }
+
+    [Fact]
+    public async Task TryAcquireAsync_LockFileReparseDetectedAfterOpenDisposesFileAndReleasesOwnership()
+    {
+        using var directory = new TemporaryDirectory();
+        var identity = DataProfileIdentity.Create(directory.Path);
+        var runtimePath = Path.Combine(identity.CanonicalPath, "runtime");
+        var lockPath = Path.Combine(runtimePath, "profile.lock");
+        var fileSystem = new RecordingProfileLockFileSystem(lockPath, rejectOccurrence: 2);
+
+        var error = await CaptureAcquireFailureAsync(identity, fileSystem);
+        await using var next = await UserProfileInstanceLock.TryAcquireAsync(identity, CancellationToken.None);
+
+        var ownershipError = Assert.IsType<ProfileOwnershipException>(error);
+        Assert.Equal(ProfileOwnershipErrorCode.ProfileMustBeLocalFixedStorage, ownershipError.Code);
+        Assert.Equal(
+            [
+                $"validate:{runtimePath}",
+                $"create:{runtimePath}",
+                $"validate:{runtimePath}",
+                $"validate:{lockPath}",
+                $"open:{lockPath}",
+                $"validate:{lockPath}",
+            ],
+            fileSystem.Operations);
+        Assert.NotNull(next);
+    }
+
+    private static async Task<Exception?> CaptureAcquireFailureAsync(
+        DataProfileIdentity identity,
+        IProfileLockFileSystem fileSystem)
+    {
+        try
+        {
+            await using var acquired = await UserProfileInstanceLock.TryAcquireAsync(
+                identity,
+                CancellationToken.None,
+                fileSystem);
+            return null;
+        }
+        catch (Exception error)
+        {
+            return error;
+        }
     }
 
     private sealed class TemporaryDirectory : IDisposable
@@ -337,25 +493,49 @@ public sealed class UserProfileInstanceLockTests
                 cancellationToken);
     }
 
-    private sealed class ReparseAfterCreateProfileLockFileSystem : IProfileLockFileSystem
+    private sealed class RecordingProfileLockFileSystem(
+        string? rejectedPath = null,
+        int rejectOccurrence = 1) : IProfileLockFileSystem
     {
-        public void CreateDirectory(string path, CancellationToken cancellationToken) =>
+        private int _matchingValidationCount;
+
+        internal List<string> Operations { get; } = [];
+
+        public void CreateDirectory(string path, CancellationToken cancellationToken)
+        {
+            Operations.Add($"create:{path}");
             WindowsProfileLockFileSystem.Instance.CreateDirectory(path, cancellationToken);
+        }
 
-        public FileStream OpenLockFile(string path, CancellationToken cancellationToken) =>
-            WindowsProfileLockFileSystem.Instance.OpenLockFile(path, cancellationToken);
+        public FileStream OpenLockFile(string path, CancellationToken cancellationToken)
+        {
+            Operations.Add($"open:{path}");
+            return WindowsProfileLockFileSystem.Instance.OpenLockFile(path, cancellationToken);
+        }
 
-        public void ValidateProfilePath(string path, CancellationToken cancellationToken) =>
-            throw new ProfileOwnershipException(ProfileOwnershipErrorCode.ProfileMustBeLocalFixedStorage);
+        public void ValidateProfilePath(string path, CancellationToken cancellationToken)
+        {
+            Operations.Add($"validate:{path}");
+            if (string.Equals(path, rejectedPath, StringComparison.OrdinalIgnoreCase) &&
+                ++_matchingValidationCount == rejectOccurrence)
+            {
+                throw new ProfileOwnershipException(ProfileOwnershipErrorCode.ProfileMustBeLocalFixedStorage);
+            }
+
+            WindowsProfileLockFileSystem.Instance.ValidateProfilePath(path, cancellationToken);
+        }
 
         public void WriteDiagnostic(
             FileStream lockFile,
             string profileHash,
-            CancellationToken cancellationToken) =>
+            CancellationToken cancellationToken)
+        {
+            Operations.Add($"write:{lockFile.Name}");
             WindowsProfileLockFileSystem.Instance.WriteDiagnostic(
                 lockFile,
                 profileHash,
                 cancellationToken);
+        }
     }
 
     private sealed class ReparsePointPathInspector(string reparsePath) : IProfilePathInspector
