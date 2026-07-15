@@ -117,7 +117,10 @@ public sealed class LifecycleCoordinatorTests
             recovery.Commands.Select(command => command.Type));
         Assert.Equal(2, results.Count(result => result.Ignored));
         Assert.Equal(RuntimeState.StartingServer, harness.Coordinator.State);
-        Assert.Equal(worker, recovery.Commands[0].Generation);
+        var recoveryStopGeneration = Assert.IsType<ProcessGeneration>(recovery.Commands[0].Generation);
+        Assert.Equal(worker.Role, recoveryStopGeneration.Role);
+        Assert.Equal(worker.Value, recoveryStopGeneration.Value);
+        Assert.Equal(recovery.Commands[0].OperationId, recoveryStopGeneration.OperationId);
 
         var replacementServer = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
         var serverStarted = await harness.Coordinator.DispatchAsync(new RoleStarted(replacementServer));
@@ -215,6 +218,162 @@ public sealed class LifecycleCoordinatorTests
         Assert.Empty(workerExit.Commands);
         Assert.Equal(RuntimeState.StartingServer, harness.Coordinator.State);
         Assert.Equal(RestartBudgetResult.Allowed, harness.Budget.TryConsume(RuntimeRole.Worker, harness.Clock.UtcNow));
+    }
+
+    [Fact]
+    public async Task TimedOutWorkerStopDuringServerRecoveryUsesRecoveryIdentityAndReconciles()
+    {
+        var harness = await CoordinatorHarness.ReadyAsync();
+        var failedServer = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
+
+        var recovery = await harness.Coordinator.DispatchAsync(new RoleExited(failedServer, 1));
+        var stop = recovery.Commands.Single(command => command.Type == LifecycleCommandType.StopWorker);
+
+        Assert.Equal(stop.OperationId, stop.Generation!.Value.OperationId);
+        var timeout = await harness.Coordinator.DispatchAsync(
+            new OperationTimedOut(stop.Generation.Value, stop.OperationId));
+
+        Assert.False(timeout.Ignored);
+        Assert.Equal(RuntimeState.StartingServer, timeout.Current);
+        var reconcile = Assert.Single(timeout.Commands);
+        Assert.Equal(LifecycleCommandType.ReconcileRoleStop, reconcile.Type);
+        Assert.Equal(stop.Generation, reconcile.Generation);
+        Assert.Equal(stop.OperationId, reconcile.OperationId);
+
+        var reconciled = await harness.Coordinator.DispatchAsync(
+            new Reconciled(stop.Generation.Value, ReconciledState.Stopped));
+        Assert.False(reconciled.Ignored);
+        Assert.Equal(RuntimeState.StartingServer, reconciled.Current);
+        Assert.Empty(reconciled.Commands);
+
+        var duplicate = await harness.Coordinator.DispatchAsync(
+            new Reconciled(stop.Generation.Value, ReconciledState.Stopped));
+        Assert.True(duplicate.Ignored);
+        Assert.Equal("StaleGeneration", duplicate.ReasonCode);
+        Assert.Empty(duplicate.Commands);
+
+        var replacementServer = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
+        await harness.Coordinator.DispatchAsync(new RoleStarted(replacementServer));
+        await harness.Coordinator.DispatchAsync(new RoleReady(replacementServer));
+        Assert.Equal(RuntimeState.StartingWorker, harness.Coordinator.State);
+
+        var staleRequestedStart = await harness.Coordinator.DispatchAsync(
+            new RoleStarted(stop.Generation.Value));
+        Assert.True(staleRequestedStart.Ignored);
+        Assert.Equal("StaleGeneration", staleRequestedStart.ReasonCode);
+        Assert.Empty(staleRequestedStart.Commands);
+    }
+
+    [Fact]
+    public async Task RecoveryStopTimeoutRemainsFencedAfterCurrentOperationChanges()
+    {
+        var harness = await CoordinatorHarness.ReadyAsync();
+        var server = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
+        var serverRecovery = await harness.Coordinator.DispatchAsync(new RoleExited(server, 1));
+        var stop = serverRecovery.Commands.Single(
+            command => command.Type == LifecycleCommandType.StopWorker);
+
+        var database = harness.Coordinator.CurrentGeneration(RuntimeRole.Database);
+        await harness.Coordinator.DispatchAsync(new RoleExited(database, 1));
+        Assert.NotEqual(stop.OperationId, database.OperationId);
+
+        var timeout = await harness.Coordinator.DispatchAsync(
+            new OperationTimedOut(stop.Generation!.Value, stop.OperationId));
+
+        Assert.False(timeout.Ignored);
+        Assert.Equal(RuntimeState.ReconcilingDatabaseStart, timeout.Current);
+        var reconcile = Assert.Single(timeout.Commands);
+        Assert.Equal(LifecycleCommandType.ReconcileRoleStop, reconcile.Type);
+        Assert.Equal(stop.Generation, reconcile.Generation);
+        Assert.Equal(stop.OperationId, reconcile.OperationId);
+    }
+
+    [Fact]
+    public async Task RecoveryStopReconciliationTimeoutEscalatesAndFaults()
+    {
+        var harness = await CoordinatorHarness.ReadyAsync();
+        var server = harness.Coordinator.CurrentGeneration(RuntimeRole.Server);
+        var recovery = await harness.Coordinator.DispatchAsync(new RoleExited(server, 1));
+        var stop = recovery.Commands.Single(command => command.Type == LifecycleCommandType.StopWorker);
+        var timedOut = new OperationTimedOut(stop.Generation!.Value, stop.OperationId);
+        await harness.Coordinator.DispatchAsync(timedOut);
+
+        var reconciliationTimeout = await harness.Coordinator.DispatchAsync(timedOut);
+
+        Assert.False(reconciliationTimeout.Ignored);
+        Assert.Equal(RuntimeState.Faulted, reconciliationTimeout.Current);
+        Assert.Equal("RoleStopReconciliationTimedOut", reconciliationTimeout.ReasonCode);
+        Assert.Equal(
+            new[] { LifecycleCommandType.EscalateJob, LifecycleCommandType.EnterFault },
+            reconciliationTimeout.Commands.Select(command => command.Type));
+        Assert.All(reconciliationTimeout.Commands, command =>
+        {
+            Assert.Equal(stop.Generation, command.Generation);
+            Assert.Equal(stop.OperationId, command.OperationId);
+        });
+    }
+
+    [Fact]
+    public async Task TaggedRecoveryStopReconciliationCannotFallThroughDatabaseReconciliation()
+    {
+        var harness = await CoordinatorHarness.ReadyAsync();
+        var database = harness.Coordinator.CurrentGeneration(RuntimeRole.Database);
+        var recovery = await harness.Coordinator.DispatchAsync(new RoleExited(database, 1));
+        var stop = recovery.Commands.Single(command => command.Type == LifecycleCommandType.StopWorker);
+
+        var premature = await harness.Coordinator.DispatchAsync(
+            new Reconciled(stop.Generation!.Value, ReconciledState.Running));
+
+        Assert.True(premature.Ignored);
+        Assert.Equal("RecoveryStopNotReconciling", premature.ReasonCode);
+        Assert.Equal(RuntimeState.ReconcilingDatabaseStart, premature.Current);
+        Assert.Empty(premature.Commands);
+
+        await harness.Coordinator.DispatchAsync(
+            new OperationTimedOut(stop.Generation.Value, stop.OperationId));
+        var stopped = await harness.Coordinator.DispatchAsync(
+            new Reconciled(stop.Generation.Value, ReconciledState.Stopped));
+        Assert.False(stopped.Ignored);
+        Assert.Equal(RuntimeState.ReconcilingDatabaseStart, stopped.Current);
+
+        var duplicate = await harness.Coordinator.DispatchAsync(
+            new Reconciled(stop.Generation.Value, ReconciledState.Running));
+        Assert.True(duplicate.Ignored);
+        Assert.Equal("StaleReconciliation", duplicate.ReasonCode);
+        Assert.Equal(RuntimeState.ReconcilingDatabaseStart, duplicate.Current);
+        Assert.Empty(duplicate.Commands);
+    }
+
+    [Theory]
+    [InlineData(RuntimeRole.Worker)]
+    [InlineData(RuntimeRole.Server)]
+    public async Task TimedOutAppTierStopDuringDatabaseRecoveryUsesRecoveryIdentityAndReconciles(
+        RuntimeRole role)
+    {
+        var harness = await CoordinatorHarness.ReadyAsync();
+        var failedDatabase = harness.Coordinator.CurrentGeneration(RuntimeRole.Database);
+
+        var recovery = await harness.Coordinator.DispatchAsync(new RoleExited(failedDatabase, 1));
+        var stopType = role == RuntimeRole.Worker
+            ? LifecycleCommandType.StopWorker
+            : LifecycleCommandType.StopServer;
+        var stop = recovery.Commands.Single(command => command.Type == stopType);
+
+        Assert.Equal(stop.OperationId, stop.Generation!.Value.OperationId);
+        var timeout = await harness.Coordinator.DispatchAsync(
+            new OperationTimedOut(stop.Generation.Value, stop.OperationId));
+
+        Assert.False(timeout.Ignored);
+        Assert.Equal(RuntimeState.ReconcilingDatabaseStart, timeout.Current);
+        var reconcile = Assert.Single(timeout.Commands);
+        Assert.Equal(LifecycleCommandType.ReconcileRoleStop, reconcile.Type);
+        Assert.Equal(stop.Generation, reconcile.Generation);
+
+        var reconciled = await harness.Coordinator.DispatchAsync(
+            new Reconciled(stop.Generation.Value, ReconciledState.Stopped));
+        Assert.False(reconciled.Ignored);
+        Assert.Equal(RuntimeState.ReconcilingDatabaseStart, reconciled.Current);
+        Assert.Empty(reconciled.Commands);
     }
 
     [Theory]

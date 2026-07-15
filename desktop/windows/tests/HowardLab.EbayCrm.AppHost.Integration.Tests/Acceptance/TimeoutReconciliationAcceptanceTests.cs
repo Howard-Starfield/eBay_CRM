@@ -8,6 +8,7 @@ using HowardLab.EbayCrm.AppHost.Windows.Instance;
 using HowardLab.EbayCrm.AppHost.Protocol.Control;
 using HowardLab.EbayCrm.AppHost.Windows.Processes;
 using HowardLab.EbayCrm.AppHost.Core.Time;
+using HowardLab.EbayCrm.AppHost.Core.Diagnostics;
 
 namespace HowardLab.EbayCrm.AppHost.Integration.Tests.Acceptance;
 
@@ -39,7 +40,7 @@ public sealed class TimeoutReconciliationAcceptanceTests
     public async Task LateFixtureStart_ReconcilesTheRetainedProcessIdentity(RuntimeRole role)
     {
         using var layout = TestLayout.CreateReal("ebaycrm-task2-late-start");
-        var boundary = new BlockingRoleOperationBoundary(role, RoleOperationBoundaryPoint.StartIdentityRetained);
+        var boundary = new BlockingRoleOperationBoundary(role, RoleOperationBoundaryPoint.StartAcceptInFlight);
         var runtime = AppHostComposition.CreateForTests(
             AppHostOptions.Parse(layout.Arguments("run")),
             roleOperationBoundary: boundary,
@@ -80,6 +81,143 @@ public sealed class TimeoutReconciliationAcceptanceTests
             boundary.Release();
             await runtime.Orchestrator.DisposeAsync();
         }
+    }
+
+    [Fact, Trait("Category", "Acceptance")]
+    public async Task CallerCancellationAfterWorkerIdentityRetention_ReconcilesTheRetainedAccept()
+    {
+        var boundary = new BlockingRoleOperationBoundary(
+            RuntimeRole.Worker,
+            RoleOperationBoundaryPoint.StartAcceptInFlight);
+        await using var harness = RoleExecutorHarness.Create(
+            boundary,
+            new RoleOperationDeadlines(
+                TimeSpan.FromSeconds(30),
+                TimeSpan.FromSeconds(5),
+                TimeSpan.FromSeconds(30)));
+        using var cancellation = new CancellationTokenSource();
+        try
+        {
+            var generation = new ProcessGeneration(RuntimeRole.Worker, 1, Guid.NewGuid());
+            var command = new LifecycleCommand(
+                LifecycleCommandType.StartWorker,
+                generation,
+                generation.OperationId,
+                LifecycleDeadlineKey.WorkerStart);
+            var startup = harness.Executor.ExecuteAsync(command, cancellation.Token);
+            await WaitUntilBlockedOrPropagateStartupAsync(boundary, startup);
+            Assert.True(boundary.ObservedOperationWasPending);
+
+            cancellation.Cancel();
+            var timedOut = Assert.IsType<OperationTimedOut>(await startup);
+
+            Assert.Equal(generation, timedOut.Value);
+            Assert.Equal(generation.OperationId, timedOut.OperationId);
+            Assert.Equal(generation, GenerationFor(harness.Executor.SnapshotForTests(), RuntimeRole.Worker));
+            Assert.Equal(1, boundary.CountLaunches(generation));
+            Assert.Equal(1, boundary.CountLiveFixtureProcesses(generation));
+
+            boundary.Release();
+            var reconciled = await harness.Executor.ExecuteAsync(
+                new LifecycleCommand(
+                    LifecycleCommandType.ReconcileRoleStart,
+                    generation,
+                    generation.OperationId,
+                    LifecycleDeadlineKey.RoleReconciliation));
+
+            Assert.Equal(ReconciledState.Running, Assert.IsType<Reconciled>(reconciled).State);
+            Assert.Equal(generation, GenerationFor(harness.Executor.SnapshotForTests(), RuntimeRole.Worker));
+            Assert.Equal(1, boundary.CountLaunches(generation));
+        }
+        finally
+        {
+            boundary.Release();
+        }
+    }
+
+    [Fact, Trait("Category", "Acceptance")]
+    public async Task ExitedLateWorkerStart_ReconcilesStoppedWithoutWaitingForBlockedAccept()
+    {
+        var boundary = new BlockingRoleOperationBoundary(
+            RuntimeRole.Worker,
+            RoleOperationBoundaryPoint.StartAcceptInFlight);
+        await using var harness = RoleExecutorHarness.Create(
+            boundary,
+            new RoleOperationDeadlines(
+                TimeSpan.FromMilliseconds(1),
+                TimeSpan.FromSeconds(5),
+                TimeSpan.FromSeconds(5)));
+        try
+        {
+            var generation = new ProcessGeneration(RuntimeRole.Worker, 1, Guid.NewGuid());
+            var command = new LifecycleCommand(
+                LifecycleCommandType.StartWorker,
+                generation,
+                generation.OperationId,
+                LifecycleDeadlineKey.WorkerStart);
+            var startup = harness.Executor.ExecuteAsync(command);
+            await WaitUntilBlockedOrPropagateStartupAsync(boundary, startup);
+            Assert.IsType<OperationTimedOut>(await startup);
+
+            boundary.Terminate(generation);
+            await boundary.WaitUntilExitedAsync(generation, TimeSpan.FromSeconds(10));
+            var reconciliation = harness.Executor.ExecuteAsync(
+                new LifecycleCommand(
+                    LifecycleCommandType.ReconcileRoleStart,
+                    generation,
+                    generation.OperationId,
+                    LifecycleDeadlineKey.RoleReconciliation));
+            var completed = await reconciliation.WaitAsync(TimeSpan.FromSeconds(1));
+
+            Assert.Equal(ReconciledState.Stopped, Assert.IsType<Reconciled>(completed).State);
+            Assert.Null(GenerationFor(harness.Executor.SnapshotForTests(), RuntimeRole.Worker));
+            Assert.Equal(1, boundary.CountLaunches(generation));
+            Assert.Equal(0, boundary.CountLiveFixtureProcesses(generation));
+        }
+        finally
+        {
+            boundary.Release();
+        }
+    }
+
+    [Fact, Trait("Category", "Acceptance")]
+    public async Task FaultedAcceptWithLiveWorker_ReconcilesStoppedAndDisposesExactResource()
+    {
+        var boundary = new BlockingRoleOperationBoundary(
+            RuntimeRole.Worker,
+            RoleOperationBoundaryPoint.StopAccepted);
+        await using var harness = RoleExecutorHarness.Create(
+            boundary,
+            new RoleOperationDeadlines(
+                TimeSpan.FromMilliseconds(1),
+                TimeSpan.FromSeconds(5),
+                TimeSpan.FromSeconds(20)));
+        harness.Executor.WorkerFixtureModeForTests = "pipe-timeout";
+        var generation = new ProcessGeneration(RuntimeRole.Worker, 1, Guid.NewGuid());
+        var start = new LifecycleCommand(
+            LifecycleCommandType.StartWorker,
+            generation,
+            generation.OperationId,
+            LifecycleDeadlineKey.WorkerStart);
+
+        Assert.IsType<OperationTimedOut>(await harness.Executor.ExecuteAsync(start));
+        Assert.Equal(1, boundary.CountLiveFixtureProcesses(generation));
+
+        var reconcile = new LifecycleCommand(
+            LifecycleCommandType.ReconcileRoleStart,
+            generation,
+            generation.OperationId,
+            LifecycleDeadlineKey.RoleReconciliation);
+        var completed = await harness.Executor.ExecuteAsync(reconcile)
+            .WaitAsync(TimeSpan.FromSeconds(15));
+
+        Assert.Equal(ReconciledState.Stopped, Assert.IsType<Reconciled>(completed).State);
+        Assert.Null(GenerationFor(harness.Executor.SnapshotForTests(), RuntimeRole.Worker));
+        Assert.Equal(0, boundary.CountLiveFixtureProcesses(generation));
+
+        var duplicate = await harness.Executor.ExecuteAsync(reconcile);
+        Assert.Equal(ReconciledState.Stopped, Assert.IsType<Reconciled>(duplicate).State);
+        Assert.Equal(0, boundary.CountLiveFixtureProcesses(generation));
     }
 
     [PostgresFact, Trait("Category", "Acceptance")]
@@ -181,6 +319,20 @@ public sealed class TimeoutReconciliationAcceptanceTests
         Assert.Fail($"State {state} count {expectedCount} was not reached. History={string.Join(',', orchestrator.StateHistory)}");
     }
 
+    private static async Task WaitUntilBlockedOrPropagateStartupAsync(
+        BlockingRoleOperationBoundary boundary,
+        Task<LifecycleEvent?> startup)
+    {
+        var blocked = boundary.WaitUntilBlockedAsync(TimeSpan.FromSeconds(30));
+        if (await Task.WhenAny(blocked, startup) == startup)
+        {
+            _ = await startup;
+            Assert.Fail("Role startup completed before the accept boundary blocked.");
+        }
+
+        await blocked;
+    }
+
     internal static async Task WaitForStateAsync(
         RuntimeOrchestrator orchestrator,
         RuntimeState state,
@@ -235,6 +387,81 @@ public sealed class TimeoutReconciliationAcceptanceTests
     }
 }
 
+internal sealed class RoleExecutorHarness : IAsyncDisposable
+{
+    private readonly string _profileRoot;
+
+    private RoleExecutorHarness(string profileRoot, LifecycleCommandExecutor executor)
+    {
+        _profileRoot = profileRoot;
+        Executor = executor;
+    }
+
+    internal LifecycleCommandExecutor Executor { get; }
+
+    internal static RoleExecutorHarness Create(
+        IRoleOperationBoundary boundary,
+        RoleOperationDeadlines deadlines)
+    {
+        var profileRoot = Path.Combine(
+            Path.GetTempPath(),
+            $"ebaycrm-phase1b-role-executor-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(profileRoot);
+        var postgresBin = Path.Combine(profileRoot, "unused-postgres-bin");
+        Directory.CreateDirectory(postgresBin);
+        var fixturePath = Path.Combine(
+            AppContext.BaseDirectory,
+            "HowardLab.EbayCrm.AppHost.Fixture.exe");
+        var options = new AppHostOptions(
+            profileRoot,
+            postgresBin,
+            fixturePath,
+            Port: 15432,
+            AppHostMode.Run);
+        var postgresLayout = new PostgresBinaryLayout(
+            postgresBin,
+            Path.Combine(postgresBin, "initdb.exe"),
+            Path.Combine(postgresBin, "pg_ctl.exe"),
+            Path.Combine(postgresBin, "postgres.exe"),
+            Path.Combine(postgresBin, "psql.exe"),
+            Path.Combine(postgresBin, "pg_isready.exe"));
+        var payload = new ValidatedAppHostPayload(
+            DataProfileIdentity.Create(profileRoot),
+            postgresLayout,
+            PostgresClusterPaths.Create(profileRoot),
+            Path.Combine(profileRoot, "unused-migration.sql"),
+            ControlProtocolConstants.FixtureBuildIdentity);
+        var secrets = new DiagnosticSecretRegistry();
+        var sink = new JsonLinesDiagnosticSink(
+            (_, _) => ValueTask.FromResult<Stream>(Stream.Null),
+            new SystemClock(),
+            secrets);
+        var executor = new LifecycleCommandExecutor(
+            options,
+            payload,
+            identityStore: null,
+            boundary,
+            deadlines,
+            new OwnershipGatedDiagnosticSink(sink, TimeSpan.FromSeconds(1)),
+            secrets,
+            diagnosticSecretObserver: null);
+        var harness = new RoleExecutorHarness(profileRoot, executor);
+        executor.RoleLaunchedForTests = boundary is BlockingRoleOperationBoundary blocking
+            ? blocking.RecordLaunched
+            : null;
+        return harness;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await Executor.DisposeAsync();
+        if (Directory.Exists(_profileRoot))
+        {
+            Directory.Delete(_profileRoot, recursive: true);
+        }
+    }
+}
+
 internal sealed class ExhaustedRoleStartReconciliationExecutor : ILifecycleCommandExecutor
 {
     internal List<LifecycleCommandType> Commands { get; } = [];
@@ -285,6 +512,8 @@ internal sealed class BlockingRoleOperationBoundary(
 
     internal SupervisedProcessIdentity ObservedIdentity { get; private set; } = null!;
 
+    internal bool ObservedOperationWasPending { get; private set; }
+
     internal void RecordLaunched(
         RuntimeRole role,
         WindowsJobObject job,
@@ -300,6 +529,7 @@ internal sealed class BlockingRoleOperationBoundary(
         RoleOperationBoundaryPoint point,
         ProcessGeneration generation,
         Guid operationId,
+        Task pendingOperation,
         CancellationToken roleLifetimeToken)
     {
         if (point != blockedPoint || generation.Role != blockedRole ||
@@ -313,6 +543,7 @@ internal sealed class BlockingRoleOperationBoundary(
         {
             ObservedGeneration = generation;
             ObservedIdentity = _launches.Single(identity => identity.Generation == generation);
+            ObservedOperationWasPending = !pendingOperation.IsCompleted;
         }
         _blocked.TrySetResult();
         await _release.Task.WaitAsync(roleLifetimeToken);
@@ -321,6 +552,39 @@ internal sealed class BlockingRoleOperationBoundary(
     internal Task WaitUntilBlockedAsync(TimeSpan timeout) => _blocked.Task.WaitAsync(timeout);
 
     internal void Release() => _release.TrySetResult();
+
+    internal void Terminate(ProcessGeneration generation)
+    {
+        SupervisedProcessIdentity identity;
+        lock (_gate)
+        {
+            identity = _launches.Single(value => value.Generation == generation);
+        }
+
+        using var process = System.Diagnostics.Process.GetProcessById(identity.ProcessId);
+        if (process.StartTime.ToUniversalTime() != identity.CreationTimeUtc.UtcDateTime)
+        {
+            throw new InvalidOperationException("The retained fixture process identity changed before termination.");
+        }
+
+        process.Kill(entireProcessTree: true);
+    }
+
+    internal async Task WaitUntilExitedAsync(ProcessGeneration generation, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (CountLiveFixtureProcesses(generation) == 0)
+            {
+                return;
+            }
+
+            await Task.Delay(10);
+        }
+
+        throw new TimeoutException($"Fixture generation {generation} did not exit.");
+    }
 
     internal int CountLaunches(ProcessGeneration generation)
     {

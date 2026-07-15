@@ -480,7 +480,8 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
                 await resource.AcceptTask.WaitAsync(commandDeadline.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (
-                !cancellationToken.IsCancellationRequested && commandDeadline.IsCancellationRequested)
+                !resource.RoleLifetimeCancellation.IsCancellationRequested &&
+                commandDeadline.IsCancellationRequested)
             {
                 return new OperationTimedOut(generation, command.OperationId);
             }
@@ -510,15 +511,17 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     private async Task AcceptRoleAsync(RoleResource resource)
     {
         var roleLifetimeToken = resource.RoleLifetimeCancellation.Token;
-        await _roleOperationBoundary.PauseAsync(
-            RoleOperationBoundaryPoint.StartIdentityRetained,
-            resource.Generation,
-            resource.StartupOperationId,
-            roleLifetimeToken).ConfigureAwait(false);
-        await resource.Channel.AcceptAsync(
+        var acceptTask = resource.Channel.AcceptAsync(
             resource.Process,
             resource.Job,
+            roleLifetimeToken);
+        await _roleOperationBoundary.PauseAsync(
+            RoleOperationBoundaryPoint.StartAcceptInFlight,
+            resource.Generation,
+            resource.StartupOperationId,
+            acceptTask,
             roleLifetimeToken).ConfigureAwait(false);
+        await acceptTask.ConfigureAwait(false);
         resource.Authenticated = true;
     }
 
@@ -690,12 +693,14 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     private async Task CompleteRoleStopAsync(RoleResource resource, Guid operationId)
     {
         var roleLifetimeToken = resource.RoleLifetimeCancellation.Token;
+        var stoppedTask = resource.Channel.ReadAsync(roleLifetimeToken);
         await _roleOperationBoundary.PauseAsync(
             RoleOperationBoundaryPoint.StopAccepted,
             resource.Generation,
             operationId,
+            stoppedTask,
             roleLifetimeToken).ConfigureAwait(false);
-        var stopped = await resource.Channel.ReadAsync(roleLifetimeToken).ConfigureAwait(false);
+        var stopped = await stoppedTask.ConfigureAwait(false);
         if (stopped.Type != ControlMessageType.Stopped || stopped.OperationId != operationId)
         {
             throw new AppHostExecutionException("fixture-shutdown-sequence-invalid");
@@ -798,15 +803,35 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
 
         var acceptTask = resource.AcceptTask
             ?? throw new AppHostExecutionException("fixture-accept-task-missing");
+        if (resource.Process.Completion.IsCompleted)
+        {
+            await DisposeRoleAsync(resource).ConfigureAwait(false);
+            return new Reconciled(generation, ReconciledState.Stopped);
+        }
+
         using var reconciliationDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         reconciliationDeadline.CancelAfter(_roleOperationDeadlines.Reconciliation);
         try
         {
             await acceptTask.WaitAsync(reconciliationDeadline.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (!resource.RoleLifetimeCancellation.IsCancellationRequested)
+        catch (OperationCanceledException) when (
+            !resource.RoleLifetimeCancellation.IsCancellationRequested &&
+            reconciliationDeadline.IsCancellationRequested)
         {
+            if (acceptTask.IsCompleted || resource.Process.Completion.IsCompleted)
+            {
+                await DisposeRoleAsync(resource).ConfigureAwait(false);
+                return new Reconciled(generation, ReconciledState.Stopped);
+            }
+
             return new OperationTimedOut(generation, command.OperationId);
+        }
+        catch (Exception) when (
+            acceptTask.IsCompleted || resource.Process.Completion.IsCompleted)
+        {
+            await DisposeRoleAsync(resource).ConfigureAwait(false);
+            return new Reconciled(generation, ReconciledState.Stopped);
         }
 
         if (!resource.Authenticated || resource.Process.Completion.IsCompleted)

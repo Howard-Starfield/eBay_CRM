@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Globalization;
@@ -59,7 +60,7 @@ public sealed class CrossSessionOwnershipAcceptanceTests
                     RuntimeState.Stopped),
                 result.StandardOutput.Trim());
             Assert.Equal(1u, result.TotalProcesses);
-            Assert.False(owner.HasExited);
+            await AssertOwnerRemainsAliveForAsync(owner, TimeSpan.FromMilliseconds(1250));
             Assert.Equal(before, CaptureSegments(logs));
         }
         finally
@@ -118,6 +119,78 @@ public sealed class CrossSessionOwnershipAcceptanceTests
         harness.AssertClean();
     }
 
+    [Fact]
+    public async Task PrimaryAndCleanupFailures_AreBothReportedWithoutLosingPrimaryContext()
+    {
+        await using var harness = await S4uRunnerHarness.CreateAsync(
+            ResultFault.TimeoutWithCleanupFailure);
+
+        var error = await Assert.ThrowsAsync<S4uCleanupException>(() => harness.RunAsync());
+
+        Assert.Equal("task-cleanup-failed", error.ReasonCode);
+        Assert.Equal(1, error.FailureCount);
+        var combined = Assert.IsType<AggregateException>(error.InnerException);
+        var primary = Assert.IsType<S4uExecutionException>(combined.InnerExceptions[0]);
+        Assert.Equal("task-timeout", primary.ReasonCode);
+        Assert.IsType<IOException>(combined.InnerExceptions[1]);
+        harness.AssertCleanupAttempted();
+        harness.AssertRunnerOwnedArtifactsClean();
+        harness.AssertClean();
+    }
+
+    [Fact]
+    public async Task HarnessDispose_RemovesUnexpectedRunnerArtifactsAfterAnEarlierTestFailure()
+    {
+        var harness = await S4uRunnerHarness.CreateAsync(ResultFault.Timeout);
+        Directory.CreateDirectory(harness.RunnerRoot);
+        File.WriteAllText(Path.Combine(harness.RunnerRoot, "unexpected.txt"), "leftover");
+        try
+        {
+            await harness.DisposeAsync();
+
+            Assert.False(Directory.Exists(harness.RunnerRoot));
+        }
+        finally
+        {
+            if (Directory.Exists(harness.RunnerRoot))
+                Directory.Delete(harness.RunnerRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RunnerRoot_IsCreatedWithProtectedCurrentUserOnlyAcl()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"ebaycrm-s4u-acl-{Guid.NewGuid():N}");
+        try
+        {
+            TaskSchedulerS4uRunner.CreateCurrentUserOnlyDirectory(root);
+
+            var sid = WindowsIdentity.GetCurrent().User
+                ?? throw new InvalidOperationException("current-user-sid-unavailable");
+            var security = FileSystemAclExtensions.GetAccessControl(
+                new DirectoryInfo(root),
+                AccessControlSections.Access | AccessControlSections.Owner);
+            Assert.True(security.AreAccessRulesProtected);
+            Assert.Equal(sid, security.GetOwner(typeof(SecurityIdentifier)));
+            var rule = Assert.Single(security.GetAccessRules(
+                    includeExplicit: true,
+                    includeInherited: true,
+                    typeof(SecurityIdentifier))
+                .Cast<FileSystemAccessRule>());
+            Assert.False(rule.IsInherited);
+            Assert.Equal(sid, rule.IdentityReference);
+            Assert.Equal(AccessControlType.Allow, rule.AccessControlType);
+            Assert.Equal(FileSystemRights.FullControl, rule.FileSystemRights);
+            Assert.Equal(
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                rule.InheritanceFlags);
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
     [Theory]
     [InlineData(true, 1)]
     [InlineData(false, 0)]
@@ -136,6 +209,20 @@ public sealed class CrossSessionOwnershipAcceptanceTests
                 () => deleteCount++));
 
         Assert.Equal(unchecked((int)0x80070005), error.HResult);
+        Assert.Equal(expectedDeleteCount, deleteCount);
+    }
+
+    [Theory]
+    [InlineData(true, 1)]
+    [InlineData(false, 0)]
+    public void SuccessfulSessionCleanup_RemovesOnlyFolderCreatedByThisSession(
+        bool folderCreated,
+        int expectedDeleteCount)
+    {
+        var deleteCount = 0;
+
+        RealS4uTaskSession.DeleteFolderIfOwned(folderCreated, () => deleteCount++);
+
         Assert.Equal(expectedDeleteCount, deleteCount);
     }
 
@@ -162,6 +249,28 @@ public sealed class CrossSessionOwnershipAcceptanceTests
 
         static void InjectSettingsFailure() =>
             throw new InvalidOperationException("injected-settings-failure");
+    }
+
+    [Fact]
+    public void RegistrationAndFolderCleanupFailures_AreBothReportedWithoutPolicyMisclassification()
+    {
+        var primary = new COMException(
+            "policy-blocked",
+            unchecked((int)0x80070005));
+        var cleanup = new IOException("injected-folder-cleanup-failure");
+
+        var error = Assert.Throws<S4uCleanupException>(() =>
+            RealS4uTaskSession.CompleteAfterFolderAcquisition(
+                () => throw primary,
+                folderCreated: true,
+                () => throw cleanup));
+
+        Assert.Equal("task-cleanup-failed", error.ReasonCode);
+        Assert.Equal(1, error.FailureCount);
+        var combined = Assert.IsType<AggregateException>(error.InnerException);
+        Assert.Same(primary, combined.InnerExceptions[0]);
+        Assert.Same(cleanup, combined.InnerExceptions[1]);
+        Assert.NotEqual(primary.HResult, error.HResult);
     }
 
     private static Process StartOwner(string appHostPath, string fixturePath, TestLayout layout)
@@ -233,6 +342,14 @@ public sealed class CrossSessionOwnershipAcceptanceTests
                 throw new TimeoutException("owner-log-not-created");
             await Task.Delay(20);
         }
+    }
+
+    private static async Task AssertOwnerRemainsAliveForAsync(
+        Process owner,
+        TimeSpan observationWindow)
+    {
+        await Task.Delay(observationWindow);
+        Assert.False(owner.HasExited);
     }
 
     private static IReadOnlyList<SegmentSnapshot> CaptureSegments(string logs) =>

@@ -130,8 +130,8 @@ internal static class TaskSchedulerS4uRunner
             TryCleanup(() => DeleteIfPresent(requestPath), cleanupErrors);
             TryCleanup(() => DeleteMatchingTemporaryResults(root), cleanupErrors);
             TryCleanup(() => DeleteDirectoryIfPresent(root), cleanupErrors);
-            if (cleanupErrors.Count > 0 && primary is null)
-                throw new S4uCleanupException("task-cleanup-failed", cleanupErrors);
+            if (cleanupErrors.Count > 0)
+                throw new S4uCleanupException("task-cleanup-failed", cleanupErrors, primary);
         }
     }
 
@@ -239,9 +239,8 @@ internal static class TaskSchedulerS4uRunner
         }
     }
 
-    private static void CreateCurrentUserOnlyDirectory(string path)
+    internal static void CreateCurrentUserOnlyDirectory(string path)
     {
-        Directory.CreateDirectory(path);
         var sid = WindowsIdentity.GetCurrent().User
             ?? throw new Win32Exception("current-user-sid-unavailable");
         var security = new DirectorySecurity();
@@ -253,7 +252,7 @@ internal static class TaskSchedulerS4uRunner
             InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
             PropagationFlags.None,
             AccessControlType.Allow));
-        FileSystemAclExtensions.SetAccessControl(new DirectoryInfo(path), security);
+        FileSystemAclExtensions.Create(new DirectoryInfo(path), security);
     }
 
     private static bool IsS4uPolicyFailure(int hresult) => hresult is
@@ -317,14 +316,20 @@ internal sealed class RealS4uTaskSession : IS4uTaskSession
     private readonly dynamic _root;
     private readonly dynamic _folder;
     private readonly dynamic _registeredTask;
+    private readonly bool _folderCreated;
     private dynamic? _runningTask;
     private bool _deleted;
 
-    private RealS4uTaskSession(dynamic root, dynamic folder, dynamic registeredTask)
+    private RealS4uTaskSession(
+        dynamic root,
+        dynamic folder,
+        dynamic registeredTask,
+        bool folderCreated)
     {
         _root = root;
         _folder = folder;
         _registeredTask = registeredTask;
+        _folderCreated = folderCreated;
     }
 
     internal static IS4uTaskSession Create(string taskName, string brokerPath, string requestPath)
@@ -403,7 +408,7 @@ internal sealed class RealS4uTaskSession : IS4uTaskSession
                     root.DeleteFolder("\\HowardLab", 0);
                     folderCreated = false;
                 });
-            var session = new RealS4uTaskSession(root, folder, registered);
+            var session = new RealS4uTaskSession(root, folder, registered, folderCreated);
             transferred = true;
             return session;
         }
@@ -431,9 +436,20 @@ internal sealed class RealS4uTaskSession : IS4uTaskSession
         {
             return complete();
         }
-        catch
+        catch (Exception primary)
         {
-            if (folderCreated) deleteCreatedFolder();
+            if (folderCreated)
+            {
+                try { deleteCreatedFolder(); }
+                catch (Exception cleanup)
+                {
+                    throw new S4uCleanupException(
+                        "task-cleanup-failed",
+                        [cleanup],
+                        primary);
+                }
+            }
+
             throw;
         }
     }
@@ -475,11 +491,21 @@ internal sealed class RealS4uTaskSession : IS4uTaskSession
 
     public void DeleteFolderIfEmpty()
     {
-        try { _root.DeleteFolder("\\HowardLab", 0); }
+        try
+        {
+            DeleteFolderIfOwned(
+                _folderCreated,
+                () => _root.DeleteFolder("\\HowardLab", 0));
+        }
         catch (Exception error) when (error.HResult is unchecked((int)0x80070091) or unchecked((int)0x80070005))
         {
             if (error.HResult == unchecked((int)0x80070005)) throw;
         }
+    }
+
+    internal static void DeleteFolderIfOwned(bool folderCreated, Action deleteFolder)
+    {
+        if (folderCreated) deleteFolder();
     }
 
     public void Dispose()
@@ -497,7 +523,9 @@ internal sealed class RealS4uTaskSession : IS4uTaskSession
     }
 }
 
-internal class S4uContractException(string reasonCode) : Exception(reasonCode)
+internal class S4uContractException(
+    string reasonCode,
+    Exception? innerException = null) : Exception(reasonCode, innerException)
 {
     internal string ReasonCode { get; } = reasonCode;
 }
@@ -513,7 +541,11 @@ internal sealed class S4uExecutionException(string reasonCode) :
 
 internal sealed class S4uCleanupException(
     string reasonCode,
-    IReadOnlyCollection<Exception> cleanupErrors) : S4uContractException(reasonCode)
+    IReadOnlyCollection<Exception> cleanupErrors,
+    Exception? primary = null) : S4uContractException(
+        reasonCode,
+        new AggregateException(
+            primary is null ? cleanupErrors : [primary, .. cleanupErrors]))
 {
     internal int FailureCount { get; } = cleanupErrors.Count;
 }
@@ -609,6 +641,7 @@ internal enum ResultFault
     Timeout,
     BrokerCrash,
     CleanupFailure,
+    TimeoutWithCleanupFailure,
 }
 
 internal sealed class S4uRunnerHarness : IAsyncDisposable
@@ -656,6 +689,8 @@ internal sealed class S4uRunnerHarness : IAsyncDisposable
                 broker, appHost, root, profile, bin, fixture, 15432, sid, ownerSession)));
     }
 
+    internal string RunnerRoot => _runnerRoot;
+
     internal async Task<S4uBrokerResult> RunAsync()
     {
         try
@@ -699,6 +734,7 @@ internal sealed class S4uRunnerHarness : IAsyncDisposable
     public ValueTask DisposeAsync()
     {
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
+        if (Directory.Exists(_runnerRoot)) Directory.Delete(_runnerRoot, recursive: true);
         return ValueTask.CompletedTask;
     }
 }
@@ -732,7 +768,7 @@ internal sealed class FakeS4uTaskSession(
         var resultPath = request.GetProperty("ResultPath").GetString()!;
         TemporaryResultPath = resultPath + "." + nonce + ".tmp";
         File.WriteAllText(TemporaryResultPath, "incomplete-result");
-        if (fault == ResultFault.Timeout) return;
+        if (fault is ResultFault.Timeout or ResultFault.TimeoutWithCleanupFailure) return;
         if (fault == ResultFault.BrokerCrash)
         {
             BrokerAlive = false;
@@ -772,7 +808,9 @@ internal sealed class FakeS4uTaskSession(
 
     public S4uTaskObservation Observe() => new(
         fault == ResultFault.BrokerCrash,
-        fault is ResultFault.Timeout or ResultFault.BrokerCrash ? null : 111);
+        fault is ResultFault.Timeout or ResultFault.TimeoutWithCleanupFailure or ResultFault.BrokerCrash
+            ? null
+            : 111);
 
     public void DeleteTask()
     {
@@ -780,7 +818,8 @@ internal sealed class FakeS4uTaskSession(
         BrokerAlive = false;
         ContenderAlive = false;
         TaskExists = false;
-        if (fault == ResultFault.CleanupFailure) throw new IOException("injected-cleanup-failure");
+        if (fault is ResultFault.CleanupFailure or ResultFault.TimeoutWithCleanupFailure)
+            throw new IOException("injected-cleanup-failure");
     }
 
     public void DeleteFolderIfEmpty() => DeleteFolderAttempted = true;

@@ -8,6 +8,7 @@ internal static unsafe partial class NativeMethods
     internal const uint GenericRead = 0x80000000;
     internal const uint GenericWrite = 0x40000000;
     internal const uint FileReadAttributes = 0x00000080;
+    internal const uint ReadControl = 0x00020000;
     internal const uint Delete = 0x00010000;
     internal const uint FileShareRead = 0x00000001;
     internal const uint FileShareWrite = 0x00000002;
@@ -68,6 +69,15 @@ internal static unsafe partial class NativeMethods
         int informationClass,
         out FileAttributeTagInformation information,
         uint bufferSize);
+
+    [LibraryImport("advapi32.dll", EntryPoint = "GetKernelObjectSecurity", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool GetFileObjectSecurity(
+        SafeFileHandle handle,
+        uint requestedInformation,
+        byte* securityDescriptor,
+        uint length,
+        out uint needed);
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

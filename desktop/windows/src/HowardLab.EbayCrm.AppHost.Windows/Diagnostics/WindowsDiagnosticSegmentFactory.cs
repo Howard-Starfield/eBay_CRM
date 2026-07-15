@@ -22,18 +22,35 @@ public sealed unsafe class WindowsDiagnosticSegmentFactory
 
     private readonly DataProfileIdentity _profile;
     private readonly Action? _beforeDirectoryHandleOpenForTests;
+    private readonly Func<SafeFileHandle, RawSecurityDescriptor> _readSecurityDescriptor;
 
     public WindowsDiagnosticSegmentFactory(DataProfileIdentity profile)
-        : this(profile, beforeDirectoryHandleOpenForTests: null)
+        : this(
+            profile,
+            beforeDirectoryHandleOpenForTests: null,
+            readSecurityDescriptor: ReadSecurityDescriptor)
     {
     }
 
     internal WindowsDiagnosticSegmentFactory(
         DataProfileIdentity profile,
         Action? beforeDirectoryHandleOpenForTests)
+        : this(
+            profile,
+            beforeDirectoryHandleOpenForTests,
+            readSecurityDescriptor: ReadSecurityDescriptor)
+    {
+    }
+
+    internal WindowsDiagnosticSegmentFactory(
+        DataProfileIdentity profile,
+        Action? beforeDirectoryHandleOpenForTests,
+        Func<SafeFileHandle, RawSecurityDescriptor> readSecurityDescriptor)
     {
         _profile = profile ?? throw new ArgumentNullException(nameof(profile));
         _beforeDirectoryHandleOpenForTests = beforeDirectoryHandleOpenForTests;
+        _readSecurityDescriptor = readSecurityDescriptor ??
+            throw new ArgumentNullException(nameof(readSecurityDescriptor));
     }
 
     public ValueTask<Stream> OpenAsync(int slot, CancellationToken cancellationToken)
@@ -53,7 +70,7 @@ public sealed unsafe class WindowsDiagnosticSegmentFactory
 
         using var directoryHandle = NativeMethods.CreateFile(
             logsPath,
-            NativeMethods.FileReadAttributes,
+            NativeMethods.FileReadAttributes | NativeMethods.ReadControl,
             NativeMethods.FileShareRead | NativeMethods.FileShareWrite,
             IntPtr.Zero,
             NativeMethods.OpenExisting,
@@ -61,8 +78,7 @@ public sealed unsafe class WindowsDiagnosticSegmentFactory
             IntPtr.Zero);
         EnsureValidHandle(directoryHandle);
         EnsureNotReparsePoint(directoryHandle, requireDirectory: true);
-        ValidateExactCurrentUserOnlyDacl(new DirectoryInfo(logsPath).GetAccessControl(
-            AccessControlSections.Access));
+        ValidateExactCurrentUserOnlyDacl(directoryHandle);
 
         cancellationToken.ThrowIfCancellationRequested();
         var segmentPath = Path.Combine(logsPath, SegmentNames[slot]);
@@ -70,8 +86,7 @@ public sealed unsafe class WindowsDiagnosticSegmentFactory
         try
         {
             EnsureNotReparsePoint(segmentHandle, requireDirectory: false);
-            ValidateExactCurrentUserOnlyDacl(new FileInfo(segmentPath).GetAccessControl(
-                AccessControlSections.Access));
+            ValidateExactCurrentUserOnlyDacl(segmentHandle);
             var stream = new FileStream(segmentHandle, FileAccess.Write, bufferSize: 4_096, isAsync: false);
             segmentHandle = null;
             stream.SetLength(0);
@@ -172,27 +187,62 @@ public sealed unsafe class WindowsDiagnosticSegmentFactory
         }
     }
 
-    private static void ValidateExactCurrentUserOnlyDacl(FileSystemSecurity security)
+    private void ValidateExactCurrentUserOnlyDacl(SafeFileHandle handle)
     {
-        if (!security.AreAccessRulesProtected)
+        var security = _readSecurityDescriptor(handle);
+        if ((security.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0)
         {
             throw new UnauthorizedAccessException("The diagnostic path DACL permits inheritance.");
         }
 
-        var rules = security.GetAccessRules(
-                includeExplicit: true,
-                includeInherited: true,
-                typeof(SecurityIdentifier))
-            .Cast<FileSystemAccessRule>()
-            .ToArray();
+        var dacl = security.DiscretionaryAcl;
         var currentSid = new SecurityIdentifier(NativeSecurityDescriptor.GetCurrentUserSid());
-        if (rules.Length != 1 ||
-            rules[0].IsInherited ||
-            rules[0].AccessControlType != AccessControlType.Allow ||
-            rules[0].FileSystemRights != FileSystemRights.FullControl ||
-            !currentSid.Equals(rules[0].IdentityReference))
+        if (dacl is null ||
+            dacl.Count != 1 ||
+            dacl[0] is not CommonAce rule ||
+            rule.IsCallback ||
+            rule.AceFlags != AceFlags.None ||
+            rule.AceQualifier != AceQualifier.AccessAllowed ||
+            rule.AccessMask != (int)FileSystemRights.FullControl ||
+            !currentSid.Equals(rule.SecurityIdentifier))
         {
             throw new UnauthorizedAccessException("The diagnostic path DACL is not current-user-only.");
         }
     }
+
+    private static RawSecurityDescriptor ReadSecurityDescriptor(SafeFileHandle handle)
+    {
+        _ = NativeMethods.GetFileObjectSecurity(
+            handle,
+            NativeMethods.DaclSecurityInformation,
+            securityDescriptor: null,
+            length: 0,
+            out var needed);
+        var error = Marshal.GetLastPInvokeError();
+        if (error != NativeMethods.ErrorInsufficientBuffer || needed == 0)
+        {
+            throw SecurityDescriptorUnavailable(error);
+        }
+
+        var buffer = new byte[checked((int)needed)];
+        fixed (byte* descriptor = buffer)
+        {
+            if (!NativeMethods.GetFileObjectSecurity(
+                    handle,
+                    NativeMethods.DaclSecurityInformation,
+                    descriptor,
+                    checked((uint)buffer.Length),
+                    out _))
+            {
+                throw SecurityDescriptorUnavailable(Marshal.GetLastPInvokeError());
+            }
+        }
+
+        return new RawSecurityDescriptor(buffer, 0);
+    }
+
+    private static UnauthorizedAccessException SecurityDescriptorUnavailable(int error) =>
+        new(
+            "The diagnostic path security descriptor could not be validated.",
+            new Win32Exception(error));
 }

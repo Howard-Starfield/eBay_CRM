@@ -4,7 +4,7 @@ namespace HowardLab.EbayCrm.AppHost.Composition;
 
 internal enum RoleOperationBoundaryPoint
 {
-    StartIdentityRetained,
+    StartAcceptInFlight,
     StopAccepted,
 }
 
@@ -14,6 +14,7 @@ internal interface IRoleOperationBoundary
         RoleOperationBoundaryPoint point,
         ProcessGeneration generation,
         Guid operationId,
+        Task pendingOperation,
         CancellationToken roleLifetimeToken);
 }
 
@@ -25,8 +26,10 @@ internal sealed class NoopRoleOperationBoundary : IRoleOperationBoundary
         RoleOperationBoundaryPoint point,
         ProcessGeneration generation,
         Guid operationId,
+        Task pendingOperation,
         CancellationToken roleLifetimeToken)
     {
+        ArgumentNullException.ThrowIfNull(pendingOperation);
         roleLifetimeToken.ThrowIfCancellationRequested();
         return ValueTask.CompletedTask;
     }
