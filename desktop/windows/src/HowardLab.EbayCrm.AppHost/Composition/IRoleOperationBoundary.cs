@@ -40,14 +40,22 @@ internal sealed record RoleOperationDeadlines
     internal static RoleOperationDeadlines Production { get; } = new(
         TimeSpan.FromSeconds(10),
         TimeSpan.FromSeconds(5),
-        TimeSpan.FromSeconds(30));
+        TimeSpan.FromSeconds(30),
+        TimeSpan.FromSeconds(30),
+        TimeSpan.FromMilliseconds(100));
 
     internal RoleOperationDeadlines(
         TimeSpan startCommand,
         TimeSpan stopCommand,
-        TimeSpan reconciliation)
+        TimeSpan reconciliation,
+        TimeSpan readiness,
+        TimeSpan readinessPollInterval)
     {
-        if (startCommand <= TimeSpan.Zero || stopCommand <= TimeSpan.Zero || reconciliation <= TimeSpan.Zero)
+        if (startCommand <= TimeSpan.Zero ||
+            stopCommand <= TimeSpan.Zero ||
+            reconciliation <= TimeSpan.Zero ||
+            readiness <= TimeSpan.Zero ||
+            readinessPollInterval <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(startCommand));
         }
@@ -55,6 +63,8 @@ internal sealed record RoleOperationDeadlines
         StartCommand = startCommand;
         StopCommand = stopCommand;
         Reconciliation = reconciliation;
+        Readiness = readiness;
+        ReadinessPollInterval = readinessPollInterval;
     }
 
     internal TimeSpan StartCommand { get; }
@@ -62,4 +72,8 @@ internal sealed record RoleOperationDeadlines
     internal TimeSpan StopCommand { get; }
 
     internal TimeSpan Reconciliation { get; }
+
+    internal TimeSpan Readiness { get; }
+
+    internal TimeSpan ReadinessPollInterval { get; }
 }

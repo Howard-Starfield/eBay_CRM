@@ -1,7 +1,6 @@
 using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
+using System.Diagnostics;
 using System.Globalization;
-using System.Net;
-using System.Net.Http.Json;
 using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using HowardLab.EbayCrm.AppHost.Core.Diagnostics;
@@ -36,6 +35,7 @@ public interface IDependencyFailureInspector
 public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDependencyFailureInspector
 {
     private static readonly TimeSpan ControlDeadline = TimeSpan.FromSeconds(10);
+    private const int MaxHealthResponseBytes = 8 * 1024;
     private readonly AppHostOptions _options;
     private readonly ValidatedAppHostPayload _payload;
     private readonly IProfileRuntimeIdentityStore _identityStore;
@@ -46,6 +46,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     private readonly IRoleOperationBoundary _roleOperationBoundary;
     private readonly RoleOperationDeadlines _roleOperationDeadlines;
     private readonly IRoleLaunchPlanProvider _roleLaunchPlanProvider;
+    private readonly Func<HttpMessageHandler> _roleHealthMessageHandlerFactory;
     private UserProfileInstanceLock? _instanceLock;
     private Guid? _instanceOperationId;
     private ProfileRuntimeIdentity? _profileIdentity;
@@ -58,6 +59,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     private int _disposed;
     private int _faultDiagnosticWritten;
     private int _releaseInstanceCountForTests;
+    private int _readinessTimeoutDiagnosticCountForTests;
 
     internal LifecycleCommandExecutor(
         AppHostOptions options,
@@ -106,7 +108,8 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         DiagnosticSecretRegistry diagnosticSecrets,
         Action<SecretValue>? diagnosticSecretObserver,
         IRoleLaunchPlanProvider roleLaunchPlanProvider,
-        IProcessLauncher? launcher = null)
+        IProcessLauncher? launcher = null,
+        Func<HttpMessageHandler>? roleHealthMessageHandlerFactory = null)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _payload = payload ?? throw new ArgumentNullException(nameof(payload));
@@ -119,17 +122,33 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         _roleLaunchPlanProvider = roleLaunchPlanProvider ??
             throw new ArgumentNullException(nameof(roleLaunchPlanProvider));
         _launcher = launcher ?? new WindowsProcessLauncher(_diagnosticSink);
+        _roleHealthMessageHandlerFactory = roleHealthMessageHandlerFactory ?? CreateRoleHealthMessageHandler;
     }
 
     public Func<LifecycleEvent, CancellationToken, Task>? EventSink { get; set; }
 
     internal Action<RuntimeRole, WindowsJobObject, WindowsSupervisedProcess>? RoleLaunchedForTests { get; set; }
 
+    internal Func<RuntimeRole, Task>? ReadinessValidatedForTests { get; set; }
+
+    internal Func<RuntimeRole, Task>? ControlMonitorDisconnectObservedForTests { get; set; }
+
+    internal Action? ReadinessLoserObservedForTests { get; set; }
+
     internal int ReleaseInstanceCountForTests => Volatile.Read(ref _releaseInstanceCountForTests);
 
     internal long DiagnosticSinkFailureCountForTests => _diagnosticSink.SinkFailureCount;
 
     internal long DiagnosticCompletionTimeoutCountForTests => _diagnosticSink.CompletionTimeoutCount;
+
+    internal int ReadinessTimeoutDiagnosticCountForTests =>
+        Volatile.Read(ref _readinessTimeoutDiagnosticCountForTests);
+
+    internal static HttpClientHandler CreateRoleHealthMessageHandler() => new()
+    {
+        AllowAutoRedirect = false,
+        UseProxy = false,
+    };
 
     internal ValueTask WriteDiagnosticForTestsAsync(DiagnosticEvent diagnosticEvent) =>
         _diagnosticSink.WriteAsync(diagnosticEvent);
@@ -172,6 +191,19 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
                 break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(role));
+        }
+    }
+
+    internal async Task DisconnectRoleControlForTestsAsync(RuntimeRole role) =>
+        await GetRole(role).Channel.DisposeAsync().ConfigureAwait(false);
+
+    internal async Task WaitForControlDisconnectForTestsAsync(RuntimeRole role)
+    {
+        var disconnected = await (GetRole(role).ControlDisconnectTask ??
+            throw new AppHostExecutionException("role-control-watch-missing")).ConfigureAwait(false);
+        if (!disconnected)
+        {
+            throw new AppHostExecutionException("role-control-watch-canceled");
         }
     }
 
@@ -620,6 +652,9 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             roleLifetimeToken).ConfigureAwait(false);
         await acceptTask.ConfigureAwait(false);
         resource.Authenticated = true;
+        resource.ControlDisconnectTask = WatchForReadinessControlLossAsync(
+            resource.Channel,
+            resource.MonitorCancellation.Token);
     }
 
     private async Task<LifecycleEvent> WaitForRoleAsync(
@@ -634,33 +669,402 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             throw new AppHostExecutionException("role-retained-identity-mismatch");
         }
 
-        using var http = new HttpClient { Timeout = ControlDeadline };
-        using var request = CreateHealthRequest(resource);
-        using var response = await http.SendAsync(request, cancellationToken).ConfigureAwait(false);
-        await ValidateHealthResponseAsync(resource, response, cancellationToken).ConfigureAwait(false);
+        if (resource.ReadinessConfirmed)
+        {
+            var controlDisconnect = resource.ControlDisconnectTask
+                ?? throw new AppHostExecutionException("role-control-watch-missing");
+            if (controlDisconnect.IsCompleted &&
+                await controlDisconnect.ConfigureAwait(false))
+            {
+                throw new AppHostExecutionException("role-control-disconnected-before-ready");
+            }
 
+            MonitorRole(resource);
+            return new RoleReady(generation);
+        }
+
+        var outcome = await PollRoleReadinessAsync(
+            resource,
+            _roleOperationDeadlines.Readiness,
+            cancellationToken).ConfigureAwait(false);
+        if (outcome == RoleReadinessOutcome.TimedOut)
+        {
+            await RecordRoleReadinessTimeoutAsync(resource).ConfigureAwait(false);
+            return new OperationTimedOut(generation, command.OperationId);
+        }
+
+        return outcome switch
+        {
+            RoleReadinessOutcome.Ready => CompleteRoleReadiness(resource, generation),
+            RoleReadinessOutcome.ProcessExited => throw new AppHostExecutionException("role-process-exited-before-ready"),
+            RoleReadinessOutcome.ControlDisconnected => throw new AppHostExecutionException("role-control-disconnected-before-ready"),
+            _ => throw new ArgumentOutOfRangeException(nameof(outcome)),
+        };
+    }
+
+    private LifecycleEvent CompleteRoleReadiness(RoleResource resource, ProcessGeneration generation)
+    {
+        resource.ReadinessConfirmed = true;
         MonitorRole(resource);
         return new RoleReady(generation);
     }
 
-    private static async Task ValidateHealthResponseAsync(
+    private async Task RecordRoleReadinessTimeoutAsync(RoleResource resource)
+    {
+        if (!resource.TryRecordReadinessTimeout())
+        {
+            return;
+        }
+
+        var diagnostic = DiagnosticEvent.Create("role.readiness_timeout")
+            .With("reason_code", DiagnosticField.ReasonCode("role-readiness-timeout"))
+            .With("role", DiagnosticField.String(resource.Generation.Role.ToString()))
+            .With("generation", DiagnosticField.Integer(resource.Generation.Value))
+            .With("operation_id", DiagnosticField.Guid(resource.Generation.OperationId));
+        await _diagnosticSink.WriteAsync(diagnostic).ConfigureAwait(false);
+        Interlocked.Increment(ref _readinessTimeoutDiagnosticCountForTests);
+    }
+
+    private async Task<RoleReadinessOutcome> PollRoleReadinessAsync(
+        RoleResource resource,
+        TimeSpan deadline,
+        CancellationToken cancellationToken)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        using var http = new HttpClient(_roleHealthMessageHandlerFactory(), disposeHandler: true)
+        {
+            Timeout = Timeout.InfiniteTimeSpan,
+        };
+        var controlLoss = resource.ControlDisconnectTask
+            ?? throw new AppHostExecutionException("role-control-watch-missing");
+        var observedNotReady = false;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (resource.Process.Completion.IsCompleted)
+            {
+                return RoleReadinessOutcome.ProcessExited;
+            }
+
+            if (controlLoss.IsCompleted && await controlLoss.ConfigureAwait(false))
+            {
+                return RoleReadinessOutcome.ControlDisconnected;
+            }
+
+            var remaining = deadline - stopwatch.Elapsed;
+            if (remaining <= TimeSpan.Zero)
+            {
+                return observedNotReady
+                    ? RoleReadinessOutcome.TimedOut
+                    : throw new AppHostExecutionException("role-health-request-timed-out");
+            }
+
+            using var requestCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var requestReachedReadinessDeadline = remaining <= ControlDeadline;
+            requestCancellation.CancelAfter(requestReachedReadinessDeadline ? remaining : ControlDeadline);
+            using var request = CreateHealthRequest(resource);
+            var requestTask = http.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                requestCancellation.Token);
+            var completed = await Task.WhenAny(
+                requestTask,
+                resource.Process.Completion,
+                controlLoss).ConfigureAwait(false);
+            if (completed != requestTask)
+            {
+                requestCancellation.Cancel();
+                await ObserveCanceledRequestAsync(requestTask).ConfigureAwait(false);
+                ReadinessLoserObservedForTests?.Invoke();
+                cancellationToken.ThrowIfCancellationRequested();
+                if (resource.Process.Completion.IsCompleted)
+                {
+                    return RoleReadinessOutcome.ProcessExited;
+                }
+
+                if (await controlLoss.ConfigureAwait(false))
+                {
+                    return RoleReadinessOutcome.ControlDisconnected;
+                }
+            }
+
+            HttpResponseMessage response;
+            try
+            {
+                response = await requestTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                return observedNotReady && requestReachedReadinessDeadline
+                    ? RoleReadinessOutcome.TimedOut
+                    : throw new AppHostExecutionException("role-health-request-timed-out");
+            }
+            catch (HttpRequestException error)
+            {
+                throw new AppHostExecutionException("role-health-request-failed", error);
+            }
+
+            using (response)
+            {
+                var validationTask = ValidateHealthResponseAsync(
+                    resource,
+                    response,
+                    requestCancellation.Token);
+                completed = await Task.WhenAny(
+                    validationTask,
+                    resource.Process.Completion,
+                    controlLoss).ConfigureAwait(false);
+                if (completed != validationTask)
+                {
+                    requestCancellation.Cancel();
+                    await ObserveCanceledValidationAsync(validationTask).ConfigureAwait(false);
+                    ReadinessLoserObservedForTests?.Invoke();
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (resource.Process.Completion.IsCompleted)
+                    {
+                        return RoleReadinessOutcome.ProcessExited;
+                    }
+
+                    if (await controlLoss.ConfigureAwait(false))
+                    {
+                        return RoleReadinessOutcome.ControlDisconnected;
+                    }
+                }
+
+                RoleHealthStatus health;
+                try
+                {
+                    health = await validationTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (OperationCanceledException)
+                {
+                    return observedNotReady && requestReachedReadinessDeadline
+                        ? RoleReadinessOutcome.TimedOut
+                        : throw new AppHostExecutionException("role-health-request-timed-out");
+                }
+
+                if (health == RoleHealthStatus.Ready)
+                {
+                    if (ReadinessValidatedForTests is { } readinessValidated)
+                    {
+                        await readinessValidated(resource.Generation.Role).ConfigureAwait(false);
+                    }
+
+                    if (resource.Process.Completion.IsCompleted)
+                    {
+                        return RoleReadinessOutcome.ProcessExited;
+                    }
+
+                    if (controlLoss.IsCompleted && await controlLoss.ConfigureAwait(false))
+                    {
+                        return RoleReadinessOutcome.ControlDisconnected;
+                    }
+
+                    return RoleReadinessOutcome.Ready;
+                }
+
+                observedNotReady = true;
+            }
+
+            remaining = deadline - stopwatch.Elapsed;
+            if (remaining <= TimeSpan.Zero)
+            {
+                return RoleReadinessOutcome.TimedOut;
+            }
+
+            var delay = remaining < _roleOperationDeadlines.ReadinessPollInterval
+                ? remaining
+                : _roleOperationDeadlines.ReadinessPollInterval;
+            using var delayCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var delayTask = Task.Delay(delay, delayCancellation.Token);
+            completed = await Task.WhenAny(
+                delayTask,
+                resource.Process.Completion,
+                controlLoss).ConfigureAwait(false);
+            if (completed != delayTask)
+            {
+                delayCancellation.Cancel();
+                await ObserveCanceledDelayAsync(delayTask).ConfigureAwait(false);
+                ReadinessLoserObservedForTests?.Invoke();
+                cancellationToken.ThrowIfCancellationRequested();
+                if (resource.Process.Completion.IsCompleted)
+                {
+                    return RoleReadinessOutcome.ProcessExited;
+                }
+
+                if (await controlLoss.ConfigureAwait(false))
+                {
+                    return RoleReadinessOutcome.ControlDisconnected;
+                }
+            }
+
+            await delayTask.ConfigureAwait(false);
+        }
+    }
+
+    private static async Task<RoleHealthStatus> ValidateHealthResponseAsync(
         RoleResource resource,
         HttpResponseMessage response,
         CancellationToken cancellationToken)
     {
-        response.EnsureSuccessStatusCode();
-        var health = await response.Content.ReadFromJsonAsync<HealthPayload>(
-            ControlFrameCodec.SerializerOptions,
-            cancellationToken).ConfigureAwait(false)
-            ?? throw new AppHostExecutionException("role-health-empty");
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new AppHostExecutionException("role-health-http-status-invalid");
+        }
+
+        var json = await ReadBoundedHealthBodyAsync(response.Content, cancellationToken).ConfigureAwait(false);
+        if (json.Length == 0)
+        {
+            throw new AppHostExecutionException("role-health-empty");
+        }
+
+        HealthPayload health;
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                throw new JsonException();
+            }
+
+            var expectedProperties = new HashSet<string>(StringComparer.Ordinal)
+            {
+                "protocolVersion",
+                "buildIdentity",
+                "generation",
+                "generationNonce",
+                "status",
+                "activeWorkRemaining",
+            };
+            var observedProperties = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                if (!expectedProperties.Contains(property.Name) ||
+                    !observedProperties.Add(property.Name))
+                {
+                    throw new JsonException();
+                }
+            }
+
+            if (observedProperties.Count != expectedProperties.Count)
+            {
+                throw new JsonException();
+            }
+
+            health = JsonSerializer.Deserialize<HealthPayload>(
+                json,
+                ControlFrameCodec.SerializerOptions)
+                ?? throw new AppHostExecutionException("role-health-empty");
+        }
+        catch (JsonException error)
+        {
+            throw new AppHostExecutionException("role-health-malformed", error);
+        }
+
         var endpoint = resource.Channel.EndpointIdentity;
         if (health.ProtocolVersion != ControlProtocolConstants.CurrentVersion ||
             health.BuildIdentity != endpoint.ExpectedBuildIdentity ||
             health.Generation != resource.Generation.Value ||
             health.GenerationNonce != endpoint.CapabilityNonce ||
-            health.Status != "ready")
+            health.ActiveWorkRemaining is < 0 or > ControlProtocolConstants.MaxActiveWorkRemaining)
         {
             throw new AppHostExecutionException("role-health-identity-mismatch");
+        }
+
+        return health.Status switch
+        {
+            "ready" => RoleHealthStatus.Ready,
+            "not-ready" => RoleHealthStatus.NotReady,
+            _ => throw new AppHostExecutionException("role-health-status-invalid"),
+        };
+    }
+
+    private static async Task<byte[]> ReadBoundedHealthBodyAsync(
+        HttpContent content,
+        CancellationToken cancellationToken)
+    {
+        await using var stream = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        using var buffer = new MemoryStream();
+        var chunk = new byte[1024];
+        while (true)
+        {
+            var read = await stream.ReadAsync(chunk, cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+            {
+                return buffer.ToArray();
+            }
+
+            if (buffer.Length + read > MaxHealthResponseBytes)
+            {
+                throw new AppHostExecutionException("role-health-malformed");
+            }
+
+            buffer.Write(chunk, 0, read);
+        }
+    }
+
+    private static async Task<bool> WatchForReadinessControlLossAsync(
+        WindowsControlChannel channel,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await channel.WaitForDisconnectAsync(cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (Exception)
+        {
+            return true;
+        }
+    }
+
+    private static async Task ObserveCanceledRequestAsync(Task<HttpResponseMessage> request)
+    {
+        try
+        {
+            using var response = await request.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception error) when (
+            error is not StackOverflowException and not OutOfMemoryException)
+        {
+        }
+    }
+
+    private static async Task ObserveCanceledDelayAsync(Task delay)
+    {
+        try
+        {
+            await delay.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private static async Task ObserveCanceledValidationAsync(Task<RoleHealthStatus> validation)
+    {
+        try
+        {
+            _ = await validation.ConfigureAwait(false);
+        }
+        catch (Exception error) when (
+            error is not StackOverflowException and not OutOfMemoryException)
+        {
         }
     }
 
@@ -885,6 +1289,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         LifecycleCommand command,
         CancellationToken cancellationToken)
     {
+        var stopwatch = Stopwatch.StartNew();
         var generation = command.Generation
             ?? throw new AppHostExecutionException("role-generation-missing");
         if (generation.Role is not (RuntimeRole.Server or RuntimeRole.Worker))
@@ -912,7 +1317,12 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         {
             await acceptTask.WaitAsync(reconciliationDeadline.Token).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (OperationCanceledException) when (
+            !cancellationToken.IsCancellationRequested &&
             !resource.RoleLifetimeCancellation.IsCancellationRequested &&
             reconciliationDeadline.IsCancellationRequested)
         {
@@ -937,7 +1347,31 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             return new Reconciled(generation, ReconciledState.Stopped);
         }
 
-        return new Reconciled(generation, ReconciledState.Running);
+        var remaining = _roleOperationDeadlines.Reconciliation - stopwatch.Elapsed;
+        if (remaining <= TimeSpan.Zero)
+        {
+            return new OperationTimedOut(generation, command.OperationId);
+        }
+
+        var readiness = await PollRoleReadinessAsync(
+            resource,
+            remaining,
+            cancellationToken).ConfigureAwait(false);
+        if (readiness == RoleReadinessOutcome.Ready)
+        {
+            resource.ReadinessConfirmed = true;
+            MonitorRole(resource);
+            return new Reconciled(generation, ReconciledState.Running);
+        }
+
+        if (readiness == RoleReadinessOutcome.TimedOut)
+        {
+            await RecordRoleReadinessTimeoutAsync(resource).ConfigureAwait(false);
+            return new OperationTimedOut(generation, command.OperationId);
+        }
+
+        await DisposeRoleAsync(resource).ConfigureAwait(false);
+        return new Reconciled(generation, ReconciledState.Stopped);
     }
 
     private async Task<LifecycleEvent> ReconcileRoleStopAsync(
@@ -1147,26 +1581,28 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
 
     private void MonitorRole(RoleResource resource)
     {
+        if (!resource.TryStartMonitoring())
+        {
+            return;
+        }
+
         var monitorToken = resource.MonitorCancellation.Token;
         _ = ObserveAsync(resource.Process.Completion, resource.Generation);
-        resource.ControlMonitor = ObserveControlAsync(resource, monitorToken);
+        resource.ControlMonitor = ObserveControlAsync(resource);
         resource.HealthMonitor = ObserveHealthAsync(resource, monitorToken);
     }
 
-    private async Task ObserveControlAsync(RoleResource resource, CancellationToken monitorToken)
+    private async Task ObserveControlAsync(RoleResource resource)
     {
-        try
+        var disconnected = await (resource.ControlDisconnectTask ??
+            throw new AppHostExecutionException("role-control-watch-missing")).ConfigureAwait(false);
+        if (disconnected && !resource.MonitorCancellation.IsCancellationRequested)
         {
-            while (true)
+            if (ControlMonitorDisconnectObservedForTests is { } observed)
             {
-                await resource.Channel.WaitForDisconnectAsync(monitorToken).ConfigureAwait(false);
+                await observed(resource.Generation.Role).ConfigureAwait(false);
             }
-        }
-        catch (OperationCanceledException) when (monitorToken.IsCancellationRequested)
-        {
-        }
-        catch (Exception) when (!monitorToken.IsCancellationRequested)
-        {
+
             if (EventSink is { } sink)
             {
                 _ = sink(new ControlDisconnected(resource.Generation), CancellationToken.None);
@@ -1181,13 +1617,22 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         {
             while (await timer.WaitForNextTickAsync(monitorToken).ConfigureAwait(false))
             {
-                using var http = new HttpClient { Timeout = ControlDeadline };
+                using var http = new HttpClient(
+                    _roleHealthMessageHandlerFactory(),
+                    disposeHandler: true)
+                {
+                    Timeout = ControlDeadline,
+                };
                 using var request = CreateHealthRequest(resource);
                 using var response = await http.SendAsync(request, monitorToken).ConfigureAwait(false);
-                await ValidateHealthResponseAsync(
+                var health = await ValidateHealthResponseAsync(
                     resource,
                     response,
                     monitorToken).ConfigureAwait(false);
+                if (health != RoleHealthStatus.Ready)
+                {
+                    throw new AppHostExecutionException("role-health-status-invalid");
+                }
             }
         }
         catch (OperationCanceledException) when (monitorToken.IsCancellationRequested)
@@ -1205,7 +1650,12 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     private static async Task StopMonitoringAsync(RoleResource resource)
     {
         resource.MonitorCancellation.Cancel();
-        var monitors = new[] { resource.ControlMonitor, resource.HealthMonitor }
+        var monitors = new[]
+            {
+                resource.ControlDisconnectTask,
+                resource.ControlMonitor,
+                resource.HealthMonitor,
+            }
             .Where(task => task is not null)
             .Cast<Task>();
         await Task.WhenAll(monitors).ConfigureAwait(false);
@@ -1442,6 +1892,20 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         ThrowCleanupErrors(errors);
     }
 
+    private enum RoleHealthStatus
+    {
+        Ready,
+        NotReady,
+    }
+
+    private enum RoleReadinessOutcome
+    {
+        Ready,
+        TimedOut,
+        ProcessExited,
+        ControlDisconnected,
+    }
+
     private sealed record RoleResource(
         ProcessGeneration Generation,
         Guid StartupOperationId,
@@ -1452,6 +1916,8 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     {
         private int _monitorCancellationDisposalStarted;
         private int _roleLifetimeCancellationDisposalStarted;
+        private int _monitoringStarted;
+        private int _readinessTimeoutRecorded;
 
         internal CancellationTokenSource MonitorCancellation { get; } = new();
 
@@ -1467,11 +1933,21 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
 
         internal Task? ControlMonitor { get; set; }
 
+        internal Task<bool>? ControlDisconnectTask { get; set; }
+
         internal Task? HealthMonitor { get; set; }
 
         internal bool Drained { get; set; }
 
         internal Guid? DrainOperationId { get; set; }
+
+        internal bool ReadinessConfirmed { get; set; }
+
+        internal bool TryStartMonitoring() =>
+            Interlocked.CompareExchange(ref _monitoringStarted, 1, 0) == 0;
+
+        internal bool TryRecordReadinessTimeout() =>
+            Interlocked.CompareExchange(ref _readinessTimeoutRecorded, 1, 0) == 0;
 
         internal void DisposeMonitorCancellationWhenQuiescent()
         {
@@ -1488,7 +1964,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             try
             {
                 await Task.WhenAll(
-                    new[] { ControlMonitor, HealthMonitor }
+                    new Task?[] { ControlDisconnectTask, ControlMonitor, HealthMonitor }
                         .Where(task => task is not null)
                         .Cast<Task>()).ConfigureAwait(false);
             }

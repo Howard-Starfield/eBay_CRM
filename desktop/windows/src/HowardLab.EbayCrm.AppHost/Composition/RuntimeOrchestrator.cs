@@ -33,6 +33,8 @@ public sealed class RuntimeOrchestrator : IAsyncDisposable
 
     internal Exception? LastFatalExceptionForTests { get; private set; }
 
+    internal string? FatalReasonForTests { get; private set; }
+
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
@@ -352,6 +354,7 @@ public sealed class RuntimeOrchestrator : IAsyncDisposable
         string reasonCode,
         List<Exception> failures)
     {
+        FatalReasonForTests = reasonCode;
         using var escalationCleanup = new CancellationTokenSource(TimeSpan.FromSeconds(1));
         await CaptureFatalCleanupAsync(
             new LifecycleCommand(

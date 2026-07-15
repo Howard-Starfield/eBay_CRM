@@ -639,6 +639,35 @@ public sealed class LifecycleCoordinatorTests
     }
 
     [Theory]
+    [InlineData(RuntimeRole.Server, RuntimeState.WaitingForServer)]
+    [InlineData(RuntimeRole.Worker, RuntimeState.WaitingForWorker)]
+    public async Task RoleReadinessTimeoutEntersStartReconciliation(
+        RuntimeRole role,
+        RuntimeState waitingState)
+    {
+        var harness = await CoordinatorHarness.AtRoleStartAsync(role);
+        var generation = harness.Coordinator.CurrentGeneration(role);
+        var waiting = await harness.Coordinator.DispatchAsync(new RoleStarted(generation));
+        Assert.Equal(waitingState, waiting.Current);
+
+        var timeout = await harness.Coordinator.DispatchAsync(
+            new OperationTimedOut(generation, generation.OperationId));
+
+        Assert.Equal(RuntimeState.ReconcilingRoleStart, timeout.Current);
+        var reconcile = Assert.Single(timeout.Commands);
+        Assert.Equal(LifecycleCommandType.ReconcileRoleStart, reconcile.Type);
+        Assert.Equal(generation, reconcile.Generation);
+        Assert.Equal(LifecycleDeadlineKey.RoleReconciliation, reconcile.DeadlineKey);
+
+        var exhausted = await harness.Coordinator.DispatchAsync(
+            new OperationTimedOut(generation, generation.OperationId));
+        Assert.Equal(RuntimeState.Faulted, exhausted.Current);
+        var enterFault = Assert.Single(exhausted.Commands);
+        Assert.Equal(LifecycleCommandType.EnterFault, enterFault.Type);
+        Assert.Equal("RoleStartReconciliationTimedOut", enterFault.ReasonCode);
+    }
+
+    [Theory]
     [InlineData(RuntimeRole.Server, RuntimeState.StartingServer, LifecycleCommandType.StartServer, LifecycleDeadlineKey.ServerStart)]
     [InlineData(RuntimeRole.Worker, RuntimeState.StartingWorker, LifecycleCommandType.StartWorker, LifecycleDeadlineKey.WorkerStart)]
     public async Task LateRoleStartReconciledStoppedUsesBoundedRestartAndCreatesOneGeneration(

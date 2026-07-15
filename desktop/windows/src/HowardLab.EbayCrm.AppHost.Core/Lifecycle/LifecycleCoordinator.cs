@@ -441,8 +441,10 @@ public sealed class LifecycleCoordinator
 
     private TransitionResult RoleTimeout(RuntimeState previous, OperationTimedOut @event)
     {
-        var startStateMatches = (@event.Value.Role == RuntimeRole.Server && State == RuntimeState.StartingServer)
-            || (@event.Value.Role == RuntimeRole.Worker && State == RuntimeState.StartingWorker);
+        var startStateMatches = (@event.Value.Role == RuntimeRole.Server &&
+                State is RuntimeState.StartingServer or RuntimeState.WaitingForServer)
+            || (@event.Value.Role == RuntimeRole.Worker &&
+                State is RuntimeState.StartingWorker or RuntimeState.WaitingForWorker);
         if (startStateMatches)
         {
             BeginRoleReconciliation(@event.Value, RoleReconciliationKind.Start);

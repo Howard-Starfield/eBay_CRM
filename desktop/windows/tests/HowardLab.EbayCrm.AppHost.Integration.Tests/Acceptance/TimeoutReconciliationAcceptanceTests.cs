@@ -34,6 +34,38 @@ public sealed class TimeoutReconciliationAcceptanceTests
             executor.Commands.IndexOf(LifecycleCommandType.ReleaseInstance));
     }
 
+    [Fact, Trait("Category", "Acceptance")]
+    public async Task ExhaustedRoleReadinessReconciliation_ContainsWithoutRelaunchOrRollback()
+    {
+        var executor = new ExhaustedRoleReadinessReconciliationExecutor();
+        var coordinator = new LifecycleCoordinator(
+            new SystemClock(),
+            new RestartBudget(3, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(5)));
+        await using var orchestrator = new RuntimeOrchestrator(coordinator, executor);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => orchestrator.StartAsync());
+
+        Assert.Equal(RuntimeState.Faulted, orchestrator.State);
+        Assert.Equal(0, executor.RollbackCount);
+        Assert.Equal(1, executor.Commands.Count(command => command.Type == LifecycleCommandType.StartServer));
+        Assert.Equal(1, executor.Commands.Count(command => command.Type == LifecycleCommandType.WaitForServer));
+        Assert.Equal(1, executor.Commands.Count(command => command.Type == LifecycleCommandType.ReconcileRoleStart));
+        Assert.Equal(1, executor.Commands.Count(command => command.Type == LifecycleCommandType.EscalateJob));
+        Assert.Equal(1, executor.Commands.Count(command => command.Type == LifecycleCommandType.ReleaseInstance));
+        var serverCommands = executor.Commands
+            .Where(command => command.Generation?.Role == RuntimeRole.Server)
+            .ToArray();
+        Assert.NotEmpty(serverCommands);
+        Assert.Single(serverCommands.Select(command => command.Generation).Distinct());
+        Assert.DoesNotContain(
+            orchestrator.StateHistory.SkipWhile(state => state != RuntimeState.WaitingForServer),
+            state => state == RuntimeState.StartingServer);
+        Assert.Equal(
+            "role-start-reconciliation-timed-out",
+            orchestrator.FatalReasonForTests);
+        Assert.False(executor.RoleRetained);
+    }
+
     [PostgresTheory, Trait("Category", "Acceptance")]
     [InlineData(RuntimeRole.Server)]
     [InlineData(RuntimeRole.Worker)]
@@ -47,7 +79,9 @@ public sealed class TimeoutReconciliationAcceptanceTests
             roleOperationDeadlines: new RoleOperationDeadlines(
                 TimeSpan.FromMilliseconds(1),
                 TimeSpan.FromSeconds(5),
-                TimeSpan.FromSeconds(30)));
+                TimeSpan.FromSeconds(30),
+                TimeSpan.FromSeconds(30),
+                TimeSpan.FromMilliseconds(25)));
         runtime.Executor.RoleLaunchedForTests = boundary.RecordLaunched;
         try
         {
@@ -94,7 +128,9 @@ public sealed class TimeoutReconciliationAcceptanceTests
             new RoleOperationDeadlines(
                 TimeSpan.FromSeconds(30),
                 TimeSpan.FromSeconds(5),
-                TimeSpan.FromSeconds(30)));
+                TimeSpan.FromSeconds(30),
+                TimeSpan.FromSeconds(30),
+                TimeSpan.FromMilliseconds(25)));
         using var cancellation = new CancellationTokenSource();
         try
         {
@@ -146,7 +182,9 @@ public sealed class TimeoutReconciliationAcceptanceTests
             new RoleOperationDeadlines(
                 TimeSpan.FromMilliseconds(1),
                 TimeSpan.FromSeconds(5),
-                TimeSpan.FromSeconds(5)));
+                TimeSpan.FromSeconds(5),
+                TimeSpan.FromSeconds(30),
+                TimeSpan.FromMilliseconds(25)));
         try
         {
             var generation = new ProcessGeneration(RuntimeRole.Worker, 1, Guid.NewGuid());
@@ -191,7 +229,9 @@ public sealed class TimeoutReconciliationAcceptanceTests
             new RoleOperationDeadlines(
                 TimeSpan.FromMilliseconds(1),
                 TimeSpan.FromSeconds(5),
-                TimeSpan.FromSeconds(20)));
+                TimeSpan.FromSeconds(20),
+                TimeSpan.FromSeconds(30),
+                TimeSpan.FromMilliseconds(25)));
         harness.FixtureRoleLaunchPlanProvider.WorkerModeForTests = "pipe-timeout";
         var generation = new ProcessGeneration(RuntimeRole.Worker, 1, Guid.NewGuid());
         var start = new LifecycleCommand(
@@ -407,7 +447,8 @@ internal sealed class RoleExecutorHarness : IAsyncDisposable
 
     internal static RoleExecutorHarness Create(
         IRoleOperationBoundary boundary,
-        RoleOperationDeadlines deadlines)
+        RoleOperationDeadlines deadlines,
+        Func<HttpMessageHandler>? roleHealthMessageHandlerFactory = null)
     {
         var profileRoot = Path.Combine(
             Path.GetTempPath(),
@@ -452,7 +493,8 @@ internal sealed class RoleExecutorHarness : IAsyncDisposable
             new OwnershipGatedDiagnosticSink(sink, TimeSpan.FromSeconds(1)),
             secrets,
             diagnosticSecretObserver: null,
-            roleLaunchPlanProvider);
+            roleLaunchPlanProvider,
+            roleHealthMessageHandlerFactory: roleHealthMessageHandlerFactory);
         var harness = new RoleExecutorHarness(profileRoot, executor, roleLaunchPlanProvider);
         executor.RoleLaunchedForTests = boundary is BlockingRoleOperationBoundary blocking
             ? blocking.RecordLaunched
@@ -504,6 +546,58 @@ internal sealed class ExhaustedRoleStartReconciliationExecutor : ILifecycleComma
     }
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+internal sealed class ExhaustedRoleReadinessReconciliationExecutor : ILifecycleCommandExecutor
+{
+    internal List<LifecycleCommand> Commands { get; } = [];
+
+    internal int RollbackCount { get; private set; }
+
+    internal bool RoleRetained { get; private set; }
+
+    public Task<LifecycleEvent?> ExecuteAsync(
+        LifecycleCommand command,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Commands.Add(command);
+        LifecycleEvent? result = command.Type switch
+        {
+            LifecycleCommandType.AcquireInstance => new InstanceAcquired(command.OperationId),
+            LifecycleCommandType.ValidatePayload => new PayloadValidated(command.OperationId),
+            LifecycleCommandType.PrepareRuntime => new RuntimePrepared(command.OperationId),
+            LifecycleCommandType.StartDatabase => new RoleStarted(command.Generation!.Value),
+            LifecycleCommandType.WaitForDatabase => new RoleReady(command.Generation!.Value),
+            LifecycleCommandType.RunMigrations => new MigrationCompleted(command.OperationId),
+            LifecycleCommandType.StartServer => RetainAndStart(command.Generation!.Value),
+            LifecycleCommandType.WaitForServer => new OperationTimedOut(command.Generation!.Value, command.OperationId),
+            LifecycleCommandType.ReconcileRoleStart => new OperationTimedOut(command.Generation!.Value, command.OperationId),
+            LifecycleCommandType.EscalateJob => ReleaseRole(),
+            _ => null,
+        };
+        return Task.FromResult(result);
+    }
+
+    public Task RollbackAsync(Guid operationId, CancellationToken cancellationToken = default)
+    {
+        RollbackCount++;
+        return Task.CompletedTask;
+    }
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+    private LifecycleEvent RetainAndStart(ProcessGeneration generation)
+    {
+        RoleRetained = true;
+        return new RoleStarted(generation);
+    }
+
+    private LifecycleEvent? ReleaseRole()
+    {
+        RoleRetained = false;
+        return null;
+    }
 }
 
 internal sealed class BlockingRoleOperationBoundary(

@@ -46,7 +46,9 @@ public sealed class AppHostShutdownTests
             roleOperationDeadlines: new RoleOperationDeadlines(
                 TimeSpan.FromSeconds(10),
                 TimeSpan.FromMilliseconds(1),
-                TimeSpan.FromSeconds(30)));
+                TimeSpan.FromSeconds(30),
+                TimeSpan.FromSeconds(30),
+                TimeSpan.FromMilliseconds(25)));
         runtime.Executor.RoleLaunchedForTests = boundary.RecordLaunched;
         ProcessIdentitySnapshot? databaseIdentity = null;
         try
