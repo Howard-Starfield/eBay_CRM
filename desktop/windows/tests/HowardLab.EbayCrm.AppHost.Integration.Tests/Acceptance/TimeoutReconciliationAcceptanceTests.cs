@@ -192,7 +192,7 @@ public sealed class TimeoutReconciliationAcceptanceTests
                 TimeSpan.FromMilliseconds(1),
                 TimeSpan.FromSeconds(5),
                 TimeSpan.FromSeconds(20)));
-        harness.Executor.WorkerFixtureModeForTests = "pipe-timeout";
+        harness.FixtureRoleLaunchPlanProvider.WorkerModeForTests = "pipe-timeout";
         var generation = new ProcessGeneration(RuntimeRole.Worker, 1, Guid.NewGuid());
         var start = new LifecycleCommand(
             LifecycleCommandType.StartWorker,
@@ -391,13 +391,19 @@ internal sealed class RoleExecutorHarness : IAsyncDisposable
 {
     private readonly string _profileRoot;
 
-    private RoleExecutorHarness(string profileRoot, LifecycleCommandExecutor executor)
+    private RoleExecutorHarness(
+        string profileRoot,
+        LifecycleCommandExecutor executor,
+        FixtureRoleLaunchPlanProvider fixtureRoleLaunchPlanProvider)
     {
         _profileRoot = profileRoot;
         Executor = executor;
+        FixtureRoleLaunchPlanProvider = fixtureRoleLaunchPlanProvider;
     }
 
     internal LifecycleCommandExecutor Executor { get; }
+
+    internal FixtureRoleLaunchPlanProvider FixtureRoleLaunchPlanProvider { get; }
 
     internal static RoleExecutorHarness Create(
         IRoleOperationBoundary boundary,
@@ -436,6 +442,7 @@ internal sealed class RoleExecutorHarness : IAsyncDisposable
             (_, _) => ValueTask.FromResult<Stream>(Stream.Null),
             new SystemClock(),
             secrets);
+        var roleLaunchPlanProvider = new FixtureRoleLaunchPlanProvider(options, payload);
         var executor = new LifecycleCommandExecutor(
             options,
             payload,
@@ -444,8 +451,9 @@ internal sealed class RoleExecutorHarness : IAsyncDisposable
             deadlines,
             new OwnershipGatedDiagnosticSink(sink, TimeSpan.FromSeconds(1)),
             secrets,
-            diagnosticSecretObserver: null);
-        var harness = new RoleExecutorHarness(profileRoot, executor);
+            diagnosticSecretObserver: null,
+            roleLaunchPlanProvider);
+        var harness = new RoleExecutorHarness(profileRoot, executor, roleLaunchPlanProvider);
         executor.RoleLaunchedForTests = boundary is BlockingRoleOperationBoundary blocking
             ? blocking.RecordLaunched
             : null;

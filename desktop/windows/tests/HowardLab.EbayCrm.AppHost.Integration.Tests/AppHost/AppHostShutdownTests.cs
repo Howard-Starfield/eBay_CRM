@@ -115,7 +115,7 @@ public sealed class AppHostShutdownTests
             TimeSpan.FromMilliseconds(60),
             TimeSpan.FromMilliseconds(120));
         var runtime = AppHostComposition.CreateForTests(options, budget);
-        runtime.Executor.WorkerFixtureModeForTests = "ignore-shutdown";
+        runtime.FixtureRoleLaunchPlanProvider.WorkerModeForTests = "ignore-shutdown";
         try
         {
             await runtime.Orchestrator.StartAsync().WaitAsync(TimeSpan.FromMinutes(2));
@@ -157,7 +157,7 @@ public sealed class AppHostShutdownTests
                 TimeSpan.FromMilliseconds(120),
                 TimeSpan.FromMilliseconds(60),
                 TimeSpan.FromMilliseconds(120)));
-        runtime.Executor.WorkerFixtureModeForTests = "ignore-shutdown";
+        runtime.FixtureRoleLaunchPlanProvider.WorkerModeForTests = "ignore-shutdown";
         runtime.Executor.RoleLaunchedForTests =
             LifecycleCommandExecutor.RetainWorkerJobHandleInRoleForTests;
         try

@@ -2,7 +2,7 @@ using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Json;
-using System.Net.Sockets;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using HowardLab.EbayCrm.AppHost.Core.Diagnostics;
 using HowardLab.EbayCrm.AppHost.Core.Migrations;
@@ -39,12 +39,13 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     private readonly AppHostOptions _options;
     private readonly ValidatedAppHostPayload _payload;
     private readonly IProfileRuntimeIdentityStore _identityStore;
-    private readonly WindowsProcessLauncher _launcher;
+    private readonly IProcessLauncher _launcher;
     private readonly OwnershipGatedDiagnosticSink _diagnosticSink;
     private readonly DiagnosticSecretRegistry _diagnosticSecrets;
     private readonly Action<SecretValue>? _diagnosticSecretObserver;
     private readonly IRoleOperationBoundary _roleOperationBoundary;
     private readonly RoleOperationDeadlines _roleOperationDeadlines;
+    private readonly IRoleLaunchPlanProvider _roleLaunchPlanProvider;
     private UserProfileInstanceLock? _instanceLock;
     private Guid? _instanceOperationId;
     private ProfileRuntimeIdentity? _profileIdentity;
@@ -54,14 +55,14 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     private Guid? _databaseOperationId;
     private RoleResource? _server;
     private RoleResource? _worker;
-    private string? _workerFixtureModeForTests;
     private int _disposed;
     private int _faultDiagnosticWritten;
     private int _releaseInstanceCountForTests;
 
-    public LifecycleCommandExecutor(
+    internal LifecycleCommandExecutor(
         AppHostOptions options,
         ValidatedAppHostPayload payload,
+        IRoleLaunchPlanProvider roleLaunchPlanProvider,
         IProfileRuntimeIdentityStore? identityStore = null)
         : this(
             options,
@@ -69,7 +70,8 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             identityStore,
             NoopRoleOperationBoundary.Instance,
             RoleOperationDeadlines.Production,
-            CreateFallbackDiagnosticComposition())
+            CreateFallbackDiagnosticComposition(),
+            roleLaunchPlanProvider)
     {
     }
 
@@ -79,7 +81,8 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         IProfileRuntimeIdentityStore? identityStore,
         IRoleOperationBoundary roleOperationBoundary,
         RoleOperationDeadlines roleOperationDeadlines,
-        DiagnosticComposition diagnostics)
+        DiagnosticComposition diagnostics,
+        IRoleLaunchPlanProvider roleLaunchPlanProvider)
         : this(
             options,
             payload,
@@ -88,7 +91,8 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             roleOperationDeadlines,
             diagnostics.Sink,
             diagnostics.Registry,
-            diagnosticSecretObserver: null)
+            diagnosticSecretObserver: null,
+            roleLaunchPlanProvider)
     {
     }
 
@@ -100,7 +104,9 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         RoleOperationDeadlines roleOperationDeadlines,
         OwnershipGatedDiagnosticSink diagnosticSink,
         DiagnosticSecretRegistry diagnosticSecrets,
-        Action<SecretValue>? diagnosticSecretObserver)
+        Action<SecretValue>? diagnosticSecretObserver,
+        IRoleLaunchPlanProvider roleLaunchPlanProvider,
+        IProcessLauncher? launcher = null)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _payload = payload ?? throw new ArgumentNullException(nameof(payload));
@@ -110,16 +116,12 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         _diagnosticSink = diagnosticSink ?? throw new ArgumentNullException(nameof(diagnosticSink));
         _diagnosticSecrets = diagnosticSecrets ?? throw new ArgumentNullException(nameof(diagnosticSecrets));
         _diagnosticSecretObserver = diagnosticSecretObserver;
-        _launcher = new WindowsProcessLauncher(_diagnosticSink);
+        _roleLaunchPlanProvider = roleLaunchPlanProvider ??
+            throw new ArgumentNullException(nameof(roleLaunchPlanProvider));
+        _launcher = launcher ?? new WindowsProcessLauncher(_diagnosticSink);
     }
 
     public Func<LifecycleEvent, CancellationToken, Task>? EventSink { get; set; }
-
-    internal string? WorkerFixtureModeForTests
-    {
-        get => _workerFixtureModeForTests;
-        set => _workerFixtureModeForTests = value;
-    }
 
     internal Action<RuntimeRole, WindowsJobObject, WindowsSupervisedProcess>? RoleLaunchedForTests { get; set; }
 
@@ -411,10 +413,22 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         CancellationToken cancellationToken)
     {
         var generation = command.Generation
-            ?? throw new AppHostExecutionException("fixture-generation-missing");
+            ?? throw new AppHostExecutionException("role-generation-missing");
         if (generation.Role is not (RuntimeRole.Server or RuntimeRole.Worker))
         {
-            throw new AppHostExecutionException("fixture-role-invalid");
+            throw new AppHostExecutionException("role-invalid");
+        }
+
+        var request = new RoleLaunchRequest(generation.Role, generation);
+        RoleLaunchPlan plan;
+        try
+        {
+            plan = _roleLaunchPlanProvider.Create(request);
+            plan.ValidateFor(request);
+        }
+        catch (Exception)
+        {
+            throw new AppHostExecutionException("role-launch-plan-invalid");
         }
 
         await DisposeRoleAsync(generation.Role).ConfigureAwait(false);
@@ -422,7 +436,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             generation.Role,
             generation.Value,
             generation.OperationId,
-            _payload.FixtureBuildIdentity,
+            plan.BuildIdentity,
             ControlDeadline);
         var job = WindowsJobObject.CreateKillOnClose();
         ISupervisedProcess? process = null;
@@ -430,44 +444,57 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         try
         {
             var child = channel.CreateChildEnvironment();
-            foreach (var secret in child.SecretEnvironment.Values)
+            var environment = new Dictionary<string, string>(plan.Environment, StringComparer.OrdinalIgnoreCase);
+            var secretEnvironment = new Dictionary<string, SecretValue>(
+                plan.SecretEnvironment,
+                StringComparer.OrdinalIgnoreCase);
+            foreach (var pair in child.Environment)
+            {
+                if (!environment.TryAdd(pair.Key, pair.Value))
+                {
+                    throw new AppHostExecutionException("role-launch-plan-invalid");
+                }
+            }
+
+            foreach (var pair in child.SecretEnvironment)
+            {
+                if (environment.ContainsKey(pair.Key) ||
+                    !secretEnvironment.TryAdd(pair.Key, pair.Value))
+                {
+                    throw new AppHostExecutionException("role-launch-plan-invalid");
+                }
+            }
+
+            foreach (var secret in secretEnvironment.Values)
             {
                 RegisterDiagnosticSecret(secret);
             }
 
-            var environment = new Dictionary<string, string>(child.Environment, StringComparer.Ordinal)
-            {
-                ["SystemRoot"] = Environment.GetEnvironmentVariable("SystemRoot")
-                    ?? throw new AppHostExecutionException("system-root-unavailable"),
-            };
-            var healthPort = ReserveLoopbackPort();
-            var testFixtureMode = generation.Role == RuntimeRole.Worker
-                ? Interlocked.Exchange(ref _workerFixtureModeForTests, null)
-                : null;
-            var fixtureMode = testFixtureMode is not null
-                ? testFixtureMode
-                : generation.Role.ToString().ToLowerInvariant();
             var specification = new LaunchSpecification(
                 generation.Role,
                 generation,
-                _options.FixturePath,
-                [fixtureMode, healthPort.ToString(CultureInfo.InvariantCulture)],
-                Path.GetDirectoryName(_options.FixturePath)!,
+                plan.ApplicationPath,
+                plan.Arguments,
+                plan.WorkingDirectory,
                 environment,
-                child.SecretEnvironment,
-                TimeSpan.FromMilliseconds(100));
-            using var fixtureLease = AppHostComposition.OpenTrustedFixtureArtifacts(_options.FixturePath);
-            process = await _launcher.LaunchAsync(specification, job, cancellationToken).ConfigureAwait(false);
+                secretEnvironment,
+                plan.OutputDrainTimeout);
+            process = await LaunchWithArtifactLeaseAsync(
+                plan,
+                specification,
+                job,
+                cancellationToken).ConfigureAwait(false);
+
             if (process is not WindowsSupervisedProcess windowsProcess)
             {
-                throw new AppHostExecutionException("fixture-process-type-invalid");
+                throw new AppHostExecutionException("role-process-type-invalid");
             }
 
             RoleLaunchedForTests?.Invoke(generation.Role, job, windowsProcess);
             resource = new RoleResource(
                 generation,
                 command.OperationId,
-                healthPort,
+                plan.HealthPort!.Value,
                 process,
                 channel,
                 job);
@@ -508,6 +535,76 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
     }
 
+    private async ValueTask<ISupervisedProcess> LaunchWithArtifactLeaseAsync(
+        RoleLaunchPlan plan,
+        LaunchSpecification specification,
+        WindowsJobObject job,
+        CancellationToken cancellationToken)
+    {
+        IDisposable? artifactLease;
+        try
+        {
+            artifactLease = plan.OpenBootstrapArtifactLease();
+        }
+        catch (AppHostOptionsException error)
+        {
+            throw new AppHostExecutionException(error.ReasonCode);
+        }
+        catch (Exception)
+        {
+            throw new AppHostExecutionException("role-payload-trust-failed");
+        }
+
+        if (artifactLease is null)
+        {
+            throw new AppHostExecutionException("role-launch-plan-invalid");
+        }
+
+        ISupervisedProcess? launchedProcess = null;
+        ExceptionDispatchInfo? launchFailure = null;
+        try
+        {
+            launchedProcess = await _launcher.LaunchAsync(
+                specification,
+                job,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception error)
+        {
+            launchFailure = ExceptionDispatchInfo.Capture(error);
+        }
+
+        try
+        {
+            artifactLease.Dispose();
+        }
+        catch (Exception) when (launchFailure is not null)
+        {
+            // Launch/cancellation is the authoritative failure. Lease details
+            // are untrusted and must not replace or decorate that exception.
+        }
+        catch (Exception)
+        {
+            if (launchedProcess is not null)
+            {
+                try
+                {
+                    await launchedProcess.DisposeAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                    // The enclosing role job remains the cleanup authority.
+                }
+            }
+
+            throw new AppHostExecutionException("role-payload-trust-failed");
+        }
+
+        launchFailure?.Throw();
+        return launchedProcess
+            ?? throw new AppHostExecutionException("role-process-type-invalid");
+    }
+
     private async Task AcceptRoleAsync(RoleResource resource)
     {
         var roleLifetimeToken = resource.RoleLifetimeCancellation.Token;
@@ -530,11 +627,11 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         CancellationToken cancellationToken)
     {
         var generation = command.Generation
-            ?? throw new AppHostExecutionException("fixture-generation-missing");
+            ?? throw new AppHostExecutionException("role-generation-missing");
         var resource = GetRole(generation.Role);
         if (resource.Generation != generation || resource.Process.Completion.IsCompleted)
         {
-            throw new AppHostExecutionException("fixture-retained-identity-mismatch");
+            throw new AppHostExecutionException("role-retained-identity-mismatch");
         }
 
         using var http = new HttpClient { Timeout = ControlDeadline };
@@ -555,7 +652,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         var health = await response.Content.ReadFromJsonAsync<HealthPayload>(
             ControlFrameCodec.SerializerOptions,
             cancellationToken).ConfigureAwait(false)
-            ?? throw new AppHostExecutionException("fixture-health-empty");
+            ?? throw new AppHostExecutionException("role-health-empty");
         var endpoint = resource.Channel.EndpointIdentity;
         if (health.ProtocolVersion != ControlProtocolConstants.CurrentVersion ||
             health.BuildIdentity != endpoint.ExpectedBuildIdentity ||
@@ -563,7 +660,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             health.GenerationNonce != endpoint.CapabilityNonce ||
             health.Status != "ready")
         {
-            throw new AppHostExecutionException("fixture-health-identity-mismatch");
+            throw new AppHostExecutionException("role-health-identity-mismatch");
         }
     }
 
@@ -648,7 +745,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         if (resource.Generation.Role != commandGeneration.Role ||
             resource.Generation.Value != commandGeneration.Value)
         {
-            throw new AppHostExecutionException("fixture-retained-identity-mismatch");
+            throw new AppHostExecutionException("role-retained-identity-mismatch");
         }
 
         await StopMonitoringAsync(resource).ConfigureAwait(false);
@@ -670,7 +767,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         var accepted = await resource.Channel.ReadAsync(cancellationToken).ConfigureAwait(false);
         if (accepted.Type != ControlMessageType.ShutdownAccepted || accepted.OperationId != command.OperationId)
         {
-            throw new AppHostExecutionException("fixture-shutdown-sequence-invalid");
+            throw new AppHostExecutionException("role-shutdown-sequence-invalid");
         }
 
         resource.ShutdownOperationId = command.OperationId;
@@ -703,7 +800,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         var stopped = await stoppedTask.ConfigureAwait(false);
         if (stopped.Type != ControlMessageType.Stopped || stopped.OperationId != operationId)
         {
-            throw new AppHostExecutionException("fixture-shutdown-sequence-invalid");
+            throw new AppHostExecutionException("role-shutdown-sequence-invalid");
         }
 
         _ = await resource.Process.Completion.WaitAsync(roleLifetimeToken).ConfigureAwait(false);
@@ -789,10 +886,10 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         CancellationToken cancellationToken)
     {
         var generation = command.Generation
-            ?? throw new AppHostExecutionException("fixture-generation-missing");
+            ?? throw new AppHostExecutionException("role-generation-missing");
         if (generation.Role is not (RuntimeRole.Server or RuntimeRole.Worker))
         {
-            throw new AppHostExecutionException("fixture-role-invalid");
+            throw new AppHostExecutionException("role-invalid");
         }
 
         var resource = generation.Role == RuntimeRole.Server ? _server : _worker;
@@ -802,7 +899,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
 
         var acceptTask = resource.AcceptTask
-            ?? throw new AppHostExecutionException("fixture-accept-task-missing");
+            ?? throw new AppHostExecutionException("role-accept-task-missing");
         if (resource.Process.Completion.IsCompleted)
         {
             await DisposeRoleAsync(resource).ConfigureAwait(false);
@@ -848,10 +945,10 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         CancellationToken cancellationToken)
     {
         var generation = command.Generation
-            ?? throw new AppHostExecutionException("fixture-generation-missing");
+            ?? throw new AppHostExecutionException("role-generation-missing");
         if (generation.Role is not (RuntimeRole.Server or RuntimeRole.Worker))
         {
-            throw new AppHostExecutionException("fixture-role-invalid");
+            throw new AppHostExecutionException("role-invalid");
         }
 
         var resource = generation.Role == RuntimeRole.Server ? _server : _worker;
@@ -864,11 +961,11 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
 
         if (resource.ShutdownOperationId != command.OperationId)
         {
-            throw new AppHostExecutionException("fixture-shutdown-operation-mismatch");
+            throw new AppHostExecutionException("role-shutdown-operation-mismatch");
         }
 
         var stopCompletionTask = resource.StopCompletionTask
-            ?? throw new AppHostExecutionException("fixture-stop-task-missing");
+            ?? throw new AppHostExecutionException("role-stop-task-missing");
         using var reconciliationDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         reconciliationDeadline.CancelAfter(_roleOperationDeadlines.Reconciliation);
         try
@@ -951,7 +1048,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             if (!termination.Succeeded)
             {
                 errors.Add(new AppHostExecutionException(
-                    $"fixture-job-termination-failed-{termination.ErrorCode.ToString(CultureInfo.InvariantCulture)}"));
+                    $"role-job-termination-failed-{termination.ErrorCode.ToString(CultureInfo.InvariantCulture)}"));
             }
         }
         foreach (var resource in new[] { worker, server }.Where(value => value is not null).Cast<RoleResource>())
@@ -971,7 +1068,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
                 }
                 else
                 {
-                    throw new AppHostExecutionException("fixture-process-type-invalid");
+                    throw new AppHostExecutionException("role-process-type-invalid");
                 }
             }
             catch (Exception error)
@@ -1100,7 +1197,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         {
             if (EventSink is { } sink)
             {
-                _ = sink(new HealthFailed(resource.Generation, "fixture-health-monitor-failed"), CancellationToken.None);
+                _ = sink(new HealthFailed(resource.Generation, "role-health-monitor-failed"), CancellationToken.None);
             }
         }
     }
@@ -1263,7 +1360,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     {
         RuntimeRole.Server => _server ?? throw new AppHostExecutionException("server-resource-missing"),
         RuntimeRole.Worker => _worker ?? throw new AppHostExecutionException("worker-resource-missing"),
-        _ => throw new AppHostExecutionException("fixture-role-invalid"),
+        _ => throw new AppHostExecutionException("role-invalid"),
     };
 
     private void SetRole(RoleResource resource)
@@ -1305,20 +1402,6 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             generation.Value,
             type,
             JsonSerializer.SerializeToElement(new { }, ControlFrameCodec.SerializerOptions));
-
-    private static int ReserveLoopbackPort()
-    {
-        var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        try
-        {
-            return ((IPEndPoint)listener.LocalEndpoint).Port;
-        }
-        finally
-        {
-            listener.Stop();
-        }
-    }
 
     private void RegisterDiagnosticSecret(SecretValue secret)
     {

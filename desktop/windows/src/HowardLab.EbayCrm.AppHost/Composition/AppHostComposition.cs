@@ -109,6 +109,7 @@ public static class AppHostComposition
         var ownedDiagnosticSink = new OwnershipGatedDiagnosticSink(
             diagnosticSink,
             diagnosticCompletionBudget ?? TimeSpan.FromSeconds(1));
+        var roleLaunchPlanProvider = new FixtureRoleLaunchPlanProvider(options, validated);
         var executor = new LifecycleCommandExecutor(
             options,
             validated,
@@ -117,10 +118,11 @@ public static class AppHostComposition
             roleOperationDeadlines,
             ownedDiagnosticSink,
             secretRegistry,
-            diagnosticSecretObserver);
+            diagnosticSecretObserver,
+            roleLaunchPlanProvider);
         var orchestrator = new RuntimeOrchestrator(coordinator, executor, shutdownBudget);
         executor.EventSink = orchestrator.HandleEventAsync;
-        return new AppHostTestRuntime(orchestrator, executor);
+        return new AppHostTestRuntime(orchestrator, executor, roleLaunchPlanProvider);
     }
 
     public static Task<AppHostProbeResult> ProbeAsync(
@@ -325,7 +327,8 @@ public static class AppHostComposition
 
 internal sealed record AppHostTestRuntime(
     RuntimeOrchestrator Orchestrator,
-    LifecycleCommandExecutor Executor);
+    LifecycleCommandExecutor Executor,
+    FixtureRoleLaunchPlanProvider FixtureRoleLaunchPlanProvider);
 
 internal sealed class OwnershipGatedDiagnosticSink : IDiagnosticSink
 {
