@@ -25,6 +25,8 @@ public enum LifecycleCommandType
     StopDatabaseFast,
     ReconcileDatabaseStart,
     ReconcileDatabaseStop,
+    ReconcileRoleStart,
+    ReconcileRoleStop,
     ReleaseInstance,
     EscalateJob,
     EnterFault,
@@ -48,4 +50,5 @@ public enum LifecycleDeadlineKey
     ServerStop,
     DatabaseStop,
     DatabaseReconciliation,
+    RoleReconciliation,
 }

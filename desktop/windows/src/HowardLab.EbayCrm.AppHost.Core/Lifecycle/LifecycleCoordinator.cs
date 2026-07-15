@@ -14,6 +14,8 @@ public sealed class LifecycleCoordinator
     private readonly HashSet<FailureKey> _failures = [];
     private readonly HashSet<ProcessGeneration> _requestedExits = [];
     private Guid _currentOperationId;
+    private ProcessGeneration? _reconcilingRole;
+    private RoleReconciliationKind? _roleReconciliationKind;
     private bool _stopAccepted;
     private bool _faultEmitted;
 
@@ -90,6 +92,7 @@ public sealed class LifecycleCoordinator
             return Ignored(previous, "AlreadyStarted");
         }
 
+        ClearRoleReconciliation();
         _currentOperationId = @event.OperationId;
         State = RuntimeState.AcquiringInstance;
         return Accepted(previous, Command(LifecycleCommandType.AcquireInstance, null, @event.OperationId, LifecycleDeadlineKey.InstanceAcquisition));
@@ -108,6 +111,7 @@ public sealed class LifecycleCoordinator
         }
 
         _stopAccepted = true;
+        ClearRoleReconciliation();
         _currentOperationId = @event.OperationId;
         RetargetOwnedGenerations(@event.OperationId);
         var commands = new List<LifecycleCommand>();
@@ -197,6 +201,11 @@ public sealed class LifecycleCoordinator
             return Ignored(previous, "UnexpectedEvent");
         }
 
+        return WaitForRoleAfterStart(previous, generation);
+    }
+
+    private TransitionResult WaitForRoleAfterStart(RuntimeState previous, ProcessGeneration generation)
+    {
         State = generation.Role switch
         {
             RuntimeRole.Database => RuntimeState.WaitingForDatabase,
@@ -285,11 +294,8 @@ public sealed class LifecycleCoordinator
         var operationId = Guid.NewGuid();
         _currentOperationId = operationId;
         var worker = CreateGeneration(RuntimeRole.Worker, operationId);
-        State = RuntimeState.WaitingForWorker;
-        return Accepted(
-            previous,
-            Command(LifecycleCommandType.StartWorker, worker, operationId, LifecycleDeadlineKey.WorkerStart),
-            Command(LifecycleCommandType.WaitForWorker, worker, operationId, LifecycleDeadlineKey.WorkerReadiness));
+        State = RuntimeState.StartingWorker;
+        return Accepted(previous, Command(LifecycleCommandType.StartWorker, worker, operationId, LifecycleDeadlineKey.WorkerStart));
     }
 
     private TransitionResult RecoverServer(RuntimeState previous)
@@ -306,8 +312,7 @@ public sealed class LifecycleCoordinator
         }
 
         commands.Add(Command(LifecycleCommandType.StartServer, server, operationId, LifecycleDeadlineKey.ServerStart));
-        commands.Add(Command(LifecycleCommandType.WaitForServer, server, operationId, LifecycleDeadlineKey.ServerReadiness));
-        State = RuntimeState.WaitingForServer;
+        State = RuntimeState.StartingServer;
         return Result(previous, commands, false, "Accepted");
     }
 
@@ -341,11 +346,21 @@ public sealed class LifecycleCoordinator
             return Ignored(previous, "StaleOperation");
         }
 
-        if (@event.Value.Role != RuntimeRole.Database)
+        if (@event.Value.Role == RuntimeRole.Database)
         {
-            return Ignored(previous, "UnexpectedEvent");
+            return DatabaseTimeout(previous, @event);
         }
 
+        if (@event.Value.Role is RuntimeRole.Server or RuntimeRole.Worker)
+        {
+            return RoleTimeout(previous, @event);
+        }
+
+        return Ignored(previous, "UnexpectedEvent");
+    }
+
+    private TransitionResult DatabaseTimeout(RuntimeState previous, OperationTimedOut @event)
+    {
         if (State is RuntimeState.StartingDatabase or RuntimeState.WaitingForDatabase)
         {
             State = RuntimeState.ReconcilingDatabaseStart;
@@ -385,8 +400,111 @@ public sealed class LifecycleCoordinator
         return Ignored(previous, "UnexpectedEvent");
     }
 
+    private TransitionResult RoleTimeout(RuntimeState previous, OperationTimedOut @event)
+    {
+        var startStateMatches = (@event.Value.Role == RuntimeRole.Server && State == RuntimeState.StartingServer)
+            || (@event.Value.Role == RuntimeRole.Worker && State == RuntimeState.StartingWorker);
+        if (startStateMatches)
+        {
+            BeginRoleReconciliation(@event.Value, RoleReconciliationKind.Start);
+            State = RuntimeState.ReconcilingRoleStart;
+            return Accepted(previous, Command(
+                LifecycleCommandType.ReconcileRoleStart,
+                @event.Value,
+                @event.OperationId,
+                LifecycleDeadlineKey.RoleReconciliation));
+        }
+
+        if (State == RuntimeState.ReconcilingRoleStart)
+        {
+            if (!MatchesRoleReconciliation(@event.Value, RoleReconciliationKind.Start))
+            {
+                return Ignored(previous, "StaleReconciliation");
+            }
+
+            return Fault(previous, @event.Value, "RoleStartReconciliationTimedOut");
+        }
+
+        if (State == RuntimeState.Stopping)
+        {
+            BeginRoleReconciliation(@event.Value, RoleReconciliationKind.Stop);
+            State = RuntimeState.ReconcilingRoleStop;
+            return Accepted(previous, Command(
+                LifecycleCommandType.ReconcileRoleStop,
+                @event.Value,
+                @event.OperationId,
+                LifecycleDeadlineKey.RoleReconciliation));
+        }
+
+        if (State == RuntimeState.ReconcilingRoleStop)
+        {
+            if (!MatchesRoleReconciliation(@event.Value, RoleReconciliationKind.Stop))
+            {
+                return Ignored(previous, "StaleReconciliation");
+            }
+
+            State = RuntimeState.Faulted;
+            ClearRoleReconciliation();
+            if (_faultEmitted)
+            {
+                return Ignored(previous, "FaultAlreadyEmitted");
+            }
+
+            _faultEmitted = true;
+            return Result(
+                previous,
+                [
+                    Command(LifecycleCommandType.EscalateJob, @event.Value, @event.OperationId, LifecycleDeadlineKey.None),
+                    Command(LifecycleCommandType.EnterFault, @event.Value, @event.OperationId, LifecycleDeadlineKey.None, "role-stop-reconciliation-timed-out"),
+                ],
+                false,
+                "RoleStopReconciliationTimedOut");
+        }
+
+        return Ignored(previous, "UnexpectedEvent");
+    }
+
     private TransitionResult Reconcile(RuntimeState previous, Reconciled @event)
     {
+        if (State == RuntimeState.ReconcilingRoleStart)
+        {
+            if (!MatchesRoleReconciliation(@event.Value, RoleReconciliationKind.Start))
+            {
+                return Ignored(previous, "StaleReconciliation");
+            }
+
+            if (@event.State == ReconciledState.Running)
+            {
+                ClearRoleReconciliation();
+                return WaitForRoleAfterStart(previous, @event.Value);
+            }
+
+            if (@event.State == ReconciledState.Stopped)
+            {
+                ClearRoleReconciliation();
+                return Recover(previous, @event.Value);
+            }
+
+            return Accepted(previous);
+        }
+
+        if (State == RuntimeState.ReconcilingRoleStop)
+        {
+            if (!MatchesRoleReconciliation(@event.Value, RoleReconciliationKind.Stop))
+            {
+                return Ignored(previous, "StaleReconciliation");
+            }
+
+            if (@event.State == ReconciledState.Stopped)
+            {
+                ClearRoleReconciliation();
+                State = RuntimeState.Stopping;
+                return Accepted(previous);
+            }
+
+            return Accepted(previous);
+        }
+
         if (State == RuntimeState.ReconcilingDatabaseStart)
         {
             if (@event.State == ReconciledState.Running)
@@ -416,6 +534,7 @@ public sealed class LifecycleCoordinator
             if (@event.State == ReconciledState.Stopped)
             {
                 State = RuntimeState.Stopped;
+                ClearRoleReconciliation();
                 _ownedRoles.Clear();
                 return Accepted(previous, Command(LifecycleCommandType.ReleaseInstance, null, _currentOperationId, LifecycleDeadlineKey.None));
             }
@@ -439,6 +558,7 @@ public sealed class LifecycleCoordinator
         }
 
         State = RuntimeState.Stopped;
+        ClearRoleReconciliation();
         _ownedRoles.Clear();
         return Accepted(previous);
     }
@@ -450,12 +570,13 @@ public sealed class LifecycleCoordinator
             return Ignored(previous, "StaleOperation");
         }
 
-        if (State is not (RuntimeState.Stopping or RuntimeState.ReconcilingDatabaseStop))
+        if (State is not (RuntimeState.Stopping or RuntimeState.ReconcilingDatabaseStop or RuntimeState.ReconcilingRoleStop))
         {
             return Ignored(previous, "UnexpectedEvent");
         }
 
         State = RuntimeState.Faulted;
+        ClearRoleReconciliation();
         if (_faultEmitted)
         {
             return Ignored(previous, "FaultAlreadyEmitted");
@@ -482,6 +603,7 @@ public sealed class LifecycleCoordinator
     private TransitionResult Fault(RuntimeState previous, ProcessGeneration? generation, string reasonCode)
     {
         State = RuntimeState.Faulted;
+        ClearRoleReconciliation();
         if (_faultEmitted)
         {
             return Ignored(previous, "FaultAlreadyEmitted");
@@ -489,6 +611,25 @@ public sealed class LifecycleCoordinator
 
         _faultEmitted = true;
         return Result(previous, [Command(LifecycleCommandType.EnterFault, generation, _currentOperationId, LifecycleDeadlineKey.None, reasonCode)], false, reasonCode);
+    }
+
+    private void BeginRoleReconciliation(ProcessGeneration generation, RoleReconciliationKind kind)
+    {
+        _reconcilingRole = generation;
+        _roleReconciliationKind = kind;
+    }
+
+    private bool MatchesRoleReconciliation(ProcessGeneration generation, RoleReconciliationKind kind)
+    {
+        return _reconcilingRole == generation
+            && _roleReconciliationKind == kind
+            && generation.OperationId == _currentOperationId;
+    }
+
+    private void ClearRoleReconciliation()
+    {
+        _reconcilingRole = null;
+        _roleReconciliationKind = null;
     }
 
     private ProcessGeneration CreateGeneration(RuntimeRole role, Guid operationId)
@@ -543,4 +684,10 @@ public sealed class LifecycleCoordinator
         long Value,
         Guid OperationId,
         RuntimeRole RecoveryKind);
+
+    private enum RoleReconciliationKind
+    {
+        Start,
+        Stop,
+    }
 }

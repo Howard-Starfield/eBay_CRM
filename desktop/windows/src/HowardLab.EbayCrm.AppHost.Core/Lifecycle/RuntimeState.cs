@@ -16,6 +16,8 @@ public enum RuntimeState
     Ready,
     ReconcilingDatabaseStart,
     ReconcilingDatabaseStop,
+    ReconcilingRoleStart,
+    ReconcilingRoleStop,
     Stopping,
     Faulted,
 }
