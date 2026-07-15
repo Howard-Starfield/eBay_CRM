@@ -689,6 +689,329 @@ public sealed class RoleLaunchPlanProviderTests
     }
 
     [Fact]
+    public async Task RecoveryStop_NativeServerExitWinsWhileManagedCompletionIsPending()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var verificationCount = 0;
+        var nativeExitObserved = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCompletion = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var teardownStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        WindowsJobObject? launchedJob = null;
+        WindowsSupervisedProcess? launchedProcess = null;
+        await using var harness = CreateRealWindowsHarness(
+            generation,
+            () => Interlocked.Increment(ref verificationCount));
+        harness.Executor.RoleLaunchedForTests = (role, job, process) =>
+        {
+            Assert.Equal(RuntimeRole.Server, role);
+            launchedJob = job;
+            launchedProcess = process;
+            process.NativeExitObservedBeforeCompletionForTests = async () =>
+            {
+                nativeExitObserved.TrySetResult();
+                await releaseCompletion.Task;
+            };
+        };
+        harness.Executor.RoleTeardownStartedForTests = role =>
+        {
+            Assert.Equal(RuntimeRole.Server, role);
+            teardownStarted.TrySetResult();
+            return Task.CompletedTask;
+        };
+        Assert.IsType<RoleStarted>(await harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        Task<LifecycleEvent?>? stop = null;
+        try
+        {
+            launchedJob!.Dispose();
+            await nativeExitObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(launchedProcess!.HasExited);
+            Assert.False(launchedProcess.Completion.IsCompleted);
+
+            stop = harness.Executor.ExecuteAsync(StopCommand(generation));
+            var winner = await Task.WhenAny(stop, teardownStarted.Task)
+                .WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Same(teardownStarted.Task, winner);
+            Assert.False(launchedProcess.Completion.IsCompleted);
+            Assert.Equal(
+                launchedProcess.Identity.ProcessId,
+                harness.Executor.SnapshotForTests().ServerProcessId);
+
+            releaseCompletion.TrySetResult();
+            Assert.Null(await stop);
+            Assert.Null(harness.Executor.SnapshotForTests().ServerProcessId);
+            Assert.Equal(1, Volatile.Read(ref verificationCount));
+        }
+        finally
+        {
+            releaseCompletion.TrySetResult();
+            if (stop is not null)
+            {
+                _ = await Record.ExceptionAsync(() => stop);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task RecoveryStop_RechecksNativeWorkerExitAfterDrainTransportCloses()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Worker, 1, Guid.NewGuid());
+        var verificationCount = 0;
+        var stopMonitoringCount = 0;
+        WindowsJobObject? launchedJob = null;
+        WindowsSupervisedProcess? launchedProcess = null;
+        await using var harness = CreateRealWindowsHarness(
+            generation,
+            () => Interlocked.Increment(ref verificationCount));
+        harness.Executor.RoleLaunchedForTests = (role, job, process) =>
+        {
+            Assert.Equal(RuntimeRole.Worker, role);
+            launchedJob = job;
+            launchedProcess = process;
+        };
+        harness.Executor.StopMonitoringCompletedForTests = async role =>
+        {
+            Assert.Equal(RuntimeRole.Worker, role);
+            if (Interlocked.Increment(ref stopMonitoringCount) != 2)
+            {
+                return;
+            }
+
+            launchedJob!.Dispose();
+            await launchedProcess!.NativeExitObservation.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(launchedProcess.HasExited);
+        };
+        Assert.IsType<RoleStarted>(await harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        Assert.Null(await harness.Executor.ExecuteAsync(StopCommand(generation)));
+
+        Assert.Null(harness.Executor.SnapshotForTests().WorkerProcessId);
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+    }
+
+    [Fact]
+    public async Task StopServer_ControlDisconnectWhileAlive_ReconcilesAuthoritativeNativeExit()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var verificationCount = 0;
+        var transportFailureObserved = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseTransportFailure = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        WindowsJobObject? launchedJob = null;
+        WindowsSupervisedProcess? launchedProcess = null;
+        await using var harness = CreateRealWindowsHarness(
+            generation,
+            () => Interlocked.Increment(ref verificationCount),
+            fixtureMode: "control-disconnect");
+        harness.Executor.RoleLaunchedForTests = (role, job, process) =>
+        {
+            Assert.Equal(RuntimeRole.Server, role);
+            launchedJob = job;
+            launchedProcess = process;
+        };
+        harness.Executor.RoleTransportFailureObservedForTests = async role =>
+        {
+            Assert.Equal(RuntimeRole.Server, role);
+            transportFailureObserved.TrySetResult();
+            await releaseTransportFailure.Task;
+        };
+        Assert.IsType<RoleStarted>(await harness.Executor.ExecuteAsync(StartCommand(generation)));
+        Assert.IsType<RoleReady>(await harness.Executor.ExecuteAsync(WaitCommand(generation)));
+        await harness.Executor.WaitForControlDisconnectForTestsAsync(RuntimeRole.Server)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        var stop = harness.Executor.ExecuteAsync(StopCommand(generation));
+        await transportFailureObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(launchedProcess!.HasExited);
+        launchedJob!.Dispose();
+        releaseTransportFailure.TrySetResult();
+
+        Assert.Null(await stop.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Null(harness.Executor.SnapshotForTests().ServerProcessId);
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+    }
+
+    [Fact]
+    public async Task DrainWorker_ReplyPipeClosesWhileAlive_TimesOutThenReconcilesNativeExit()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Worker, 1, Guid.NewGuid());
+        var operationId = Guid.NewGuid();
+        var stopGeneration = generation with { OperationId = operationId };
+        var verificationCount = 0;
+        var transportFailureObserved = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseTransportFailure = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        WindowsJobObject? launchedJob = null;
+        WindowsSupervisedProcess? launchedProcess = null;
+        var deadlines = new RoleOperationDeadlines(
+            TimeSpan.FromSeconds(10),
+            TimeSpan.FromMilliseconds(200),
+            TimeSpan.FromSeconds(5),
+            TimeSpan.FromSeconds(30),
+            TimeSpan.FromMilliseconds(100));
+        await using var harness = CreateRealWindowsHarness(
+            generation,
+            () => Interlocked.Increment(ref verificationCount),
+            fixtureMode: "drain-disconnect-after-accepted",
+            roleOperationDeadlines: deadlines);
+        harness.Executor.RoleLaunchedForTests = (role, job, process) =>
+        {
+            Assert.Equal(RuntimeRole.Worker, role);
+            launchedJob = job;
+            launchedProcess = process;
+        };
+        harness.Executor.RoleTransportFailureObservedForTests = async role =>
+        {
+            Assert.Equal(RuntimeRole.Worker, role);
+            transportFailureObserved.TrySetResult();
+            await releaseTransportFailure.Task;
+        };
+        Assert.IsType<RoleStarted>(await harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        var drain = harness.Executor.ExecuteAsync(new LifecycleCommand(
+            LifecycleCommandType.DrainWorker,
+            stopGeneration,
+            operationId,
+            LifecycleDeadlineKey.WorkerStop));
+        await transportFailureObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(launchedProcess!.HasExited);
+        await Task.Delay(deadlines.StopCommand + TimeSpan.FromMilliseconds(100));
+        releaseTransportFailure.TrySetResult();
+
+        var timedOut = Assert.IsType<OperationTimedOut>(
+            await drain.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(operationId, timedOut.OperationId);
+        var reconcile = harness.Executor.ExecuteAsync(new LifecycleCommand(
+            LifecycleCommandType.ReconcileRoleStop,
+            stopGeneration,
+            operationId,
+            LifecycleDeadlineKey.RoleReconciliation));
+        launchedJob!.Dispose();
+
+        var reconciled = Assert.IsType<Reconciled>(
+            await reconcile.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(ReconciledState.Stopped, reconciled.State);
+        Assert.Null(harness.Executor.SnapshotForTests().WorkerProcessId);
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+    }
+
+    [Theory]
+    [InlineData(ControlProtocolErrorCode.TruncatedPrefix)]
+    [InlineData(ControlProtocolErrorCode.TruncatedPayload)]
+    public void RoleTransportClassification_EofTruncationIsTransport(
+        ControlProtocolErrorCode errorCode)
+    {
+        var error = new ControlProtocolException(errorCode, new EndOfStreamException());
+
+        Assert.True(LifecycleCommandExecutor.IsRoleTransportFailure(error));
+    }
+
+    [Theory]
+    [InlineData(ControlProtocolErrorCode.TruncatedPrefix)]
+    [InlineData(ControlProtocolErrorCode.TruncatedPayload)]
+    public void RoleTransportClassification_NonEofTruncationIsProtocolFailure(
+        ControlProtocolErrorCode errorCode)
+    {
+        var error = new ControlProtocolException(errorCode, new InvalidDataException("malformed"));
+
+        Assert.False(LifecycleCommandExecutor.IsRoleTransportFailure(error));
+    }
+
+    [Fact]
+    public void RoleTransportClassification_InvalidDataIsProtocolFailure()
+    {
+        Assert.False(LifecycleCommandExecutor.IsRoleTransportFailure(
+            new InvalidDataException("wrong-direction")));
+    }
+
+    [Fact]
+    public async Task StopServer_ShutdownAcceptedThenPipeCloses_ReconcilesAuthoritativeNativeExit()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var verificationCount = 0;
+        var transportFailureObserved = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseTransportFailure = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        WindowsJobObject? launchedJob = null;
+        WindowsSupervisedProcess? launchedProcess = null;
+        await using var harness = CreateRealWindowsHarness(
+            generation,
+            () => Interlocked.Increment(ref verificationCount),
+            fixtureMode: "shutdown-disconnect-after-accepted");
+        harness.Executor.RoleLaunchedForTests = (role, job, process) =>
+        {
+            Assert.Equal(RuntimeRole.Server, role);
+            launchedJob = job;
+            launchedProcess = process;
+        };
+        harness.Executor.RoleTransportFailureObservedForTests = async role =>
+        {
+            Assert.Equal(RuntimeRole.Server, role);
+            transportFailureObserved.TrySetResult();
+            await releaseTransportFailure.Task;
+        };
+        Assert.IsType<RoleStarted>(await harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        var stop = harness.Executor.ExecuteAsync(StopCommand(generation));
+        await transportFailureObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(launchedProcess!.HasExited);
+        launchedJob!.Dispose();
+        releaseTransportFailure.TrySetResult();
+
+        Assert.Null(await stop.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Null(harness.Executor.SnapshotForTests().ServerProcessId);
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+    }
+
+    [Fact]
+    public async Task ReconcileRoleStop_CallerCancellationPropagatesAndRetainsIndeterminateRole()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Worker, 1, Guid.NewGuid());
+        var operationId = Guid.NewGuid();
+        var stopGeneration = generation with { OperationId = operationId };
+        var deadlines = new RoleOperationDeadlines(
+            TimeSpan.FromSeconds(10),
+            TimeSpan.FromMilliseconds(100),
+            TimeSpan.FromSeconds(5),
+            TimeSpan.FromSeconds(30),
+            TimeSpan.FromMilliseconds(100));
+        await using var harness = CreateRealWindowsHarness(
+            generation,
+            NoopPayloadClosureVerifier,
+            fixtureMode: "drain-disconnect-after-accepted",
+            roleOperationDeadlines: deadlines);
+        Assert.IsType<RoleStarted>(await harness.Executor.ExecuteAsync(StartCommand(generation)));
+        var retainedProcessId = harness.Executor.SnapshotForTests().WorkerProcessId;
+        var drain = await harness.Executor.ExecuteAsync(new LifecycleCommand(
+                LifecycleCommandType.DrainWorker,
+                stopGeneration,
+                operationId,
+                LifecycleDeadlineKey.WorkerStop))
+            .WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.IsType<OperationTimedOut>(drain);
+        using var canceledCaller = new CancellationTokenSource();
+        canceledCaller.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            harness.Executor.ExecuteAsync(
+                new LifecycleCommand(
+                    LifecycleCommandType.ReconcileRoleStop,
+                    stopGeneration,
+                    operationId,
+                    LifecycleDeadlineKey.RoleReconciliation),
+                canceledCaller.Token));
+
+        Assert.Equal(retainedProcessId, harness.Executor.SnapshotForTests().WorkerProcessId);
+    }
+
+    [Fact]
     public async Task RealWindowsChild_NormalAndEscalationRaceShareOneTeardownAndVerifier()
     {
         var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
@@ -1148,6 +1471,28 @@ public sealed class RoleLaunchPlanProviderTests
                 ? LifecycleDeadlineKey.ServerStart
                 : LifecycleDeadlineKey.WorkerStart);
 
+    private static LifecycleCommand StopCommand(ProcessGeneration generation) =>
+        new(
+            generation.Role == RuntimeRole.Server
+                ? LifecycleCommandType.StopServer
+                : LifecycleCommandType.StopWorker,
+            generation,
+            Guid.NewGuid(),
+            generation.Role == RuntimeRole.Server
+                ? LifecycleDeadlineKey.ServerStop
+                : LifecycleDeadlineKey.WorkerStop);
+
+    private static LifecycleCommand WaitCommand(ProcessGeneration generation) =>
+        new(
+            generation.Role == RuntimeRole.Server
+                ? LifecycleCommandType.WaitForServer
+                : LifecycleCommandType.WaitForWorker,
+            generation,
+            generation.OperationId,
+            generation.Role == RuntimeRole.Server
+                ? LifecycleDeadlineKey.ServerStart
+                : LifecycleDeadlineKey.WorkerStart);
+
     private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
@@ -1164,7 +1509,8 @@ public sealed class RoleLaunchPlanProviderTests
 
     private static ExecutorHarness CreateHarness(
         IRoleLaunchPlanProvider provider,
-        IProcessLauncher? launcher)
+        IProcessLauncher? launcher,
+        RoleOperationDeadlines? roleOperationDeadlines = null)
     {
         var profileRoot = Path.Combine(Path.GetTempPath(), $"role-plan-{Guid.NewGuid():N}");
         Directory.CreateDirectory(profileRoot);
@@ -1201,7 +1547,7 @@ public sealed class RoleLaunchPlanProviderTests
             payload,
             identityStore: null,
             NoopRoleOperationBoundary.Instance,
-            RoleOperationDeadlines.Production,
+            roleOperationDeadlines ?? RoleOperationDeadlines.Production,
             gatedSink,
             secrets,
             diagnosticSecretObserver: null,
@@ -1212,7 +1558,9 @@ public sealed class RoleLaunchPlanProviderTests
 
     private static ExecutorHarness CreateRealWindowsHarness(
         ProcessGeneration generation,
-        Action verifyPayloadClosureAfterShutdown)
+        Action verifyPayloadClosureAfterShutdown,
+        string? fixtureMode = null,
+        RoleOperationDeadlines? roleOperationDeadlines = null)
     {
         var healthPort = ReserveLoopbackPort();
         var fixturePath = Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe");
@@ -1220,7 +1568,11 @@ public sealed class RoleLaunchPlanProviderTests
         return CreateHarness(
             new StubProvider(CreatePlan(
                 generation,
-                arguments: ["server", healthPort.ToString(System.Globalization.CultureInfo.InvariantCulture)],
+                arguments:
+                [
+                    fixtureMode ?? (generation.Role == RuntimeRole.Server ? "server" : "worker"),
+                    healthPort.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ],
                 applicationPath: fixturePath,
                 workingDirectory: Path.GetDirectoryName(fixturePath),
                 environment: new Dictionary<string, string> { ["SystemRoot"] = systemRoot },
@@ -1228,7 +1580,8 @@ public sealed class RoleLaunchPlanProviderTests
                 buildIdentity: ControlProtocolConstants.FixtureBuildIdentity,
                 healthPort: healthPort,
                 verifyPayloadClosureAfterShutdown: verifyPayloadClosureAfterShutdown)),
-            launcher: null);
+            launcher: null,
+            roleOperationDeadlines);
     }
 
     private static int ReserveLoopbackPort()

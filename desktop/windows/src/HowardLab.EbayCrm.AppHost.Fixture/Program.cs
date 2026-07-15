@@ -19,7 +19,8 @@ if (args.Length == 0)
 if (FixtureModeParser.TryParse(args[0], out var fixtureMode) &&
     fixtureMode is FixtureMode.Server or FixtureMode.Worker or FixtureMode.IgnoreShutdown or
         FixtureMode.CrashAfterHello or FixtureMode.CrashBeforeHello or FixtureMode.HealthMismatch or
-        FixtureMode.PipeTimeout or FixtureMode.ControlDisconnect or FixtureMode.HealthDrop or
+        FixtureMode.PipeTimeout or FixtureMode.ControlDisconnect or FixtureMode.DrainDisconnectAfterAccepted or
+        FixtureMode.ShutdownDisconnectAfterAccepted or FixtureMode.HealthDrop or
         FixtureMode.HealthStaleBuild or FixtureMode.HealthStaleProtocol or FixtureMode.HealthStaleGeneration or
         FixtureMode.HealthStaleNonce or FixtureMode.HealthUnhealthy)
 {

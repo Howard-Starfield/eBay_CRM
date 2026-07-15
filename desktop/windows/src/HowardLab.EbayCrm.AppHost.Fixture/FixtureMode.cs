@@ -13,6 +13,8 @@ public enum FixtureMode
     HealthMismatch,
     PipeTimeout,
     ControlDisconnect,
+    DrainDisconnectAfterAccepted,
+    ShutdownDisconnectAfterAccepted,
     HealthDrop,
     HealthStaleBuild,
     HealthStaleProtocol,
@@ -40,6 +42,8 @@ public static class FixtureModeParser
             "health-mismatch" => FixtureMode.HealthMismatch,
             "pipe-timeout" => FixtureMode.PipeTimeout,
             "control-disconnect" => FixtureMode.ControlDisconnect,
+            "drain-disconnect-after-accepted" => FixtureMode.DrainDisconnectAfterAccepted,
+            "shutdown-disconnect-after-accepted" => FixtureMode.ShutdownDisconnectAfterAccepted,
             "health-drop" => FixtureMode.HealthDrop,
             "health-stale-build" => FixtureMode.HealthStaleBuild,
             "health-stale-protocol" => FixtureMode.HealthStaleProtocol,
@@ -62,6 +66,8 @@ public static class FixtureModeParser
             "health-mismatch" or
             "pipe-timeout" or
             "control-disconnect" or
+            "drain-disconnect-after-accepted" or
+            "shutdown-disconnect-after-accepted" or
             "health-drop" or
             "health-stale-build" or
             "health-stale-protocol" or

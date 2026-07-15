@@ -94,6 +94,8 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
 
     internal Task StandardOutputLineAvailable => _standardOutputState.LineAvailable;
 
+    internal Func<Task>? NativeExitObservedBeforeCompletionForTests { get; set; }
+
     public bool HasExited
     {
         get
@@ -335,6 +337,11 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
     {
         using var completionHandle = DuplicateProcessHandle(ProcessHandle);
         await WaitForExitAsync(completionHandle, cancellationToken).ConfigureAwait(false);
+        if (NativeExitObservedBeforeCompletionForTests is { } nativeExitObserved)
+        {
+            await nativeExitObserved().ConfigureAwait(false);
+        }
+
         if (!NativeMethods.GetExitCodeProcess(completionHandle, out var exitCode))
         {
             throw new Win32Exception(Marshal.GetLastPInvokeError());

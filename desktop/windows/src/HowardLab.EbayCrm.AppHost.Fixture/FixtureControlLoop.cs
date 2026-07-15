@@ -118,6 +118,16 @@ public static class FixtureControlLoop
             var command = await client.ReadCommandAsync(cancellationToken).ConfigureAwait(false);
             if (command.Type == ControlMessageType.Drain && role == RuntimeRole.Worker)
             {
+                if (mode == FixtureMode.DrainDisconnectAfterAccepted)
+                {
+                    await client.SendAsync(
+                        Empty(ControlMessageType.DrainAccepted, command.OperationId, role, generation),
+                        cancellationToken).ConfigureAwait(false);
+                    await client.DisposeAsync().ConfigureAwait(false);
+                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
+                    return 0;
+                }
+
                 if (!drainReplies.TryGetValue(command.OperationId, out var replies))
                 {
                     replies =
@@ -148,6 +158,16 @@ public static class FixtureControlLoop
                 if (mode == FixtureMode.IgnoreShutdown)
                 {
                     continue;
+                }
+
+                if (mode == FixtureMode.ShutdownDisconnectAfterAccepted)
+                {
+                    await client.SendAsync(
+                        Empty(ControlMessageType.ShutdownAccepted, command.OperationId, role, generation),
+                        cancellationToken).ConfigureAwait(false);
+                    await client.DisposeAsync().ConfigureAwait(false);
+                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
+                    return 0;
                 }
 
                 var replies = new[]
