@@ -198,6 +198,11 @@ public sealed class PostgresMigrationRunner
                 if (command is not null) await command.DisposeAsync().ConfigureAwait(false);
             }
         }
+        catch (PostgresProbeException error) when (
+            error.ReasonCode == "postgres-control-state-malformed")
+        {
+            return new(MigrationOutcome.RepairRequired, "migration-control-state-invalid");
+        }
         finally
         {
             _gate.Release();

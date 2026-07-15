@@ -63,7 +63,10 @@ public sealed class PostgresMigrationRunnerTests
         var actualClusterId = Guid.NewGuid();
         await cluster.ExecuteSqlAsync(
             $"CREATE SCHEMA desktop_runtime; CREATE TABLE desktop_runtime.apphost_control " +
-            "(singleton_key boolean PRIMARY KEY CHECK (singleton_key), cluster_id uuid NOT NULL, schema_version integer NOT NULL CHECK (schema_version >= 0)); " +
+            "(singleton_key boolean NOT NULL, cluster_id uuid NOT NULL, schema_version integer NOT NULL, " +
+            "CONSTRAINT apphost_control_pkey PRIMARY KEY (singleton_key), " +
+            "CONSTRAINT apphost_control_singleton_true CHECK (singleton_key), " +
+            "CONSTRAINT apphost_control_schema_nonnegative CHECK (schema_version >= 0)); " +
             $"INSERT INTO desktop_runtime.apphost_control VALUES (true, '{actualClusterId:D}', 0);");
         var runner = CreateRunner(
             cluster,
@@ -93,14 +96,80 @@ public sealed class PostgresMigrationRunnerTests
 
         var result = await runner.RunAsync();
 
-        Assert.Equal(MigrationOutcome.Failed, result.Outcome);
-        Assert.NotEqual(0, result.ProcessExitCode);
+        Assert.Equal(MigrationOutcome.RepairRequired, result.Outcome);
+        Assert.Equal("migration-control-state-invalid", result.ReasonCode);
+        Assert.Null(cluster.Launcher.LastMigrationProcess);
         Assert.Equal("0", await cluster.ExecuteSqlScalarAsync(
             "SELECT schema_version::text FROM desktop_runtime.apphost_control;"));
         await cluster.ExecuteSqlAsync(
             $"INSERT INTO desktop_runtime.apphost_control VALUES (false, '{Guid.NewGuid():D}', -1);");
         Assert.Equal("2", await cluster.ExecuteSqlScalarAsync(
             "SELECT count(*)::text FROM desktop_runtime.apphost_control;"));
+    }
+
+    [PostgresTheory, Trait("Category", "Migration")]
+    [InlineData("under-constrained", false)]
+    [InlineData("under-constrained", true)]
+    [InlineData("extra-false-row", false)]
+    [InlineData("extra-false-row", true)]
+    [InlineData("malformed-named-constraint", false)]
+    [InlineData("malformed-named-constraint", true)]
+    public async Task RunAsync_TargetVersionWithInvalidControlState_RequiresRepair(
+        string invalidState,
+        bool hasRunningMarker)
+    {
+        await using var cluster = await StartClusterAsync();
+        var expectedClusterId = Guid.NewGuid();
+        var setupSql = invalidState switch
+        {
+            "under-constrained" =>
+                "CREATE SCHEMA desktop_runtime; " +
+                "CREATE TABLE desktop_runtime.apphost_control " +
+                "(singleton_key boolean PRIMARY KEY, cluster_id uuid, schema_version integer); " +
+                $"INSERT INTO desktop_runtime.apphost_control VALUES (true, '{expectedClusterId:D}', 1);",
+            "extra-false-row" =>
+                "CREATE SCHEMA desktop_runtime; " +
+                "CREATE TABLE desktop_runtime.apphost_control " +
+                "(singleton_key boolean NOT NULL, cluster_id uuid NOT NULL, schema_version integer NOT NULL, " +
+                "CONSTRAINT apphost_control_pkey PRIMARY KEY (singleton_key), " +
+                "CONSTRAINT apphost_control_schema_nonnegative CHECK (schema_version >= 0)); " +
+                $"INSERT INTO desktop_runtime.apphost_control VALUES " +
+                $"(true, '{expectedClusterId:D}', 1), (false, '{Guid.NewGuid():D}', 1);",
+            "malformed-named-constraint" =>
+                "CREATE SCHEMA desktop_runtime; " +
+                "CREATE TABLE desktop_runtime.apphost_control " +
+                "(singleton_key boolean NOT NULL, cluster_id uuid NOT NULL, schema_version integer NOT NULL, " +
+                "CONSTRAINT apphost_control_pkey PRIMARY KEY (singleton_key), " +
+                "CONSTRAINT apphost_control_singleton_true CHECK (singleton_key IS NOT NULL), " +
+                "CONSTRAINT apphost_control_schema_nonnegative CHECK (schema_version >= 0)); " +
+                $"INSERT INTO desktop_runtime.apphost_control VALUES (true, '{expectedClusterId:D}', 1);",
+            _ => throw new ArgumentOutOfRangeException(nameof(invalidState)),
+        };
+        await cluster.ExecuteSqlAsync(setupSql);
+        var store = new AtomicMigrationAttemptStore(cluster.Root);
+        if (hasRunningMarker)
+        {
+            await store.WriteAsync(new MigrationAttemptRecord(
+                Guid.NewGuid(),
+                new Version(1, 0, 0),
+                startingSchemaVersion: 0,
+                targetSchemaVersion: 1,
+                MigrationAttemptState.Running,
+                DateTimeOffset.UtcNow,
+                finishedAtUtc: null,
+                "migration-running"));
+        }
+
+        var result = await CreateRunner(cluster, store, expectedClusterId).RunAsync();
+
+        Assert.Equal(MigrationOutcome.RepairRequired, result.Outcome);
+        Assert.Equal("migration-control-state-invalid", result.ReasonCode);
+        Assert.Null(cluster.Launcher.LastMigrationProcess);
+        var marker = await store.ReadAsync();
+        if (hasRunningMarker)
+            Assert.Equal(MigrationAttemptState.Running, Assert.IsType<MigrationAttemptRecord>(marker).State);
+        else
+            Assert.Null(marker);
     }
 
     [PostgresFact, Trait("Category", "Migration")]

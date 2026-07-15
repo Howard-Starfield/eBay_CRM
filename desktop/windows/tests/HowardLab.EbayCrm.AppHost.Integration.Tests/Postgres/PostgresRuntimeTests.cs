@@ -580,3 +580,18 @@ internal sealed class PostgresFactAttribute : FactAttribute
         }
     }
 }
+
+internal sealed class PostgresTheoryAttribute : TheoryAttribute
+{
+    public PostgresTheoryAttribute()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Skip = "Real PostgreSQL supervision requires Windows.";
+        }
+        else if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("EBAYCRM_POSTGRES_BIN")))
+        {
+            Skip = "Set EBAYCRM_POSTGRES_BIN to the PostgreSQL 16 bin directory.";
+        }
+    }
+}

@@ -545,13 +545,68 @@ public sealed class PostgresRuntime :
     {
         if (identity.HasExited || !_job.Contains(identity.PostmasterHandle)) throw new PostgresProbeException("postmaster-not-owned-live");
         var sql = Encoding.UTF8.GetBytes(
-            "SELECT 1;\n" +
-            "SHOW data_directory;\n" +
-            "SELECT to_regclass('desktop_runtime.apphost_control') IS NOT NULL AS apphost_control_exists \\gset\n" +
-            "\\if :apphost_control_exists\n" +
-            "SELECT COALESCE((SELECT cluster_id::text || '|' || schema_version::text " +
-            "FROM desktop_runtime.apphost_control WHERE singleton_key), 'control-corrupt');\n" +
-            "\\endif\n");
+            """
+            SELECT 1;
+            SHOW data_directory;
+            SELECT to_regclass('desktop_runtime.apphost_control') IS NOT NULL AS apphost_control_exists \gset
+            \if :apphost_control_exists
+            SELECT CASE WHEN
+                (SELECT count(*)
+                   FROM pg_catalog.pg_attribute AS a
+                  WHERE a.attrelid = 'desktop_runtime.apphost_control'::regclass
+                    AND a.attnum > 0
+                    AND NOT a.attisdropped) = 3
+                AND EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_attribute AS a
+                     WHERE a.attrelid = 'desktop_runtime.apphost_control'::regclass
+                       AND a.attname = 'singleton_key'
+                       AND a.atttypid = 'boolean'::regtype
+                       AND a.attnotnull)
+                AND EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_attribute AS a
+                     WHERE a.attrelid = 'desktop_runtime.apphost_control'::regclass
+                       AND a.attname = 'cluster_id'
+                       AND a.atttypid = 'uuid'::regtype
+                       AND a.attnotnull)
+                AND EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_attribute AS a
+                     WHERE a.attrelid = 'desktop_runtime.apphost_control'::regclass
+                       AND a.attname = 'schema_version'
+                       AND a.atttypid = 'integer'::regtype
+                       AND a.attnotnull)
+                AND EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_constraint AS c
+                     WHERE c.conrelid = 'desktop_runtime.apphost_control'::regclass
+                       AND c.conname = 'apphost_control_pkey'
+                       AND c.contype = 'p'
+                       AND c.convalidated
+                       AND pg_catalog.pg_get_constraintdef(c.oid, false) = 'PRIMARY KEY (singleton_key)')
+                AND EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_constraint AS c
+                     WHERE c.conrelid = 'desktop_runtime.apphost_control'::regclass
+                       AND c.conname = 'apphost_control_singleton_true'
+                       AND c.contype = 'c'
+                       AND c.convalidated
+                       AND pg_catalog.pg_get_constraintdef(c.oid, false) = 'CHECK (singleton_key)')
+                AND EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_constraint AS c
+                     WHERE c.conrelid = 'desktop_runtime.apphost_control'::regclass
+                       AND c.conname = 'apphost_control_schema_nonnegative'
+                       AND c.contype = 'c'
+                       AND c.convalidated
+                       AND pg_catalog.pg_get_constraintdef(c.oid, false) = 'CHECK ((schema_version >= 0))')
+                AND (SELECT count(*) FROM desktop_runtime.apphost_control) = 1
+                AND (SELECT count(*)
+                       FROM desktop_runtime.apphost_control AS c
+                      WHERE to_jsonb(c)->>'singleton_key' = 'true') = 1
+            THEN COALESCE((
+                SELECT (to_jsonb(c)->>'cluster_id') || '|' || (to_jsonb(c)->>'schema_version')
+                  FROM desktop_runtime.apphost_control AS c
+                 WHERE to_jsonb(c)->>'singleton_key' = 'true'), 'control-corrupt')
+            ELSE 'control-corrupt'
+            END;
+            \endif
+            """);
         await using var command = await LaunchCommandAsync(
             _layout.PsqlExe,
             ["-X", "-A", "-t", "-q", "-w", "-h", "127.0.0.1", "-p", identity.LoopbackPort.ToString(CultureInfo.InvariantCulture),
