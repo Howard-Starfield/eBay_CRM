@@ -23,6 +23,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HowardLab.EbayCrm.AppHost.W
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HowardLab.EbayCrm.AppHost.Integration.Tests", "tests\HowardLab.EbayCrm.AppHost.Integration.Tests\HowardLab.EbayCrm.AppHost.Integration.Tests.csproj", "{6263A5EB-359C-45F7-8A32-A25F7C61CF4F}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HowardLab.EbayCrm.AppHost.AcceptanceBroker", "tests\HowardLab.EbayCrm.AppHost.AcceptanceBroker\HowardLab.EbayCrm.AppHost.AcceptanceBroker.csproj", "{9B55D47F-29E6-40F0-BEF4-F8EC5665435C}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -129,6 +131,18 @@ Global
 		{6263A5EB-359C-45F7-8A32-A25F7C61CF4F}.Release|x64.Build.0 = Release|Any CPU
 		{6263A5EB-359C-45F7-8A32-A25F7C61CF4F}.Release|x86.ActiveCfg = Release|Any CPU
 		{6263A5EB-359C-45F7-8A32-A25F7C61CF4F}.Release|x86.Build.0 = Release|Any CPU
+		{9B55D47F-29E6-40F0-BEF4-F8EC5665435C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9B55D47F-29E6-40F0-BEF4-F8EC5665435C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9B55D47F-29E6-40F0-BEF4-F8EC5665435C}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{9B55D47F-29E6-40F0-BEF4-F8EC5665435C}.Debug|x64.Build.0 = Debug|Any CPU
+		{9B55D47F-29E6-40F0-BEF4-F8EC5665435C}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{9B55D47F-29E6-40F0-BEF4-F8EC5665435C}.Debug|x86.Build.0 = Debug|Any CPU
+		{9B55D47F-29E6-40F0-BEF4-F8EC5665435C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9B55D47F-29E6-40F0-BEF4-F8EC5665435C}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9B55D47F-29E6-40F0-BEF4-F8EC5665435C}.Release|x64.ActiveCfg = Release|Any CPU
+		{9B55D47F-29E6-40F0-BEF4-F8EC5665435C}.Release|x64.Build.0 = Release|Any CPU
+		{9B55D47F-29E6-40F0-BEF4-F8EC5665435C}.Release|x86.ActiveCfg = Release|Any CPU
+		{9B55D47F-29E6-40F0-BEF4-F8EC5665435C}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -142,5 +156,6 @@ Global
 		{585177EE-A155-4B3A-A748-BF349D928D81} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 		{93DB4793-229A-4EB5-8D23-70BBB5781B7F} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 		{6263A5EB-359C-45F7-8A32-A25F7C61CF4F} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
+		{9B55D47F-29E6-40F0-BEF4-F8EC5665435C} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 	EndGlobalSection
 EndGlobal

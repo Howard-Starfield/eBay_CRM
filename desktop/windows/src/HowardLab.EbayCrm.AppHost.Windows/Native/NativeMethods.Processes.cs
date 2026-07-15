@@ -10,6 +10,7 @@ internal static unsafe partial class NativeMethods
     internal const uint StartfUseStdHandles = 0x00000100;
     internal const uint HandleFlagInherit = 0x00000001;
     internal const uint JobObjectExtendedLimitInformationClass = 9;
+    internal const uint JobObjectBasicAccountingInformationClass = 1;
     internal const uint JobObjectLimitKillOnJobClose = 0x00002000;
     internal const uint DuplicateSameAccess = 0x00000002;
     internal const uint WaitObject0 = 0;
@@ -110,6 +111,19 @@ internal static unsafe partial class NativeMethods
         internal nuint PeakJobMemoryUsed;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct JobObjectBasicAccountingInformation
+    {
+        internal long TotalUserTime;
+        internal long TotalKernelTime;
+        internal long ThisPeriodTotalUserTime;
+        internal long ThisPeriodTotalKernelTime;
+        internal uint TotalPageFaultCount;
+        internal uint TotalProcesses;
+        internal uint ActiveProcesses;
+        internal uint TotalTerminatedProcesses;
+    }
+
     [LibraryImport("kernel32.dll", EntryPoint = "CreateJobObjectW", SetLastError = true,
         StringMarshalling = StringMarshalling.Utf16)]
     internal static partial IntPtr CreateJobObject(
@@ -123,6 +137,15 @@ internal static unsafe partial class NativeMethods
         uint informationClass,
         void* information,
         uint informationLength);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool QueryInformationJobObject(
+        SafeJobHandle job,
+        uint informationClass,
+        void* information,
+        uint informationLength,
+        uint* returnLength);
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

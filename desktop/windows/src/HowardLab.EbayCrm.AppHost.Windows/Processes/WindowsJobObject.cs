@@ -55,6 +55,31 @@ public sealed class WindowsJobObject : IProcessGroup, IProcessTreeTerminator
 
     internal JobHandleLease AcquireHandle() => new(_handle);
 
+    internal unsafe WindowsJobAccountingSnapshot GetAccountingSnapshot()
+    {
+        var accounting = new NativeMethods.JobObjectBasicAccountingInformation();
+        uint returned = 0;
+        if (!NativeMethods.QueryInformationJobObject(
+            _handle,
+            NativeMethods.JobObjectBasicAccountingInformationClass,
+            &accounting,
+            checked((uint)sizeof(NativeMethods.JobObjectBasicAccountingInformation)),
+            &returned))
+        {
+            throw new Win32Exception(Marshal.GetLastPInvokeError());
+        }
+
+        if (returned != sizeof(NativeMethods.JobObjectBasicAccountingInformation))
+        {
+            throw new Win32Exception(24);
+        }
+
+        return new WindowsJobAccountingSnapshot(
+            accounting.TotalProcesses,
+            accounting.ActiveProcesses,
+            accounting.TotalTerminatedProcesses);
+    }
+
     internal SafeJobHandle DuplicateForTests()
     {
         var currentProcess = NativeMethods.GetCurrentProcess();
@@ -145,3 +170,8 @@ public sealed class WindowsJobObject : IProcessGroup, IProcessTreeTerminator
         }
     }
 }
+
+internal readonly record struct WindowsJobAccountingSnapshot(
+    uint TotalProcesses,
+    uint ActiveProcesses,
+    uint TotalTerminatedProcesses);
