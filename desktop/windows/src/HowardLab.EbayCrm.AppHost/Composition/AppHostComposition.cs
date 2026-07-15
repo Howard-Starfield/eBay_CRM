@@ -54,7 +54,9 @@ public static class AppHostComposition
             throw new AppHostOptionsException("run-mode-required");
         }
 
-        var validated = Validate(options, requireAvailablePort: true);
+        // Profile ownership must be established before checking shared runtime
+        // resources so every same-profile loser reports one stable reason.
+        var validated = Validate(options, requireAvailablePort: false);
         var coordinator = new LifecycleCoordinator(
             new SystemClock(),
             new RestartBudget(3, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(5)));
@@ -249,7 +251,7 @@ public static class AppHostComposition
         public void Dispose() => DisposeLeases(leases);
     }
 
-    private static void EnsurePortAvailable(int port)
+    internal static void EnsurePortAvailable(int port)
     {
         try
         {

@@ -194,7 +194,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         return command.Type switch
         {
             LifecycleCommandType.AcquireInstance => await AcquireInstanceAsync(command, cancellationToken).ConfigureAwait(false),
-            LifecycleCommandType.ValidatePayload => new PayloadValidated(command.OperationId),
+            LifecycleCommandType.ValidatePayload => ValidatePayload(command),
             LifecycleCommandType.PrepareRuntime => await PrepareRuntimeAsync(command, cancellationToken).ConfigureAwait(false),
             LifecycleCommandType.StartDatabase => await StartDatabaseAsync(command, cancellationToken).ConfigureAwait(false),
             LifecycleCommandType.WaitForDatabase => await WaitForDatabaseAsync(command, cancellationToken).ConfigureAwait(false),
@@ -226,6 +226,12 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             ?? throw new AppHostExecutionException("profile-already-owned");
         _instanceOperationId = command.OperationId;
         return new InstanceAcquired(command.OperationId);
+    }
+
+    private LifecycleEvent ValidatePayload(LifecycleCommand command)
+    {
+        AppHostComposition.EnsurePortAvailable(_options.Port);
+        return new PayloadValidated(command.OperationId);
     }
 
     private async Task<LifecycleEvent> PrepareRuntimeAsync(
@@ -482,9 +488,21 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
 
         await StopMonitoringAsync(_worker).ConfigureAwait(false);
 
-        await _worker.Channel.SendAsync(
-            Empty(ControlMessageType.Drain, command.OperationId, _worker.Generation),
-            cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await _worker.Channel.SendAsync(
+                Empty(ControlMessageType.Drain, command.OperationId, _worker.Generation),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is InvalidOperationException or IOException)
+        {
+            // A coalesced dependency failure can close the authenticated pipe
+            // just before recovery drains the worker. The retained process
+            // handle, not the pipe error, is authoritative: wait for the
+            // already-contained role to signal before continuing.
+            await _worker.Process.Completion.WaitAsync(cancellationToken).ConfigureAwait(false);
+            return null;
+        }
         var expected = new[]
         {
             ControlMessageType.DrainAccepted,

@@ -18,6 +18,7 @@ using HowardLab.EbayCrm.AppHost.Windows.Postgres;
 
 namespace HowardLab.EbayCrm.AppHost.Integration.Tests.AppHost;
 
+[Collection("Destructive containment")]
 public sealed class AppHostStartupTests
 {
     [Fact, Trait("Category", "AppHost")]
@@ -504,17 +505,19 @@ public sealed class AppHostStartupTests
     }
 
     [PostgresFact, Trait("Category", "AppHost")]
-    public void Composition_RejectsOccupiedPortBeforeLaunchingAnyChild()
+    public async Task Startup_RejectsOccupiedPortAfterOwnershipAndBeforeLaunchingAnyChild()
     {
         using var layout = TestLayout.CreateReal();
         using var listener = new TcpListener(IPAddress.Loopback, layout.Port);
         listener.Start();
 
-        var error = Assert.Throws<AppHostOptionsException>(() =>
-            AppHostComposition.Create(AppHostOptions.Parse(layout.Arguments("run"))));
+        var orchestrator = AppHostComposition.Create(AppHostOptions.Parse(layout.Arguments("run")));
+
+        var error = await Assert.ThrowsAsync<AppHostOptionsException>(() => orchestrator.StartAsync());
 
         Assert.Equal("port-unavailable", error.ReasonCode);
         Assert.False(File.Exists(Path.Combine(layout.ProfileRoot, "postgres-data", "PG_VERSION")));
+        await orchestrator.DisposeAsync();
     }
 
     [PostgresFact, Trait("Category", "AppHost")]
@@ -969,60 +972,6 @@ public sealed class AppHostStartupTests
             throw new InvalidOperationException("injected-rollback-failure");
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
-    }
-
-    private sealed class TestLayout : IDisposable
-    {
-        private TestLayout(string root, string? postgresBin = null, string? fixturePath = null, int port = 15432)
-        {
-            Root = root;
-            ProfileRoot = Path.Combine(root, "profile");
-            PostgresBin = postgresBin ?? Path.Combine(root, "postgres", "bin");
-            FixturePath = fixturePath ?? Path.Combine(root, "HowardLab.EbayCrm.AppHost.Fixture.exe");
-            Port = port;
-            Directory.CreateDirectory(ProfileRoot);
-            if (postgresBin is null)
-            {
-                Directory.CreateDirectory(PostgresBin);
-            }
-
-            if (fixturePath is null)
-            {
-                File.WriteAllBytes(FixturePath, [0]);
-            }
-        }
-
-        internal string Root { get; }
-        internal string ProfileRoot { get; }
-        internal string PostgresBin { get; }
-        internal string FixturePath { get; }
-        internal int Port { get; }
-
-        internal static TestLayout Create() => new(Path.Combine(
-            Path.GetTempPath(),
-            $"ebaycrm-task9-options-{Guid.NewGuid():N}"));
-
-        internal static TestLayout CreateReal()
-        {
-            var postgres = Environment.GetEnvironmentVariable("EBAYCRM_POSTGRES_BIN")
-                ?? throw new InvalidOperationException("EBAYCRM_POSTGRES_BIN is unavailable.");
-            return new TestLayout(
-                Path.Combine(Path.GetTempPath(), $"ebaycrm-task9-real-{Guid.NewGuid():N}"),
-                postgres,
-                Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe"),
-                ReserveLoopbackPort());
-        }
-
-        internal string[] Arguments(string mode) =>
-        [
-            "--profile-root", ProfileRoot,
-            "--postgres-bin", PostgresBin,
-            "--fixture-path", FixturePath,
-            "--port", Port.ToString(System.Globalization.CultureInfo.InvariantCulture),
-            "--mode", mode,
-        ];
-
-        public void Dispose() => Directory.Delete(Root, recursive: true);
     }
 
     private sealed class NoopDiagnosticSink : IDiagnosticSink
