@@ -171,6 +171,68 @@ public sealed class WindowsProcessLauncherTests
     }
 
     [Fact]
+    public async Task NativeExitObservation_RemainsPendingUntilRunningChildActuallyExits()
+    {
+        using var job = WindowsJobObject.CreateKillOnClose();
+        var launched = await CreateLauncher().LaunchAsync(
+            CreateSpecification(["hold"]),
+            job,
+            CancellationToken.None);
+        var process = Assert.IsType<WindowsSupervisedProcess>(launched);
+        using var child = System.Diagnostics.Process.GetProcessById(process.Identity.ProcessId);
+
+        Assert.False(process.NativeExitObservation.IsCompleted);
+
+        child.Kill();
+        await process.NativeExitObservation.WaitAsync(Deadline);
+
+        Assert.True(child.WaitForExit(checked((int)Deadline.TotalMilliseconds)));
+        await process.DisposeAsync().AsTask().WaitAsync(Deadline);
+    }
+
+    [Fact]
+    public async Task NativeExitObservation_SurvivesForceCloseAndSignalsOnlyAfterLaterExit()
+    {
+        using var job = WindowsJobObject.CreateKillOnClose();
+        var launched = await CreateLauncher().LaunchAsync(
+            CreateSpecification(["hold"]),
+            job,
+            CancellationToken.None);
+        var process = Assert.IsType<WindowsSupervisedProcess>(launched);
+        using var child = System.Diagnostics.Process.GetProcessById(process.Identity.ProcessId);
+
+        process.ForceCloseAfterJobClose();
+
+        Assert.True(process.ProcessHandle.IsClosed);
+        Assert.False(child.HasExited);
+        Assert.False(process.NativeExitObservation.IsCompleted);
+
+        child.Kill();
+        await process.NativeExitObservation.WaitAsync(Deadline);
+
+        Assert.True(child.WaitForExit(checked((int)Deadline.TotalMilliseconds)));
+        await process.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromMilliseconds(100));
+    }
+
+    [Fact]
+    public async Task NativeExitObservation_CompletesAndReleasesProcessAfterNormalDispose()
+    {
+        using var job = WindowsJobObject.CreateKillOnClose();
+        var launched = await CreateLauncher().LaunchAsync(
+            CreateSpecification(["hold"]),
+            job,
+            CancellationToken.None);
+        var process = Assert.IsType<WindowsSupervisedProcess>(launched);
+        using var child = System.Diagnostics.Process.GetProcessById(process.Identity.ProcessId);
+
+        await process.DisposeAsync().AsTask().WaitAsync(Deadline);
+        await process.NativeExitObservation.WaitAsync(Deadline);
+
+        Assert.True(process.ProcessHandle.IsClosed);
+        Assert.True(child.WaitForExit(checked((int)Deadline.TotalMilliseconds)));
+    }
+
+    [Fact]
     public async Task LaunchAsync_RedactsSecretEnvironmentFromBothOutputStreams()
     {
         const string secret = "task-5-stream-secret";

@@ -45,6 +45,9 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
     {
         Identity = identity;
         ProcessHandle = processHandle;
+        NativeExitObservation = WaitForDuplicatedProcessExitAsync(
+            DuplicateProcessHandle(processHandle),
+            CancellationToken.None);
         StandardOutput = standardOutput;
         StandardError = standardError;
         _outputDrainTimeout = outputDrainTimeout;
@@ -81,6 +84,8 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
     public SupervisedProcessIdentity Identity { get; }
 
     internal SafeProcessHandle ProcessHandle { get; }
+
+    internal Task NativeExitObservation { get; }
 
     public Task<int> Completion { get; }
 
@@ -461,23 +466,45 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
         SafeProcessHandle processHandle,
         CancellationToken cancellationToken)
     {
-        var duplicatedHandle = DuplicateProcessHandle(processHandle);
-        var waitHandle = new ProcessWaitHandle(duplicatedHandle);
-        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var registration = ThreadPool.RegisterWaitForSingleObject(
-            waitHandle,
-            static (state, _) => ((TaskCompletionSource)state!).TrySetResult(),
-            completion,
-            Timeout.Infinite,
-            executeOnlyOnce: true);
-        var cancellationRegistration = cancellationToken.Register(
-            () => completion.TrySetCanceled(cancellationToken));
-        return AwaitAndDisposeAsync(
-            completion.Task,
-            registration,
-            waitHandle,
-            cancellationRegistration,
-            duplicatedHandle);
+        return WaitForDuplicatedProcessExitAsync(
+            DuplicateProcessHandle(processHandle),
+            cancellationToken);
+    }
+
+    private static Task WaitForDuplicatedProcessExitAsync(
+        SafeProcessHandle duplicatedHandle,
+        CancellationToken cancellationToken)
+    {
+        ProcessWaitHandle? waitHandle = null;
+        RegisteredWaitHandle? registration = null;
+        CancellationTokenRegistration cancellationRegistration = default;
+        try
+        {
+            waitHandle = new ProcessWaitHandle(duplicatedHandle);
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            registration = ThreadPool.RegisterWaitForSingleObject(
+                waitHandle,
+                static (state, _) => ((TaskCompletionSource)state!).TrySetResult(),
+                completion,
+                Timeout.Infinite,
+                executeOnlyOnce: true);
+            cancellationRegistration = cancellationToken.Register(
+                () => completion.TrySetCanceled(cancellationToken));
+            return AwaitAndDisposeAsync(
+                completion.Task,
+                registration,
+                waitHandle,
+                cancellationRegistration,
+                duplicatedHandle);
+        }
+        catch
+        {
+            cancellationRegistration.Dispose();
+            registration?.Unregister(waitObject: null);
+            waitHandle?.Dispose();
+            duplicatedHandle.Dispose();
+            throw;
+        }
     }
 
     private static SafeProcessHandle DuplicateProcessHandle(SafeProcessHandle processHandle)
