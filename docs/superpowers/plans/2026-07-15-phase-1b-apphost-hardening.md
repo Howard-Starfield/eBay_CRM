@@ -388,7 +388,11 @@ Using a disposable fixed-drive profile, require `OpenAsync(0)` to create
 a reparse-point logs directory, and expose a DACL containing the current user
 as the only allowed SID. Filenames must remain exactly the four documented
 values. Add a gated-sink test proving writes before activation create no
-directory/file and writes after activation reach the inner sink.
+directory/file and writes after activation reach the inner sink. Pre-create a
+directory and segment with inherited/broad ACLs and require fail-closed behavior
+rather than reuse. Race a reparse-point replacement and prove the factory's
+`FILE_FLAG_OPEN_REPARSE_POINT` handle validation rejects it without touching the
+target.
 
 - [ ] **Step 3: Run focused tests and confirm they fail**
 
@@ -419,8 +423,11 @@ Use `NativeSecurityDescriptor.CreateForCurrentUserOnly()` in non-inheritable
 security attributes. Validate the canonical profile and logs path with
 `DataProfileIdentity.EnsureNoReparsePoints` before and after directory
 creation. Open only the fixed slot path with create/truncate semantics, no
-sharing that permits replacement, `FILE_ATTRIBUTE_NORMAL`, and no inherited
-handle. Re-check the opened file's attributes and reject a reparse point before
+sharing that permits replacement, `FILE_ATTRIBUTE_NORMAL |
+FILE_FLAG_OPEN_REPARSE_POINT`, and no inherited handle. Query and compare the
+exact protected DACL on a pre-existing directory and on every opened segment;
+only the current user SID is permitted. Reject inherited/broad/unreadable ACLs.
+Re-check the opened file handle's attributes and reject a reparse point before
 returning its `FileStream`.
 
 - [ ] **Step 6: Wire one owned production sink**
@@ -443,6 +450,14 @@ single `WindowsProcessLauncher`. Remove the executor's private no-op sink. Call
 leave no `logs` directory or segment change. The executor owns sink
 completion/disposal after role/process cleanup; capture sink disposal failure
 with the existing cleanup aggregation without preventing ownership release.
+
+Add a one-second production diagnostic-completion budget. Executor disposal
+requests `CompleteAsync` through that budget. On expiry, cancel the writer,
+increment a non-secret completion-timeout counter, and continue ownership
+release without awaiting `DisposeAsync` or any stream operation that ignores
+cancellation. Add a blocking stream whose write/flush/dispose never completes
+and assert AppHost shutdown plus profile reacquisition completes within
+1.5 seconds.
 
 - [ ] **Step 7: Add production-composition acceptance coverage**
 
@@ -517,7 +532,7 @@ Assert.NotEqual(ownerSessionId, result.BrokerSessionId);
 Assert.Equal(result.BrokerSessionId, result.ContenderSessionId);
 Assert.Equal(2, result.ExitCode);
 Assert.Equal("profile-already-owned", result.StandardError.Trim());
-Assert.Equal(string.Empty, result.StandardOutput.Trim());
+Assert.Equal(RuntimeState.AcquiringInstance.ToString(), result.StandardOutput.Trim());
 Assert.Equal(1u, result.TotalProcesses);
 ```
 

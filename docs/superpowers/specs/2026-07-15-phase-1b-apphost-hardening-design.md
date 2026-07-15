@@ -201,6 +201,14 @@ After activation, the directory and files must:
 - cap each segment at 1 MiB and retain at most four segments; and
 - never derive a path or filename from diagnostic content.
 
+Creation-time security attributes are not sufficient for pre-existing
+artifacts. Before use, the factory validates the exact protected DACL of the
+existing `logs` directory and every opened segment; only the current user SID
+may have access. A broader, inherited, unreadable, or otherwise mismatched DACL
+fails the diagnostic sink closed without blocking AppHost lifecycle. Files are
+opened with `FILE_FLAG_OPEN_REPARSE_POINT` and validated through the opened
+handle so a raced reparse point cannot redirect the writer.
+
 ### Data contract
 
 Only typed, allowlisted lifecycle fields and stable reason codes may enter the
@@ -231,6 +239,13 @@ The sink remains a bounded, non-blocking producer with one background writer.
 Full queues, access denial, disk-full simulation, malformed segment state, and
 writer failure increment non-secret counters and do not prevent startup,
 shutdown, containment, or ownership release.
+
+Final diagnostic completion has a one-second production budget. Expiry cancels
+the writer, records a non-secret completion-timeout counter, and releases
+profile ownership without awaiting a stream that ignores cancellation. The
+process teardown remains the final resource boundary. A deliberately blocking
+stream acceptance test must prove shutdown and ownership release remain within
+that bound.
 
 `AppHostComposition` owns one gated production sink and injects it into the
 lifecycle executor and every `WindowsProcessLauncher`. The executor activates
