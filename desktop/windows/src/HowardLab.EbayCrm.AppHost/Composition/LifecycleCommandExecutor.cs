@@ -54,6 +54,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     private string? _workerFixtureModeForTests;
     private int _disposed;
     private int _faultDiagnosticWritten;
+    private int _releaseInstanceCountForTests;
 
     public LifecycleCommandExecutor(
         AppHostOptions options,
@@ -93,6 +94,8 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
 
     internal Action<RuntimeRole, WindowsJobObject, WindowsSupervisedProcess>? RoleLaunchedForTests { get; set; }
 
+    internal int ReleaseInstanceCountForTests => Volatile.Read(ref _releaseInstanceCountForTests);
+
     internal static void RetainWorkerJobHandleInRoleForTests(
         RuntimeRole role,
         WindowsJobObject job,
@@ -103,6 +106,10 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             job.DuplicateIntoProcessForTests(process.ProcessHandle);
         }
     }
+
+    internal static bool TryTakeExactRoleResource<T>(ref T? current, T expected)
+        where T : class =>
+        ReferenceEquals(Interlocked.CompareExchange(ref current, null, expected), expected);
 
     internal AppHostRuntimeSnapshot SnapshotForTests() => new(
         _databaseIdentity?.ProcessId,
@@ -816,6 +823,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             await _instanceLock.DisposeAsync().ConfigureAwait(false);
             _instanceLock = null;
             _instanceOperationId = null;
+            Interlocked.Increment(ref _releaseInstanceCountForTests);
         }
 
         return null;
@@ -1084,9 +1092,9 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     private async Task DisposeRoleAsync(RoleResource resource)
     {
         var removed = resource.Generation.Role == RuntimeRole.Server
-            ? Interlocked.CompareExchange(ref _server, null, resource)
-            : Interlocked.CompareExchange(ref _worker, null, resource);
-        if (!ReferenceEquals(removed, resource))
+            ? TryTakeExactRoleResource(ref _server, resource)
+            : TryTakeExactRoleResource(ref _worker, resource);
+        if (!removed)
         {
             return;
         }

@@ -7,11 +7,32 @@ using HowardLab.EbayCrm.AppHost.Integration.Tests.AppHost;
 using HowardLab.EbayCrm.AppHost.Windows.Instance;
 using HowardLab.EbayCrm.AppHost.Protocol.Control;
 using HowardLab.EbayCrm.AppHost.Windows.Processes;
+using HowardLab.EbayCrm.AppHost.Core.Time;
 
 namespace HowardLab.EbayCrm.AppHost.Integration.Tests.Acceptance;
 
 public sealed class TimeoutReconciliationAcceptanceTests
 {
+    [Fact, Trait("Category", "Acceptance")]
+    public async Task ExhaustedRoleStartReconciliation_ContainsBeforeReleaseWithoutStartupRollback()
+    {
+        var executor = new ExhaustedRoleStartReconciliationExecutor();
+        var coordinator = new LifecycleCoordinator(
+            new SystemClock(),
+            new RestartBudget(3, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(5)));
+        await using var orchestrator = new RuntimeOrchestrator(coordinator, executor);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => orchestrator.StartAsync());
+
+        Assert.Equal(RuntimeState.Faulted, orchestrator.State);
+        Assert.Equal(0, executor.RollbackCount);
+        Assert.Equal(1, executor.Commands.Count(type => type == LifecycleCommandType.EscalateJob));
+        Assert.Equal(1, executor.Commands.Count(type => type == LifecycleCommandType.ReleaseInstance));
+        Assert.True(
+            executor.Commands.IndexOf(LifecycleCommandType.EscalateJob) <
+            executor.Commands.IndexOf(LifecycleCommandType.ReleaseInstance));
+    }
+
     [PostgresTheory, Trait("Category", "Acceptance")]
     [InlineData(RuntimeRole.Server)]
     [InlineData(RuntimeRole.Worker)]
@@ -212,6 +233,42 @@ public sealed class TimeoutReconciliationAcceptanceTests
         Assert.NotNull(processId);
         Assert.Throws<ArgumentException>(() => System.Diagnostics.Process.GetProcessById(processId.Value));
     }
+}
+
+internal sealed class ExhaustedRoleStartReconciliationExecutor : ILifecycleCommandExecutor
+{
+    internal List<LifecycleCommandType> Commands { get; } = [];
+
+    internal int RollbackCount { get; private set; }
+
+    public Task<LifecycleEvent?> ExecuteAsync(
+        LifecycleCommand command,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Commands.Add(command.Type);
+        LifecycleEvent? result = command.Type switch
+        {
+            LifecycleCommandType.AcquireInstance => new InstanceAcquired(command.OperationId),
+            LifecycleCommandType.ValidatePayload => new PayloadValidated(command.OperationId),
+            LifecycleCommandType.PrepareRuntime => new RuntimePrepared(command.OperationId),
+            LifecycleCommandType.StartDatabase => new RoleStarted(command.Generation!.Value),
+            LifecycleCommandType.WaitForDatabase => new RoleReady(command.Generation!.Value),
+            LifecycleCommandType.RunMigrations => new MigrationCompleted(command.OperationId),
+            LifecycleCommandType.StartServer => new OperationTimedOut(command.Generation!.Value, command.OperationId),
+            LifecycleCommandType.ReconcileRoleStart => new OperationTimedOut(command.Generation!.Value, command.OperationId),
+            _ => null,
+        };
+        return Task.FromResult(result);
+    }
+
+    public Task RollbackAsync(Guid operationId, CancellationToken cancellationToken = default)
+    {
+        RollbackCount++;
+        return Task.CompletedTask;
+    }
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }
 
 internal sealed class BlockingRoleOperationBoundary(

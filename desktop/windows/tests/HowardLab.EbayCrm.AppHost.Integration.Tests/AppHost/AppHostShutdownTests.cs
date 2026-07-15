@@ -14,6 +14,25 @@ namespace HowardLab.EbayCrm.AppHost.Integration.Tests.AppHost;
 
 public sealed class AppHostShutdownTests
 {
+    [Fact, Trait("Category", "AppHost")]
+    public void LateRetainedStopCompletion_CannotClearOrTerminateNewerRoleResource()
+    {
+        var retained = new RoleResourceProbe();
+        var newer = new RoleResourceProbe();
+        RoleResourceProbe? current = newer;
+
+        var removed = LifecycleCommandExecutor.TryTakeExactRoleResource(ref current, retained);
+        if (removed)
+        {
+            retained.Terminate();
+        }
+
+        Assert.False(removed);
+        Assert.Same(newer, current);
+        Assert.False(retained.Terminated);
+        Assert.False(newer.Terminated);
+    }
+
     [PostgresTheory, Trait("Category", "AppHost")]
     [InlineData(RuntimeRole.Server)]
     [InlineData(RuntimeRole.Worker)]
@@ -65,6 +84,7 @@ public sealed class AppHostShutdownTests
             Assert.True(databaseIdentity!.HasExited);
             Assert.True(databaseIdentity.SameIdentityIfReopened());
             Assert.False(File.Exists(Path.Combine(layout.ProfileRoot, "postgres-data", "postmaster.pid")));
+            Assert.Equal(1, runtime.Executor.ReleaseInstanceCountForTests);
             var profile = DataProfileIdentity.Create(layout.ProfileRoot);
             var ownership = await UserProfileInstanceLock.TryAcquireAsync(profile, CancellationToken.None);
             Assert.NotNull(ownership);
@@ -322,6 +342,13 @@ public sealed class AppHostShutdownTests
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class RoleResourceProbe
+    {
+        internal bool Terminated { get; private set; }
+
+        internal void Terminate() => Terminated = true;
     }
 
     private static int ReserveLoopbackPort()

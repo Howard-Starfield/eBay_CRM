@@ -13,6 +13,7 @@ public sealed class RuntimeOrchestrator : IAsyncDisposable
     private readonly List<RuntimeState> _stateHistory = [];
     private readonly TaskCompletionSource<string> _fatal = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _disposed;
+    private bool _roleStartReconciliationExhausted;
 
     public RuntimeOrchestrator(
         LifecycleCoordinator coordinator,
@@ -49,6 +50,7 @@ public sealed class RuntimeOrchestrator : IAsyncDisposable
             }
 
             var operationId = Guid.NewGuid();
+            _roleStartReconciliationExhausted = false;
             try
             {
                 await ProcessAsync(
@@ -62,13 +64,22 @@ public sealed class RuntimeOrchestrator : IAsyncDisposable
             }
             catch (Exception startupFailure)
             {
-                try
+                if (_roleStartReconciliationExhausted)
                 {
-                    await _executor.RollbackAsync(operationId, CancellationToken.None).ConfigureAwait(false);
+                    await FinalizeFatalContainmentAsync(
+                        "role-start-reconciliation-timed-out",
+                        [startupFailure]).ConfigureAwait(false);
                 }
-                catch (Exception rollbackFailure)
+                else
                 {
-                    throw new AggregateException(startupFailure, rollbackFailure);
+                    try
+                    {
+                        await _executor.RollbackAsync(operationId, CancellationToken.None).ConfigureAwait(false);
+                    }
+                    catch (Exception rollbackFailure)
+                    {
+                        throw new AggregateException(startupFailure, rollbackFailure);
+                    }
                 }
 
                 throw;
@@ -395,6 +406,11 @@ public sealed class RuntimeOrchestrator : IAsyncDisposable
                     : cancellationToken;
                 var nextEvent = await _executor.ExecuteAsync(command, commandCancellation)
                     .ConfigureAwait(false);
+                if (command.Type == LifecycleCommandType.ReconcileRoleStart &&
+                    nextEvent is OperationTimedOut)
+                {
+                    _roleStartReconciliationExhausted = true;
+                }
                 if (nextEvent is not null)
                 {
                     var dispatchCancellation = nextEvent is OperationTimedOut
