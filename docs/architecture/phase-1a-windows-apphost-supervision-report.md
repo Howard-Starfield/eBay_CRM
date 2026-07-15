@@ -226,8 +226,8 @@ Date: 2026-07-15 (America/Los_Angeles)
 Branch: `codex/phase-1b-apphost-hardening`
 
 Phase 1B base commit: `2507d8c92f3d2771ee803fb18feb757396a740c0`.
-Tested implementation commit: `f432ece2a41601e48fec36528a80d3b0587d7064`.
-Tested implementation tree: `6a7cbe59c95508ead2b1265d7caec6c2322da3d5`.
+Tested implementation commit: `3057bb076facfe40a74432615f39fa183674fe1c`.
+Tested implementation tree: `b3f45b6c251008d73db73a9e3d08956a6e3207f0`.
 The later documentation-only evidence commit does not change the tested
 implementation. Scope remains the Windows AppHost foundation. No Redis-free
 Twenty boot, full Twenty server, eBay UI, tray, installer, updater, backup, or
@@ -254,7 +254,7 @@ dotnet publish desktop\windows\src\HowardLab.EbayCrm.AppHost\HowardLab.EbayCrm.A
 
 Locked restore and publish exited zero. The Release build reported 0 warnings
 and 0 errors. The clean self-contained publish contained 204 files totaling
-81,266,106 bytes, including AppHost, Fixture, `hostfxr.dll`, `coreclr.dll`, and
+81,270,270 bytes, including AppHost, Fixture, `hostfxr.dll`, `coreclr.dll`, and
 `System.Private.CoreLib.dll`.
 
 ## Focused Phase 1B gates
@@ -265,7 +265,7 @@ The exact aggregate gate was:
 dotnet test desktop\windows\tests\HowardLab.EbayCrm.AppHost.Integration.Tests\HowardLab.EbayCrm.AppHost.Integration.Tests.csproj --configuration Release --no-restore --filter "FullyQualifiedName~TimeoutReconciliationAcceptanceTests|FullyQualifiedName~DiagnosticCanaryAcceptanceTests|FullyQualifiedName~CrossSessionOwnershipAcceptanceTests" --logger "console;verbosity=detailed" --nologo
 ```
 
-It passed 28 of 28 tests with 0 failures and 0 skips. Because that literal
+It passed 37 of 37 tests with 0 failures and 0 skips. Because that literal
 filter does not select the late-stop tests in `AppHostShutdownTests`, the four
 role boundaries were also run with this required supplement:
 
@@ -273,16 +273,18 @@ role boundaries were also run with this required supplement:
 dotnet test desktop\windows\tests\HowardLab.EbayCrm.AppHost.Integration.Tests\HowardLab.EbayCrm.AppHost.Integration.Tests.csproj --configuration Release --no-restore --no-build --filter "FullyQualifiedName~TimeoutReconciliationAcceptanceTests|FullyQualifiedName~AppHostShutdownTests" --logger "console;verbosity=detailed" --nologo
 ```
 
-The supplement passed 15 of 15 tests with 0 failures and 0 skips. Its detailed
+The supplement passed 18 of 18 tests with 0 failures and 0 skips. Its detailed
 output included late start and late stop for both Server and Worker. A separate
 six-test output-only evidence replay passed 6 of 6; its temporary serialization
 statements were reverted and are not part of the tested or committed tree.
 
 ### Retained role identity evidence
 
-Each row was captured while its injected boundary held the original retained
-operation. Each test asserted one role launch, one launch for the exact
-generation, one live exact Fixture identity before release, and no duplicate.
+This detailed table was captured by the pre-review evidence replay at
+`f432ece2`. The final `3057bb07` gate reran the strengthened assertions but did
+not emit new process identifiers. Each test asserted one role launch, one
+launch for the exact generation, one live exact Fixture identity before
+release, and no duplicate.
 
 | Boundary | Role | Generation | Operation ID | PID | UTC creation time |
 |---|---|---:|---|---:|---|
@@ -308,7 +310,7 @@ owner's segment snapshots.
 
 ### Same-user S4U evidence
 
-The real release-mode S4U gate recorded:
+The pre-review detailed release-mode S4U gate at `f432ece2` recorded:
 
 - User SID `S-1-5-21-3841990347-2960067561-1741789597-1001`.
 - Owner PID 20632 in interactive session 3.
@@ -318,8 +320,10 @@ The real release-mode S4U gate recorded:
 - Cumulative broker Job process count 1; contender exit code 2 with exact
   `profile-already-owned` stderr.
 
-The owner remained healthy, the contender could not mutate the owned profile,
-and the focused gate reported no S4U skip.
+The final gate at `3057bb07` additionally proved the owner remained alive over
+an explicit 1,250 ms observation window; it does not claim that a successful
+health-monitor cycle was observed. The contender could not mutate the owned
+profile, and the final focused gate reported no S4U skip.
 
 ## Full documented partitions
 
@@ -327,14 +331,37 @@ The final post-fix partition commands and observed counts were:
 
 | Partition | Command discriminator | Passed | Failed | Skipped |
 |---|---|---:|---:|---:|
-| Core | Core test project | 150 | 0 | 0 |
-| Windows | Windows test project | 142 | 0 | 0 |
-| Non-destructive integration | `Category!=DestructiveContainment` | 137 | 0 | 0 |
+| Core | Core test project | 156 | 0 | 0 |
+| Windows | Windows test project | 144 | 0 | 0 |
+| Non-destructive integration | `Category!=DestructiveContainment` | 146 | 0 | 0 |
 | Destructive containment | `Category=DestructiveContainment` with `RunConfiguration.DisableAppDomain=true` | 3 | 0 | 0 |
 
-Total across the non-overlapping partitions: 432 passed, 0 failed, 0 skipped.
+Total across the non-overlapping partitions: 449 passed, 0 failed, 0 skipped.
 The destructive partition's pre/post inventory remained 204 files and
-81,266,106 bytes with zero relative-path, length, or SHA-256 differences.
+81,270,270 bytes with zero relative-path, length, or SHA-256 differences.
+
+## Independent-review remediation
+
+The final whole-branch review found no Critical issues and initially blocked
+adoption on lifecycle, diagnostic-ACL, and S4U-cleanup findings. Commit
+`3057bb076facfe40a74432615f39fa183674fe1c` closed those findings with RED/GREEN
+coverage:
+
+- caller cancellation and faulted authenticated accepts preserve or dispose the
+  exact retained role resource and reconcile to a bounded outcome;
+- recovery-stop reconciliation is keyed independently from the mutable global
+  operation, reaches a terminal outcome on a second timeout, rejects stale
+  cross-role results, and prunes terminal tracking;
+- the internal seam receives the actual pending accept/read task, so acceptance
+  proves the real operation is in flight;
+- diagnostic DACL validation uses `GetKernelObjectSecurity` on the exact opened
+  handles, rejects callback ACEs, and remains reparse-safe and fail-closed; and
+- S4U setup and teardown preserve primary plus cleanup failures, apply the
+  current-user-only ACL at directory creation, preserve pre-existing scheduler
+  folders, and remove runner-owned artifacts.
+
+Fresh focused re-reviews approved all three scopes with no remaining Critical
+or Important findings before the authoritative gates above were run.
 
 ## Destructive cleanup regression found during adoption
 
@@ -361,12 +388,12 @@ identities. It did not enumerate, inspect, or kill unrelated user processes by
 image name.
 
 Task Scheduler's `\HowardLab` folder was absent, so there were 0
-`eBayCRM-Acceptance-*` tasks. Sixteen exact disposable-prefix patterns covering
-Phase 1B role, diagnostic, S4U, PostgreSQL, and containment roots found 0 roots.
-An earlier audit found two older `ebaycrm-pg-*` roots created before Task 5;
-after confirming zero exact pinned PostgreSQL survivors and exclusive access,
-only those resolved disposable roots were removed. The final audit was then
-repeated and returned zero for all three categories.
+`eBayCRM-Acceptance-*` tasks. The post-review audit queried the scoped
+`ebaycrm-phase1b-role-executor-*`, `ebaycrm-s4u-*`, `ebaycrm-task*-*`, and
+`ebaycrm-pg-*` disposable roots and found 0. The earlier Task 5 audit also found
+0 across its sixteen exact disposable-prefix patterns. The final post-review
+audit returned zero for processes, tasks, and scoped roots without deleting or
+inspecting unrelated processes by image name.
 
 The remaining limitation is deliberate scope: these gates use the attested
 Fixture plus real PostgreSQL and do not prove a Redis-free or full Twenty boot.
