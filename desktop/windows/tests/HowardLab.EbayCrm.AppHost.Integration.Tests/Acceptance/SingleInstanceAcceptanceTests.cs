@@ -84,6 +84,7 @@ public sealed class SingleInstanceAcceptanceTests
                 await contender.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
                 contender.Dispose();
             }
+            await WaitForExclusiveFilesAsync(layout.ProfileRoot);
         }
     }
 
@@ -101,6 +102,29 @@ public sealed class SingleInstanceAcceptanceTests
             false,
             process.ExitCode,
             await process.StandardError.ReadToEndAsync());
+    }
+
+    private static async Task WaitForExclusiveFilesAsync(string root)
+    {
+        var deadline = Stopwatch.StartNew();
+        while (deadline.Elapsed < TimeSpan.FromSeconds(10))
+        {
+            try
+            {
+                foreach (var path in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+                {
+                    using var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+                }
+
+                return;
+            }
+            catch (IOException)
+            {
+                await Task.Delay(50);
+            }
+        }
+
+        throw new IOException("profile-files-remained-open-after-contender-stop");
     }
 
     private sealed record ContenderObservation(
