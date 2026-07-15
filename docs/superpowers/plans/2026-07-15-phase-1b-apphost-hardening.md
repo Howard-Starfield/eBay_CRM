@@ -532,7 +532,13 @@ Assert.NotEqual(ownerSessionId, result.BrokerSessionId);
 Assert.Equal(result.BrokerSessionId, result.ContenderSessionId);
 Assert.Equal(2, result.ExitCode);
 Assert.Equal("profile-already-owned", result.StandardError.Trim());
-Assert.Equal(RuntimeState.AcquiringInstance.ToString(), result.StandardOutput.Trim());
+Assert.Equal(
+    string.Join(
+        Environment.NewLine,
+        RuntimeState.AcquiringInstance,
+        RuntimeState.Stopping,
+        RuntimeState.Stopped),
+    result.StandardOutput.Trim());
 Assert.Equal(1u, result.TotalProcesses);
 ```
 
