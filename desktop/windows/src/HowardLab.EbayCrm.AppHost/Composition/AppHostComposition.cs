@@ -28,6 +28,7 @@ public static class AppHostComposition
 
     public static RuntimeOrchestrator Create(AppHostOptions options)
     {
+        EnsureSupportedRoleTarget(options);
         var runtime = CreateRuntime(
             options,
             null,
@@ -82,6 +83,7 @@ public static class AppHostComposition
         IRoleLaunchPlanProvider? roleLaunchPlanProvider = null)
     {
         ArgumentNullException.ThrowIfNull(options);
+        EnsureSupportedRoleTarget(options);
         if (options.Mode != AppHostMode.Run)
         {
             throw new AppHostOptionsException("run-mode-required");
@@ -89,7 +91,11 @@ public static class AppHostComposition
 
         // Profile ownership must be established before checking shared runtime
         // resources so every same-profile loser reports one stable reason.
-        var validated = Validate(options, requireAvailablePort: false);
+        var requiresFixtureValidation = roleLaunchPlanProvider is null;
+        var validated = Validate(
+            options,
+            requireAvailablePort: false,
+            validateFixture: requiresFixtureValidation);
         var coordinator = new LifecycleCoordinator(
             new SystemClock(),
             new RestartBudget(3, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(5)));
@@ -112,8 +118,24 @@ public static class AppHostComposition
         var ownedDiagnosticSink = new OwnershipGatedDiagnosticSink(
             diagnosticSink,
             diagnosticCompletionBudget ?? TimeSpan.FromSeconds(1));
-        var fixtureRoleLaunchPlanProvider = new FixtureRoleLaunchPlanProvider(options, validated);
-        var activeRoleLaunchPlanProvider = roleLaunchPlanProvider ?? fixtureRoleLaunchPlanProvider;
+        FixtureRoleLaunchPlanProvider? fixtureRoleLaunchPlanProvider = null;
+        IRoleLaunchPlanProvider activeRoleLaunchPlanProvider;
+        if (roleLaunchPlanProvider is not null)
+        {
+            activeRoleLaunchPlanProvider = roleLaunchPlanProvider;
+        }
+        else
+        {
+            switch (options.RoleTarget)
+            {
+                case AppHostRoleTarget.ControlledFixture:
+                    fixtureRoleLaunchPlanProvider = new FixtureRoleLaunchPlanProvider(options, validated);
+                    activeRoleLaunchPlanProvider = fixtureRoleLaunchPlanProvider;
+                    break;
+                default:
+                    throw new AppHostOptionsException("invalid-role-target");
+            }
+        }
         var executor = new LifecycleCommandExecutor(
             options,
             validated,
@@ -151,12 +173,16 @@ public static class AppHostComposition
                 "postgres-desktop-runtime-incomplete"));
         }
 
-        _ = Validate(options, requireAvailablePort: true);
+        EnsureSupportedRoleTarget(options);
+        _ = Validate(options, requireAvailablePort: true, validateFixture: true);
         cancellationToken.ThrowIfCancellationRequested();
         return Task.FromResult(new AppHostProbeResult(true, "probe-valid"));
     }
 
-    private static ValidatedAppHostPayload Validate(AppHostOptions options, bool requireAvailablePort)
+    private static ValidatedAppHostPayload Validate(
+        AppHostOptions options,
+        bool requireAvailablePort,
+        bool validateFixture)
     {
         var profile = DataProfileIdentity.Create(options.ProfileRoot);
         var layout = PostgresBinaryLayout.Validate(options.PostgresBin);
@@ -177,27 +203,10 @@ public static class AppHostComposition
             throw new AppHostOptionsException("postgres-version-mismatch");
         }
 
-        if (!File.Exists(options.FixturePath) ||
-            !Path.GetFileName(options.FixturePath).Equals(
-                "HowardLab.EbayCrm.AppHost.Fixture.exe",
-                StringComparison.OrdinalIgnoreCase) ||
-            (File.GetAttributes(options.FixturePath) & FileAttributes.ReparsePoint) != 0)
+        if (validateFixture)
         {
-            throw new AppHostOptionsException("fixture-invalid");
+            ValidateFixture(options.FixturePath);
         }
-
-        _ = DataProfileIdentity.Create(Path.GetDirectoryName(options.FixturePath)!);
-        var expectedFixture = Path.GetFullPath(Path.Combine(
-            AppContext.BaseDirectory,
-            "HowardLab.EbayCrm.AppHost.Fixture.exe"));
-        if (!StringComparer.OrdinalIgnoreCase.Equals(Path.GetFullPath(options.FixturePath), expectedFixture))
-        {
-            throw new AppHostOptionsException("fixture-trust-mismatch");
-        }
-
-        ValidateTrustedFixtureExecutable(expectedFixture);
-
-        const string fixtureBuildIdentity = ControlProtocolConstants.FixtureBuildIdentity;
 
         if (requireAvailablePort)
         {
@@ -217,8 +226,39 @@ public static class AppHostComposition
             profile,
             layout,
             PostgresClusterPaths.Create(profile.CanonicalPath),
-            migrationPath,
-            fixtureBuildIdentity);
+            migrationPath);
+    }
+
+    private static void ValidateFixture(string fixturePath)
+    {
+        if (!File.Exists(fixturePath) ||
+            !Path.GetFileName(fixturePath).Equals(
+                "HowardLab.EbayCrm.AppHost.Fixture.exe",
+                StringComparison.OrdinalIgnoreCase) ||
+            (File.GetAttributes(fixturePath) & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new AppHostOptionsException("fixture-invalid");
+        }
+
+        _ = DataProfileIdentity.Create(Path.GetDirectoryName(fixturePath)!);
+        var expectedFixture = Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "HowardLab.EbayCrm.AppHost.Fixture.exe"));
+        if (!StringComparer.OrdinalIgnoreCase.Equals(Path.GetFullPath(fixturePath), expectedFixture))
+        {
+            throw new AppHostOptionsException("fixture-trust-mismatch");
+        }
+
+        ValidateTrustedFixtureExecutable(expectedFixture);
+    }
+
+    private static void EnsureSupportedRoleTarget(AppHostOptions? options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        if (options.RoleTarget != AppHostRoleTarget.ControlledFixture)
+        {
+            throw new AppHostOptionsException("invalid-role-target");
+        }
     }
 
     internal static void ValidateTrustedFixtureExecutable(string path)
@@ -343,7 +383,7 @@ public static class AppHostComposition
 internal sealed record AppHostTestRuntime(
     RuntimeOrchestrator Orchestrator,
     LifecycleCommandExecutor Executor,
-    FixtureRoleLaunchPlanProvider FixtureRoleLaunchPlanProvider,
+    FixtureRoleLaunchPlanProvider? FixtureRoleLaunchPlanProvider,
     IRoleLaunchPlanProvider ActiveRoleLaunchPlanProvider);
 
 internal sealed class OwnershipGatedDiagnosticSink : IDiagnosticSink
@@ -412,5 +452,4 @@ public sealed record ValidatedAppHostPayload(
     DataProfileIdentity Profile,
     PostgresBinaryLayout PostgresLayout,
     PostgresClusterPaths PostgresPaths,
-    string MigrationPath,
-    string FixtureBuildIdentity);
+    string MigrationPath);

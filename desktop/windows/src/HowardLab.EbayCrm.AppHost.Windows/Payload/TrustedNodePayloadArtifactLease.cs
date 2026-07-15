@@ -9,12 +9,15 @@ public sealed class TrustedNodePayloadArtifactLease : IDisposable
     private readonly object _lifetimeGate = new();
     private SafeFileHandle[]? _handles;
     private TrustedNodePayload? _payload;
+    private IDisposable? _payloadLifetimeLease;
 
     public TrustedNodePayloadArtifactLease(TrustedNodePayload payload)
     {
         var acquired = new List<SafeFileHandle>();
+        IDisposable? payloadLifetimeLease = null;
         try
         {
+            payloadLifetimeLease = payload?.OpenLifetimeLease() ?? throw Failure();
             var expectedPaths = ValidateExpectedPaths(payload);
             foreach (var expectedPath in expectedPaths)
             {
@@ -24,6 +27,8 @@ public sealed class TrustedNodePayloadArtifactLease : IDisposable
             payload.VerifyClosure();
             _handles = acquired.ToArray();
             _payload = payload;
+            _payloadLifetimeLease = payloadLifetimeLease;
+            payloadLifetimeLease = null;
         }
         catch (NodePayloadManifestException)
         {
@@ -33,7 +38,12 @@ public sealed class TrustedNodePayloadArtifactLease : IDisposable
         catch
         {
             DisposeHandles(acquired);
+            payloadLifetimeLease?.Dispose();
             throw Failure();
+        }
+        finally
+        {
+            payloadLifetimeLease?.Dispose();
         }
     }
 
@@ -48,6 +58,8 @@ public sealed class TrustedNodePayloadArtifactLease : IDisposable
 
             _handles = null;
             _payload = null;
+            _payloadLifetimeLease?.Dispose();
+            _payloadLifetimeLease = null;
         }
 
         GC.SuppressFinalize(this);

@@ -24,6 +24,12 @@ public sealed class ProcessLaunchException : Exception
     public int Win32ErrorCode { get; }
 }
 
+public enum NativeExitObservationKind
+{
+    Authoritative,
+    ProofUnavailableContainment,
+}
+
 public sealed class ProcessCleanupException : Exception
 {
     public ProcessCleanupException(
@@ -31,7 +37,10 @@ public sealed class ProcessCleanupException : Exception
         int? processTerminationErrorCode,
         int? jobTerminationErrorCode,
         int? waitErrorCode,
-        bool timedOut)
+        bool timedOut,
+        Task nativeExitObservation,
+        NativeExitObservationKind nativeExitObservationKind =
+            NativeExitObservationKind.Authoritative)
         : base(
             $"Could not complete {role} process cleanup; " +
             $"process error {Format(processTerminationErrorCode)}, " +
@@ -43,6 +52,9 @@ public sealed class ProcessCleanupException : Exception
         JobTerminationErrorCode = jobTerminationErrorCode;
         WaitErrorCode = waitErrorCode;
         TimedOut = timedOut;
+        PayloadLifetimeBoundaryObservation = nativeExitObservation ??
+            throw new ArgumentNullException(nameof(nativeExitObservation));
+        NativeExitObservationKind = nativeExitObservationKind;
     }
 
     public RuntimeRole Role { get; }
@@ -54,6 +66,15 @@ public sealed class ProcessCleanupException : Exception
     public int? WaitErrorCode { get; }
 
     public bool TimedOut { get; }
+
+    public Task PayloadLifetimeBoundaryObservation { get; }
+
+    public NativeExitObservationKind NativeExitObservationKind { get; }
+
+    public Task? AuthoritativeNativeExitObservation =>
+        NativeExitObservationKind == NativeExitObservationKind.Authoritative
+            ? PayloadLifetimeBoundaryObservation
+            : null;
 
     private static string Format(int? errorCode) => errorCode?.ToString() ?? "none";
 }

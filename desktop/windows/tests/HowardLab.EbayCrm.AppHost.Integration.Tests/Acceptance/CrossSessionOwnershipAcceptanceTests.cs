@@ -290,6 +290,7 @@ public sealed class CrossSessionOwnershipAcceptanceTests
             "--port", layout.Port.ToString(CultureInfo.InvariantCulture),
             "--mode", "run",
             "--runtime-backend", "redis",
+            "--role-target", "controlled-fixture",
         }) startInfo.ArgumentList.Add(argument);
         return Process.Start(startInfo) ?? throw new InvalidOperationException("owner-start-failed");
     }

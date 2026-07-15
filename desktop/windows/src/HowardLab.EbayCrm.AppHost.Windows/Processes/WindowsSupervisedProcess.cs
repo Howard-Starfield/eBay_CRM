@@ -41,13 +41,12 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
         TimeSpan outputDrainTimeout,
         IDiagnosticSink diagnosticSink,
         IProcessCleanupPolicy cleanupPolicy,
-        IProcessTreeTerminator job)
+        IProcessTreeTerminator job,
+        Task? nativeExitObservation = null)
     {
         Identity = identity;
         ProcessHandle = processHandle;
-        NativeExitObservation = WaitForDuplicatedProcessExitAsync(
-            DuplicateProcessHandle(processHandle),
-            CancellationToken.None);
+        NativeExitObservation = nativeExitObservation ?? WindowsNativeExitObservation.Create(processHandle);
         StandardOutput = standardOutput;
         StandardError = standardError;
         _outputDrainTimeout = outputDrainTimeout;
@@ -206,7 +205,8 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
                         cleanup.ProcessTerminationErrorCode,
                         cleanup.JobTerminationErrorCode,
                         cleanup.WaitErrorCode,
-                        cleanup.TimedOut);
+                        cleanup.TimedOut,
+                        NativeExitObservation);
                 }
             }
 

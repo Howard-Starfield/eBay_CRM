@@ -63,6 +63,38 @@ public sealed class AppHostStartupTests
         Assert.Equal("missing-required-option", error.ReasonCode);
     }
 
+    [Fact, Trait("Category", "AppHost")]
+    public void Options_RequireAnExplicitRoleTarget()
+    {
+        using var layout = TestLayout.Create();
+        var arguments = layout.Arguments("run").ToList();
+        arguments.RemoveRange(arguments.IndexOf("--role-target"), 2);
+
+        var error = Assert.Throws<AppHostOptionsException>(() =>
+            AppHostOptions.Parse([.. arguments]));
+
+        Assert.Equal("missing-required-option", error.ReasonCode);
+    }
+
+    [Theory, Trait("Category", "AppHost")]
+    [InlineData("")]
+    [InlineData("fixture")]
+    [InlineData("trusted-node")]
+    [InlineData("Controlled-Fixture")]
+    [InlineData("controlled_fixture")]
+    [InlineData(" controlled-fixture")]
+    [InlineData("controlled-fixture ")]
+    public void Options_RejectMalformedOrUnavailableRoleTargets(string roleTarget)
+    {
+        using var layout = TestLayout.Create();
+
+        var error = Assert.Throws<AppHostOptionsException>(() =>
+            AppHostOptions.Parse(layout.Arguments("run", roleTarget: roleTarget)));
+
+        Assert.Equal("invalid-role-target", error.ReasonCode);
+        Assert.Null(error.InnerException);
+    }
+
     [Theory, Trait("Category", "AppHost")]
     [InlineData("")]
     [InlineData("Redis")]
@@ -105,6 +137,51 @@ public sealed class AppHostStartupTests
         var error = Assert.Throws<AppHostOptionsException>(() => AppHostOptions.Parse(arguments));
 
         Assert.Equal("duplicate-option", error.ReasonCode);
+    }
+
+    [Fact, Trait("Category", "AppHost")]
+    public void Composition_RejectsUndefinedRoleTargetBeforePayloadValidationSideEffects()
+    {
+        using var layout = TestLayout.Create();
+        var marker = Path.Combine(layout.ProfileRoot, "must-not-be-created");
+        var options = AppHostOptions.Parse(layout.Arguments("run")) with
+        {
+            RoleTarget = (AppHostRoleTarget)int.MaxValue,
+            FixturePath = marker,
+        };
+
+        var error = Assert.Throws<AppHostOptionsException>(() =>
+            AppHostComposition.Create(options));
+
+        Assert.Equal("invalid-role-target", error.ReasonCode);
+        Assert.Null(error.InnerException);
+        Assert.False(File.Exists(marker));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(layout.ProfileRoot));
+    }
+
+    [PostgresFact, Trait("Category", "AppHost")]
+    public async Task TestComposition_InjectedProviderDoesNotValidateOrConstructFixtureArtifacts()
+    {
+        using var layout = TestLayout.CreateReal("ebaycrm-injected-provider-no-fixture");
+        var missingFixture = Path.Combine(layout.Root, "missing", "fixture.exe");
+        var options = AppHostOptions.Parse(layout.Arguments("run")) with
+        {
+            FixturePath = missingFixture,
+        };
+        var provider = new FailIfCalledRoleLaunchPlanProvider();
+        var runtime = AppHostComposition.CreateForTests(
+            options,
+            roleLaunchPlanProvider: provider);
+        try
+        {
+            Assert.Same(provider, runtime.ActiveRoleLaunchPlanProvider);
+            Assert.Null(runtime.FixtureRoleLaunchPlanProvider);
+            Assert.False(File.Exists(missingFixture));
+        }
+        finally
+        {
+            await runtime.Orchestrator.DisposeAsync();
+        }
     }
 
     [PostgresFact, Trait("Category", "AppHost")]
@@ -159,8 +236,7 @@ public sealed class AppHostStartupTests
             DataProfileIdentity.Create(layout.ProfileRoot),
             postgresLayout,
             PostgresClusterPaths.Create(layout.ProfileRoot),
-            Path.Combine(layout.Root, "unused-migration.sql"),
-            "unused-fixture-build");
+            Path.Combine(layout.Root, "unused-migration.sql"));
         var provider = new FailIfCalledRoleLaunchPlanProvider();
         await using var executor = new LifecycleCommandExecutor(
             options,
@@ -199,6 +275,38 @@ public sealed class AppHostStartupTests
         Assert.False(result.IsValid);
         Assert.Equal("postgres-desktop-runtime-incomplete", result.ReasonCode);
         Assert.False(Directory.Exists(layout.Root));
+    }
+
+    [Fact, Trait("Category", "AppHost")]
+    public async Task Probe_RedisCompatibilityRejectsUndefinedRoleTargetBeforePayloadValidation()
+    {
+        using var layout = TestLayout.Create();
+        var options = AppHostOptions.Parse(layout.Arguments("probe")) with
+        {
+            RoleTarget = (AppHostRoleTarget)int.MaxValue,
+        };
+
+        var error = await Assert.ThrowsAsync<AppHostOptionsException>(() =>
+            AppHostComposition.ProbeAsync(options));
+
+        Assert.Equal("invalid-role-target", error.ReasonCode);
+        Assert.Null(error.InnerException);
+        Assert.Empty(Directory.EnumerateFileSystemEntries(layout.ProfileRoot));
+    }
+
+    [Fact, Trait("Category", "AppHost")]
+    public async Task Probe_PostgresDesktopPreservesIncompleteRuntimePriorityForUndefinedRoleTarget()
+    {
+        using var layout = TestLayout.Create();
+        var options = AppHostOptions.Parse(layout.Arguments("probe", "postgres-desktop")) with
+        {
+            RoleTarget = (AppHostRoleTarget)int.MaxValue,
+        };
+
+        var result = await AppHostComposition.ProbeAsync(options);
+
+        Assert.False(result.IsValid);
+        Assert.Equal("postgres-desktop-runtime-incomplete", result.ReasonCode);
     }
 
     [Fact, Trait("Category", "AppHost")]
@@ -794,7 +902,8 @@ public sealed class AppHostStartupTests
             Path.Combine(nonTemporaryProfile, "HowardLab.EbayCrm.AppHost.Fixture.exe"),
             15432,
             AppHostMode.Run,
-            AppHostRuntimeBackend.RedisCompatibility);
+            AppHostRuntimeBackend.RedisCompatibility,
+            AppHostRoleTarget.ControlledFixture);
 
         var error = Assert.Throws<AppHostOptionsException>(() => AppHostComposition.CreateForTests(options));
 

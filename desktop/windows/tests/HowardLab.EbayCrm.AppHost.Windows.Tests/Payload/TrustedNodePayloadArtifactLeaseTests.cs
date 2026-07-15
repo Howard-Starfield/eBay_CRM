@@ -47,6 +47,88 @@ public sealed class TrustedNodePayloadArtifactLeaseTests : IDisposable
         File.WriteAllText(fixture.ArtifactPath("node.exe"), "released");
     }
 
+    [Fact]
+    public void LifetimeLease_OwnerDisposeDefersAncestorReleaseAndAllowsVerification()
+    {
+        using var fixture = CreateFixture();
+        var payload = Validator().Validate(fixture.PayloadRoot, fixture.ProfileRoot);
+        var lifetimeLease = payload.OpenLifetimeLease();
+        var replacement = fixture.PayloadRoot + ".replacement";
+
+        payload.Dispose();
+        payload.Dispose();
+
+        payload.VerifyClosure();
+        Assert.ThrowsAny<IOException>(() => Directory.Move(fixture.PayloadRoot, replacement));
+        AssertTrustFailure(() => payload.OpenLifetimeLease(), fixture.PayloadRoot);
+
+        lifetimeLease.Dispose();
+        lifetimeLease.Dispose();
+        Directory.Move(fixture.PayloadRoot, replacement);
+        AssertTrustFailure(payload.VerifyClosure, replacement);
+    }
+
+    [Fact]
+    public void LifetimeLease_ConcurrentOwnerDisposeAndAcquireIsRaceSafeAndCannotResurrect()
+    {
+        using var fixture = CreateFixture();
+        var payload = Validator().Validate(fixture.PayloadRoot, fixture.ProfileRoot);
+        using var start = new Barrier(2);
+        IDisposable? acquired = null;
+        Exception? acquisitionError = null;
+
+        Parallel.Invoke(
+            () =>
+            {
+                start.SignalAndWait();
+                payload.Dispose();
+            },
+            () =>
+            {
+                start.SignalAndWait();
+                try
+                {
+                    acquired = payload.OpenLifetimeLease();
+                }
+                catch (Exception error)
+                {
+                    acquisitionError = error;
+                }
+            });
+
+        if (acquired is not null)
+        {
+            Assert.Null(acquisitionError);
+            payload.VerifyClosure();
+            acquired.Dispose();
+            acquired.Dispose();
+        }
+        else
+        {
+            Assert.IsType<NodePayloadManifestException>(acquisitionError);
+        }
+
+        AssertTrustFailure(() => payload.OpenLifetimeLease(), fixture.PayloadRoot);
+        Directory.Move(fixture.PayloadRoot, fixture.PayloadRoot + ".released");
+    }
+
+    [Fact]
+    public void ArtifactLease_RetainsPayloadLifetimeAcrossConcurrentOwnerDispose()
+    {
+        using var fixture = CreateFixture();
+        var payload = Validator().Validate(fixture.PayloadRoot, fixture.ProfileRoot);
+        var artifactLease = new TrustedNodePayloadArtifactLease(payload);
+        var replacement = fixture.PayloadRoot + ".replacement";
+
+        payload.Dispose();
+
+        payload.VerifyClosure();
+        Assert.ThrowsAny<IOException>(() => Directory.Move(fixture.PayloadRoot, replacement));
+        artifactLease.Dispose();
+        artifactLease.Dispose();
+        Directory.Move(fixture.PayloadRoot, replacement);
+    }
+
     [Theory]
     [InlineData("tamper")]
     [InlineData("extra")]

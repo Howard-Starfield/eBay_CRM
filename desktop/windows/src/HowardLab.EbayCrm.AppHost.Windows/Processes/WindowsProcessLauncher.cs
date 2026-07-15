@@ -11,11 +11,14 @@ namespace HowardLab.EbayCrm.AppHost.Windows.Processes;
 public sealed class WindowsProcessLauncher : IProcessLauncher
 {
     public const int MaximumStandardInputBytes = 1024 * 1024;
+    private static readonly Task ProofUnavailableContainment = new TaskCompletionSource(
+        TaskCreationOptions.RunContinuationsAsynchronously).Task;
     private readonly IDiagnosticSink _diagnosticSink;
     private readonly int _maxOutputBytes;
     private readonly int _maxLineBytes;
     private readonly IProcessCleanupPolicy _cleanupPolicy;
     private readonly IWindowsProcessIdentityVerifier _identityVerifier;
+    private readonly IWindowsNativeExitObservationFactory _nativeExitObservationFactory;
 
     public WindowsProcessLauncher(
         IDiagnosticSink diagnosticSink,
@@ -29,7 +32,8 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
             new BoundedProcessCleanup(
                 NativeProcessCleanup.Instance,
                 processCleanupTimeout ?? BoundedProcessCleanup.ProductionDefaultTimeout),
-            WindowsProcessIdentityVerifier.Instance)
+            WindowsProcessIdentityVerifier.Instance,
+            WindowsNativeExitObservationFactory.Instance)
     {
     }
 
@@ -38,7 +42,8 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
         int maxOutputBytes,
         int maxLineBytes,
         IProcessCleanupPolicy cleanupPolicy,
-        IWindowsProcessIdentityVerifier identityVerifier)
+        IWindowsProcessIdentityVerifier identityVerifier,
+        IWindowsNativeExitObservationFactory? nativeExitObservationFactory = null)
     {
         ArgumentNullException.ThrowIfNull(diagnosticSink);
         ArgumentNullException.ThrowIfNull(cleanupPolicy);
@@ -50,6 +55,8 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
         _maxLineBytes = maxLineBytes;
         _cleanupPolicy = cleanupPolicy;
         _identityVerifier = identityVerifier;
+        _nativeExitObservationFactory = nativeExitObservationFactory ??
+            WindowsNativeExitObservationFactory.Instance;
     }
 
     public ValueTask<ISupervisedProcess> LaunchAsync(
@@ -84,6 +91,7 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
         SafeFileHandle? standardInputRead = null;
         SafeFileHandle? standardInputWrite = null;
         SafeProcessHandle? processHandle = null;
+        Task? authoritativeNativeExitObservation = null;
         var processInformation = new NativeMethods.ProcessInformation();
         var standardInputTransferred = false;
 
@@ -149,6 +157,8 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
 
             processHandle = new SafeProcessHandle(processInformation.Process, ownsHandle: true);
             processInformation.Process = IntPtr.Zero;
+            authoritativeNativeExitObservation =
+                _nativeExitObservationFactory.Create(processHandle);
             using var threadHandle = new SafeKernelObjectHandle(
                 processInformation.Thread,
                 ownsHandle: true);
@@ -196,7 +206,8 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
                 validated.Specification.OutputDrainTimeout,
                 _diagnosticSink,
                 _cleanupPolicy,
-                job);
+                job,
+                authoritativeNativeExitObservation);
             processHandle = null;
             standardInputWrite = null;
             standardOutputRead = null;
@@ -206,17 +217,29 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
         }
         catch (OperationCanceledException)
         {
-            EnsureCleanupCompleted(processHandle, job, validated.Specification.Role);
+            EnsureCleanupCompleted(
+                processHandle,
+                job,
+                validated.Specification.Role,
+                authoritativeNativeExitObservation);
             throw;
         }
         catch (Win32Exception error)
         {
-            EnsureCleanupCompleted(processHandle, job, validated.Specification.Role);
+            EnsureCleanupCompleted(
+                processHandle,
+                job,
+                validated.Specification.Role,
+                authoritativeNativeExitObservation);
             throw new ProcessLaunchException(validated.Specification.Role, error.NativeErrorCode);
         }
         catch
         {
-            EnsureCleanupCompleted(processHandle, job, validated.Specification.Role);
+            EnsureCleanupCompleted(
+                processHandle,
+                job,
+                validated.Specification.Role,
+                authoritativeNativeExitObservation);
             throw;
         }
         finally
@@ -400,7 +423,8 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
     private void EnsureCleanupCompleted(
         SafeProcessHandle? processHandle,
         WindowsJobObject job,
-        HowardLab.EbayCrm.AppHost.Protocol.Control.RuntimeRole role)
+        HowardLab.EbayCrm.AppHost.Protocol.Control.RuntimeRole role,
+        Task? authoritativeNativeExitObservation)
     {
         if (processHandle is null || processHandle.IsInvalid || processHandle.IsClosed)
         {
@@ -410,12 +434,29 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
         var result = _cleanupPolicy.Cleanup(processHandle, job);
         if (!result.Signaled)
         {
+            var observationKind = NativeExitObservationKind.Authoritative;
+            if (authoritativeNativeExitObservation is null)
+            {
+                try
+                {
+                    authoritativeNativeExitObservation =
+                        _nativeExitObservationFactory.Create(processHandle);
+                }
+                catch
+                {
+                    authoritativeNativeExitObservation = ProofUnavailableContainment;
+                    observationKind = NativeExitObservationKind.ProofUnavailableContainment;
+                }
+            }
+
             throw new ProcessCleanupException(
                 role,
                 result.ProcessTerminationErrorCode,
                 result.JobTerminationErrorCode,
                 result.WaitErrorCode,
-                result.TimedOut);
+                result.TimedOut,
+                authoritativeNativeExitObservation,
+                observationKind);
         }
     }
 

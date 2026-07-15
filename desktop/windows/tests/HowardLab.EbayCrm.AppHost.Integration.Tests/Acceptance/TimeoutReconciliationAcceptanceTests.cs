@@ -465,7 +465,8 @@ internal sealed class RoleExecutorHarness : IAsyncDisposable
             fixturePath,
             Port: 15432,
             AppHostMode.Run,
-            AppHostRuntimeBackend.RedisCompatibility);
+            AppHostRuntimeBackend.RedisCompatibility,
+            AppHostRoleTarget.ControlledFixture);
         var postgresLayout = new PostgresBinaryLayout(
             postgresBin,
             Path.Combine(postgresBin, "initdb.exe"),
@@ -477,8 +478,7 @@ internal sealed class RoleExecutorHarness : IAsyncDisposable
             DataProfileIdentity.Create(profileRoot),
             postgresLayout,
             PostgresClusterPaths.Create(profileRoot),
-            Path.Combine(profileRoot, "unused-migration.sql"),
-            ControlProtocolConstants.FixtureBuildIdentity);
+            Path.Combine(profileRoot, "unused-migration.sql"));
         var secrets = new DiagnosticSecretRegistry();
         var sink = new JsonLinesDiagnosticSink(
             (_, _) => ValueTask.FromResult<Stream>(Stream.Null),

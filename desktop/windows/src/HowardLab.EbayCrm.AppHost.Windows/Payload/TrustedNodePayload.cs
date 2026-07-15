@@ -8,6 +8,8 @@ public sealed class TrustedNodePayload : IDisposable
     private readonly Action _verifyClosure;
     private readonly object _lifetimeGate = new();
     private SafeFileHandle[]? _pathLeaseHandles;
+    private int _activeLifetimeLeaseCount;
+    private bool _ownerDisposed;
 
     internal TrustedNodePayload(
         string canonicalRoot,
@@ -43,6 +45,21 @@ public sealed class TrustedNodePayload : IDisposable
 
     public string WorkerEntrypoint { get; }
 
+    internal IDisposable OpenLifetimeLease()
+    {
+        lock (_lifetimeGate)
+        {
+            if (_ownerDisposed || _pathLeaseHandles is null)
+            {
+                throw new NodePayloadManifestException();
+            }
+
+            var lease = new LifetimeLease(this);
+            _activeLifetimeLeaseCount++;
+            return lease;
+        }
+    }
+
     public void VerifyClosure()
     {
         lock (_lifetimeGate)
@@ -71,17 +88,50 @@ public sealed class TrustedNodePayload : IDisposable
     {
         lock (_lifetimeGate)
         {
-            if (_pathLeaseHandles is { } handles)
-            {
-                for (var index = handles.Length - 1; index >= 0; index--)
-                {
-                    handles[index].Dispose();
-                }
-            }
-
-            _pathLeaseHandles = null;
+            _ownerDisposed = true;
+            ReleasePathHandlesWhenUnreferenced();
         }
 
         GC.SuppressFinalize(this);
+    }
+
+    private void ReleaseLifetimeLease()
+    {
+        lock (_lifetimeGate)
+        {
+            if (_activeLifetimeLeaseCount <= 0)
+            {
+                return;
+            }
+
+            _activeLifetimeLeaseCount--;
+            ReleasePathHandlesWhenUnreferenced();
+        }
+    }
+
+    private void ReleasePathHandlesWhenUnreferenced()
+    {
+        if (!_ownerDisposed || _activeLifetimeLeaseCount != 0 || _pathLeaseHandles is not { } handles)
+        {
+            return;
+        }
+
+        for (var index = handles.Length - 1; index >= 0; index--)
+        {
+            handles[index].Dispose();
+        }
+
+        _pathLeaseHandles = null;
+    }
+
+    private sealed class LifetimeLease(TrustedNodePayload owner) : IDisposable
+    {
+        private TrustedNodePayload? _owner = owner;
+
+        public void Dispose()
+        {
+            Interlocked.Exchange(ref _owner, null)?.ReleaseLifetimeLease();
+            GC.SuppressFinalize(this);
+        }
     }
 }

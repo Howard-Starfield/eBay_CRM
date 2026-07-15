@@ -14,16 +14,30 @@ public enum AppHostRuntimeBackend
     RedisCompatibility,
 }
 
+public enum AppHostRoleTarget
+{
+    ControlledFixture,
+}
+
 public sealed record AppHostOptions(
     string ProfileRoot,
     string PostgresBin,
     string FixturePath,
     int Port,
     AppHostMode Mode,
-    AppHostRuntimeBackend RuntimeBackend)
+    AppHostRuntimeBackend RuntimeBackend,
+    AppHostRoleTarget RoleTarget)
 {
     private static readonly string[] RequiredOptions =
-        ["--profile-root", "--postgres-bin", "--fixture-path", "--port", "--mode", "--runtime-backend"];
+    [
+        "--profile-root",
+        "--postgres-bin",
+        "--fixture-path",
+        "--port",
+        "--mode",
+        "--runtime-backend",
+        "--role-target",
+    ];
 
     public static AppHostOptions Parse(IReadOnlyList<string> arguments)
     {
@@ -88,7 +102,20 @@ public sealed record AppHostOptions(
             _ => throw new AppHostOptionsException("invalid-runtime-backend"),
         };
 
-        return new AppHostOptions(profileRoot, postgresBin, fixturePath, port, mode, runtimeBackend);
+        var roleTarget = values["--role-target"] switch
+        {
+            "controlled-fixture" => AppHostRoleTarget.ControlledFixture,
+            _ => throw new AppHostOptionsException("invalid-role-target"),
+        };
+
+        return new AppHostOptions(
+            profileRoot,
+            postgresBin,
+            fixturePath,
+            port,
+            mode,
+            runtimeBackend,
+            roleTarget);
     }
 
     private static string ParseAbsoluteLocalPath(string value, string reasonCode)

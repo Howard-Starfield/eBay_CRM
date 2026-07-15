@@ -36,6 +36,7 @@ internal sealed class RoleLaunchPlan
         RoleReadinessStrategy readinessStrategy,
         int? healthPort,
         TimeSpan outputDrainTimeout,
+        Func<IDisposable> openPayloadLifetimeLease,
         Func<IDisposable> openBootstrapArtifactLease,
         Action verifyPayloadClosureAfterShutdown)
     {
@@ -57,6 +58,7 @@ internal sealed class RoleLaunchPlan
         ReadinessStrategy = readinessStrategy;
         HealthPort = healthPort;
         OutputDrainTimeout = outputDrainTimeout;
+        OpenPayloadLifetimeLease = openPayloadLifetimeLease;
         OpenBootstrapArtifactLease = openBootstrapArtifactLease;
         VerifyPayloadClosureAfterShutdown = verifyPayloadClosureAfterShutdown;
     }
@@ -82,6 +84,8 @@ internal sealed class RoleLaunchPlan
     internal int? HealthPort { get; }
 
     internal TimeSpan OutputDrainTimeout { get; }
+
+    internal Func<IDisposable> OpenPayloadLifetimeLease { get; }
 
     internal Func<IDisposable> OpenBootstrapArtifactLease { get; }
 
@@ -113,6 +117,7 @@ internal sealed class RoleLaunchPlan
             ReadinessStrategy != RoleReadinessStrategy.IdentityBoundHttp ||
             HealthPort is not (> 0 and <= 65_535) ||
             OutputDrainTimeout <= TimeSpan.Zero ||
+            OpenPayloadLifetimeLease is null ||
             OpenBootstrapArtifactLease is null ||
             VerifyPayloadClosureAfterShutdown is null)
         {
@@ -149,5 +154,20 @@ internal sealed class RoleLaunchPlan
                 throw new InvalidOperationException("The role launch environment is invalid.");
             }
         }
+    }
+}
+
+internal sealed class NoopPayloadLifetimeLease : IDisposable
+{
+    internal static NoopPayloadLifetimeLease Instance { get; } = new();
+
+    private NoopPayloadLifetimeLease()
+    {
+    }
+
+    internal static IDisposable Open() => Instance;
+
+    public void Dispose()
+    {
     }
 }

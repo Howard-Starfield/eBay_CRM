@@ -64,7 +64,10 @@ internal sealed class TestLayout : IDisposable
             "Published AppHost is unavailable. Publish desktop/windows/artifacts/win-x64 before acceptance tests.");
     }
 
-    internal string[] Arguments(string mode, string runtimeBackend = "redis") =>
+    internal string[] Arguments(
+        string mode,
+        string runtimeBackend = "redis",
+        string roleTarget = "controlled-fixture") =>
     [
         "--profile-root", ProfileRoot,
         "--postgres-bin", PostgresBin,
@@ -72,6 +75,7 @@ internal sealed class TestLayout : IDisposable
         "--port", Port.ToString(System.Globalization.CultureInfo.InvariantCulture),
         "--mode", mode,
         "--runtime-backend", runtimeBackend,
+        "--role-target", roleTarget,
     ];
 
     public void Dispose()

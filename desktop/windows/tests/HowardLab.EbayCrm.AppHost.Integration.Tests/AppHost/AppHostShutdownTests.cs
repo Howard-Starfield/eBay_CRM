@@ -51,7 +51,7 @@ public sealed class AppHostShutdownTests
                 TimeSpan.FromMilliseconds(25)));
         runtime.Executor.RoleLaunchedForTests = boundary.RecordLaunched;
         var payloadClosureVerificationCount = 0;
-        runtime.FixtureRoleLaunchPlanProvider.VerifyPayloadClosureAfterShutdownForTests =
+        runtime.FixtureRoleLaunchPlanProvider!.VerifyPayloadClosureAfterShutdownForTests =
             () => Interlocked.Increment(ref payloadClosureVerificationCount);
         ProcessIdentitySnapshot? databaseIdentity = null;
         try
@@ -117,16 +117,17 @@ public sealed class AppHostShutdownTests
             Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe"),
             ReserveLoopbackPort(),
             AppHostMode.Run,
-            AppHostRuntimeBackend.RedisCompatibility);
+            AppHostRuntimeBackend.RedisCompatibility,
+            AppHostRoleTarget.ControlledFixture);
         var budget = new ShutdownBudget(
             TimeSpan.FromMilliseconds(300),
             TimeSpan.FromMilliseconds(120),
             TimeSpan.FromMilliseconds(60),
             TimeSpan.FromMilliseconds(120));
         var runtime = AppHostComposition.CreateForTests(options, budget);
-        runtime.FixtureRoleLaunchPlanProvider.WorkerModeForTests = "ignore-shutdown";
+        runtime.FixtureRoleLaunchPlanProvider!.WorkerModeForTests = "ignore-shutdown";
         var payloadClosureVerificationCount = 0;
-        runtime.FixtureRoleLaunchPlanProvider.VerifyPayloadClosureAfterShutdownForTests =
+        runtime.FixtureRoleLaunchPlanProvider!.VerifyPayloadClosureAfterShutdownForTests =
             () => Interlocked.Increment(ref payloadClosureVerificationCount);
         try
         {
@@ -167,13 +168,14 @@ public sealed class AppHostShutdownTests
                 Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe"),
                 ReserveLoopbackPort(),
                 AppHostMode.Run,
-                AppHostRuntimeBackend.RedisCompatibility),
+                AppHostRuntimeBackend.RedisCompatibility,
+                AppHostRoleTarget.ControlledFixture),
             new ShutdownBudget(
                 TimeSpan.FromMilliseconds(300),
                 TimeSpan.FromMilliseconds(120),
                 TimeSpan.FromMilliseconds(60),
                 TimeSpan.FromMilliseconds(120)));
-        runtime.FixtureRoleLaunchPlanProvider.WorkerModeForTests = "ignore-shutdown";
+        runtime.FixtureRoleLaunchPlanProvider!.WorkerModeForTests = "ignore-shutdown";
         runtime.Executor.RoleLaunchedForTests =
             LifecycleCommandExecutor.RetainWorkerJobHandleInRoleForTests;
         try

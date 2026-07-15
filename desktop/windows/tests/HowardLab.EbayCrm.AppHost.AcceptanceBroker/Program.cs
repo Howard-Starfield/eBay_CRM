@@ -61,6 +61,7 @@ internal static class AcceptanceBroker
                             "--port", request.Port.ToString(System.Globalization.CultureInfo.InvariantCulture),
                             "--mode", "run",
                             "--runtime-backend", "redis",
+                            "--role-target", "controlled-fixture",
                         ],
                         request.WorkingDirectory,
                         CreateEnvironment(),

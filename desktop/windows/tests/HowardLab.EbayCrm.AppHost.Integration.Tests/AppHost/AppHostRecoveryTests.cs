@@ -95,7 +95,7 @@ public sealed class AppHostRecoveryTests
         var profile = Path.Combine(Path.GetTempPath(), $"ebaycrm-task9-disconnect-{Guid.NewGuid():N}");
         Directory.CreateDirectory(profile);
         var runtime = AppHostComposition.CreateForTests(CreateOptions(profile));
-        runtime.FixtureRoleLaunchPlanProvider.WorkerModeForTests = fixtureMode;
+        runtime.FixtureRoleLaunchPlanProvider!.WorkerModeForTests = fixtureMode;
         try
         {
             await runtime.Orchestrator.StartAsync().WaitAsync(TimeSpan.FromMinutes(2));
@@ -251,7 +251,8 @@ public sealed class AppHostRecoveryTests
         Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe"),
         ReserveLoopbackPort(),
         AppHostMode.Run,
-        AppHostRuntimeBackend.RedisCompatibility);
+        AppHostRuntimeBackend.RedisCompatibility,
+        AppHostRoleTarget.ControlledFixture);
 
     private static async Task WaitForReadyCountAsync(
         AppHostTestRuntime runtime,

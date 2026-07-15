@@ -1,10 +1,14 @@
 using System.Text.Json;
 using System.Text;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
 using HowardLab.EbayCrm.AppHost.Core.Diagnostics;
 using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
 using HowardLab.EbayCrm.AppHost.Core.Processes;
 using HowardLab.EbayCrm.AppHost.Protocol.Control;
 using HowardLab.EbayCrm.AppHost.Windows.Processes;
+using HowardLab.EbayCrm.AppHost.Windows.Native;
+using Microsoft.Win32.SafeHandles;
 
 namespace HowardLab.EbayCrm.AppHost.Windows.Tests.Processes;
 
@@ -233,6 +237,67 @@ public sealed class WindowsProcessLauncherTests
     }
 
     [Fact]
+    public async Task LaunchAsync_CleanupIndeterminateCarriesAuthoritativeNativeExitObservation()
+    {
+        var identityVerifier = new ThrowingIdentityVerifier();
+        var cleanup = new IndeterminateCleanupPolicy();
+        using var job = WindowsJobObject.CreateKillOnClose();
+        var launcher = new WindowsProcessLauncher(
+            NoopDiagnosticSink.Instance,
+            maxOutputBytes: 64 * 1024,
+            maxLineBytes: 4 * 1024,
+            cleanup,
+            identityVerifier);
+
+        var error = await Assert.ThrowsAsync<ProcessCleanupException>(async () =>
+            await launcher.LaunchAsync(
+                CreateSpecification(["hold"]),
+                job,
+                CancellationToken.None));
+
+        Assert.NotNull(error.AuthoritativeNativeExitObservation);
+        Assert.False(error.AuthoritativeNativeExitObservation.IsCompleted);
+        using var child = System.Diagnostics.Process.GetProcessById(identityVerifier.ProcessId);
+
+        child.Kill();
+        await error.AuthoritativeNativeExitObservation.WaitAsync(Deadline);
+
+        Assert.True(child.WaitForExit(checked((int)Deadline.TotalMilliseconds)));
+    }
+
+    [Fact]
+    public async Task LaunchAsync_ExitObservationConstructionFailureRetainsFailSafeWhenCleanupIsIndeterminate()
+    {
+        var identityVerifier = new ThrowingIdentityVerifier();
+        var cleanup = new IndeterminateCleanupPolicy();
+        var observations = new ThrowingNativeExitObservationFactory();
+        using var job = WindowsJobObject.CreateKillOnClose();
+        var launcher = new WindowsProcessLauncher(
+            NoopDiagnosticSink.Instance,
+            maxOutputBytes: 64 * 1024,
+            maxLineBytes: 4 * 1024,
+            cleanup,
+            identityVerifier,
+            observations);
+
+        var error = await Assert.ThrowsAsync<ProcessCleanupException>(async () =>
+            await launcher.LaunchAsync(
+                CreateSpecification(["hold"]),
+                job,
+                CancellationToken.None));
+
+        Assert.Equal(2, observations.CreateCount);
+        Assert.Equal(
+            NativeExitObservationKind.ProofUnavailableContainment,
+            error.NativeExitObservationKind);
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            error.PayloadLifetimeBoundaryObservation.WaitAsync(TimeSpan.FromMilliseconds(100)));
+        Assert.True(job.TerminateTree(exitCode: 1).Succeeded);
+        await Assert.ThrowsAsync<TimeoutException>(() =>
+            error.PayloadLifetimeBoundaryObservation.WaitAsync(TimeSpan.FromMilliseconds(100)));
+    }
+
+    [Fact]
     public async Task LaunchAsync_RedactsSecretEnvironmentFromBothOutputStreams()
     {
         const string secret = "task-5-stream-secret";
@@ -401,6 +466,48 @@ public sealed class WindowsProcessLauncherTests
         {
             EventName.TrySetResult(diagnosticEvent.Name);
             return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class ThrowingIdentityVerifier : IWindowsProcessIdentityVerifier
+    {
+        internal int ProcessId { get; private set; }
+
+        public SupervisedProcessIdentity Capture(
+            RuntimeRole role,
+            ProcessGeneration generation,
+            SafeProcessHandle processHandle)
+        {
+            ProcessId = checked((int)NativeMethods.GetProcessId(processHandle));
+            throw new Win32Exception(87);
+        }
+    }
+
+    private sealed class IndeterminateCleanupPolicy : IProcessCleanupPolicy
+    {
+        public ProcessCleanupResult Cleanup(
+            SafeProcessHandle processHandle,
+            IProcessTreeTerminator job) =>
+            new(
+                Signaled: false,
+                EscalatedToJob: true,
+                ProcessTerminationErrorCode: null,
+                JobTerminationErrorCode: null,
+                WaitErrorCode: null,
+                TimedOut: true);
+    }
+
+    private sealed class ThrowingNativeExitObservationFactory
+        : IWindowsNativeExitObservationFactory
+    {
+        private int _createCount;
+
+        internal int CreateCount => Volatile.Read(ref _createCount);
+
+        public Task Create(SafeProcessHandle processHandle)
+        {
+            Interlocked.Increment(ref _createCount);
+            throw new Win32Exception(8);
         }
     }
 }

@@ -139,6 +139,8 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
 
     internal Func<RuntimeRole, Task, TimeSpan, Task>? NativeExitWaitForTests { get; set; }
 
+    internal Func<string, ValueTask>? PayloadPostExitFailureObservedForTests { get; set; }
+
     internal Action? ReadinessLoserObservedForTests { get; set; }
 
     internal int ReleaseInstanceCountForTests => Volatile.Read(ref _releaseInstanceCountForTests);
@@ -532,7 +534,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
                 cancellationToken).ConfigureAwait(false);
 
             if (launched.Process is not WindowsSupervisedProcess windowsProcess ||
-                launched.PayloadClosureVerifier is null ||
+                launched.PayloadPostExitBoundary is null ||
                 launched.NativeExitObservation is null)
             {
                 throw new AppHostExecutionException("role-process-type-invalid");
@@ -547,7 +549,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
                 channel,
                 job,
                 launched.NativeExitObservation,
-                launched.PayloadClosureVerifier);
+                launched.PayloadPostExitBoundary);
             SetRole(resource);
             resource.AcceptTask = AcceptRoleAsync(resource);
             using var commandDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -577,7 +579,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             else
             {
                 if (launched?.Process is WindowsSupervisedProcess windowsProcess &&
-                    launched.PayloadClosureVerifier is not null &&
+                    launched.PayloadPostExitBoundary is not null &&
                     launched.NativeExitObservation is not null)
                 {
                     await CaptureCleanupAsync(
@@ -586,7 +588,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
                             channel,
                             job,
                             launched.NativeExitObservation,
-                            launched.PayloadClosureVerifier),
+                            launched.PayloadPostExitBoundary),
                         cleanupErrors).ConfigureAwait(false);
                 }
                 else if (launched?.Process is { } process)
@@ -606,6 +608,17 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
                     {
                         cleanupErrors.Add(cleanupError);
                     }
+
+                    if (cleanupErrors.Count == 0 && launched.PayloadLifetimeLease is not null)
+                    {
+                        await CaptureCleanupAsync(
+                            () => DisposePayloadLifetimeLeaseAsync(launched.PayloadLifetimeLease),
+                            cleanupErrors).ConfigureAwait(false);
+                    }
+                    // A non-Windows launcher result is a contract breach. If
+                    // any containment cleanup is uncertain, deliberately retain
+                    // the payload lease rather than release executable inputs
+                    // while an unobserved process could still be alive.
                 }
                 else
                 {
@@ -639,6 +652,21 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         WindowsJobObject job,
         CancellationToken cancellationToken)
     {
+        IDisposable? payloadLifetimeLease;
+        try
+        {
+            payloadLifetimeLease = plan.OpenPayloadLifetimeLease();
+        }
+        catch
+        {
+            throw new AppHostExecutionException("role-payload-trust-failed");
+        }
+
+        if (payloadLifetimeLease is null)
+        {
+            throw new AppHostExecutionException("role-launch-plan-invalid");
+        }
+
         IDisposable? artifactLease;
         try
         {
@@ -646,15 +674,18 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
         catch (AppHostOptionsException error)
         {
+            DisposePayloadLifetimeLeaseNoThrow(payloadLifetimeLease);
             throw new AppHostExecutionException(error.ReasonCode);
         }
         catch (Exception)
         {
+            DisposePayloadLifetimeLeaseNoThrow(payloadLifetimeLease);
             throw new AppHostExecutionException("role-payload-trust-failed");
         }
 
         if (artifactLease is null)
         {
+            DisposePayloadLifetimeLeaseNoThrow(payloadLifetimeLease);
             throw new AppHostExecutionException("role-launch-plan-invalid");
         }
 
@@ -673,9 +704,24 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
 
         var windowsProcess = launchedProcess as WindowsSupervisedProcess;
-        var payloadClosureVerifier = windowsProcess is null
+        var payloadLifetimeBoundaryObservation = windowsProcess?.NativeExitObservation
+            ?? (launchFailure?.SourceException as ProcessCleanupException)?
+                .PayloadLifetimeBoundaryObservation;
+        var payloadClosureVerifier = payloadLifetimeBoundaryObservation is null
             ? null
             : new OneShotPayloadClosureVerifier(plan.VerifyPayloadClosureAfterShutdown);
+        var payloadPostExitBoundary = payloadLifetimeBoundaryObservation is null ||
+            payloadClosureVerifier is null
+            ? null
+            : PayloadPostExitBoundary.Start(
+                payloadLifetimeBoundaryObservation,
+                payloadClosureVerifier,
+                payloadLifetimeLease,
+                RecordPayloadPostExitFailureAsync);
+        if (payloadPostExitBoundary is not null)
+        {
+            payloadLifetimeLease = null;
+        }
 
         try
         {
@@ -688,7 +734,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
         catch (Exception)
         {
-            if (windowsProcess is not null && payloadClosureVerifier is not null)
+            if (windowsProcess is not null && payloadPostExitBoundary is not null)
             {
                 try
                 {
@@ -697,7 +743,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
                         channel,
                         job,
                         windowsProcess.NativeExitObservation,
-                        payloadClosureVerifier).ConfigureAwait(false);
+                        payloadPostExitBoundary).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -706,32 +752,127 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             }
             else if (launchedProcess is not null)
             {
+                var cleanupCertain = true;
                 try
                 {
                     await launchedProcess.DisposeAsync().ConfigureAwait(false);
                 }
                 catch
                 {
-                    // The enclosing role job remains the cleanup authority.
+                    cleanupCertain = false;
                 }
+
+                try
+                {
+                    await channel.DisposeAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                    cleanupCertain = false;
+                }
+
+                try
+                {
+                    job.Dispose();
+                }
+                catch
+                {
+                    cleanupCertain = false;
+                }
+
+                if (cleanupCertain)
+                {
+                    DisposePayloadLifetimeLeaseNoThrow(payloadLifetimeLease);
+                    payloadLifetimeLease = null;
+                }
+            }
+            else
+            {
+                DisposePayloadLifetimeLeaseNoThrow(payloadLifetimeLease);
+                payloadLifetimeLease = null;
             }
 
             throw new AppHostExecutionException("role-payload-trust-failed");
         }
 
-        launchFailure?.Throw();
-        if (windowsProcess is not null && payloadClosureVerifier is not null)
+        if (launchFailure is not null)
+        {
+            DisposePayloadLifetimeLeaseNoThrow(payloadLifetimeLease);
+            launchFailure.Throw();
+        }
+
+        if (windowsProcess is not null && payloadPostExitBoundary is not null)
         {
             return new LaunchedRoleProcess(
                 windowsProcess,
                 windowsProcess.NativeExitObservation,
-                payloadClosureVerifier);
+                payloadPostExitBoundary,
+                PayloadLifetimeLease: null);
         }
 
-        return new LaunchedRoleProcess(
-            launchedProcess ?? throw new AppHostExecutionException("role-process-type-invalid"),
+        if (launchedProcess is null)
+        {
+            DisposePayloadLifetimeLeaseNoThrow(payloadLifetimeLease);
+            throw new AppHostExecutionException("role-process-type-invalid");
+        }
+
+        var result = new LaunchedRoleProcess(
+            launchedProcess,
             NativeExitObservation: null,
-            PayloadClosureVerifier: null);
+            PayloadPostExitBoundary: null,
+            payloadLifetimeLease);
+        payloadLifetimeLease = null;
+        return result;
+    }
+
+    private async ValueTask RecordPayloadPostExitFailureAsync(string reasonCode)
+    {
+        var sanitizedReasonCode = string.Equals(
+            reasonCode,
+            "role-payload-trust-failed",
+            StringComparison.Ordinal)
+            ? reasonCode
+            : "role-payload-trust-failed";
+        try
+        {
+            if (PayloadPostExitFailureObservedForTests is { } observer)
+            {
+                await observer(sanitizedReasonCode).ConfigureAwait(false);
+            }
+
+            var diagnostic = DiagnosticEvent.Create("role.payload_post_exit_failed")
+                .With("reason_code", DiagnosticField.ReasonCode(sanitizedReasonCode));
+            await _diagnosticSink.WriteAsync(diagnostic).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Diagnostics must never impede post-exit trust cleanup.
+        }
+    }
+
+    private static Task DisposePayloadLifetimeLeaseAsync(IDisposable payloadLifetimeLease)
+    {
+        try
+        {
+            payloadLifetimeLease.Dispose();
+            return Task.CompletedTask;
+        }
+        catch
+        {
+            return Task.FromException(new AppHostExecutionException("role-payload-trust-failed"));
+        }
+    }
+
+    private static void DisposePayloadLifetimeLeaseNoThrow(IDisposable? payloadLifetimeLease)
+    {
+        try
+        {
+            payloadLifetimeLease?.Dispose();
+        }
+        catch
+        {
+            // A primary launch failure remains authoritative and sanitized.
+        }
     }
 
     private async Task AcceptRoleAsync(RoleResource resource)
@@ -1936,7 +2077,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
 
         await CaptureCleanupAsync(
-            resource.PayloadClosureVerifier.VerifyAsync,
+            () => resource.PayloadPostExitBoundary,
             errors).ConfigureAwait(false);
     }
 
@@ -1945,7 +2086,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         WindowsControlChannel channel,
         WindowsJobObject job,
         Task nativeExitObservation,
-        OneShotPayloadClosureVerifier payloadClosureVerifier)
+        Task payloadPostExitBoundary)
     {
         var errors = new List<Exception>();
         await CaptureCleanupAsync(
@@ -1977,7 +2118,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
 
         await CaptureCleanupAsync(
-            payloadClosureVerifier.VerifyAsync,
+            () => payloadPostExitBoundary,
             errors).ConfigureAwait(false);
         ThrowCleanupErrors(errors);
     }
@@ -2153,7 +2294,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         WindowsControlChannel Channel,
         WindowsJobObject Job,
         Task NativeExitObservation,
-        OneShotPayloadClosureVerifier PayloadClosureVerifier)
+        Task PayloadPostExitBoundary)
     {
         private readonly object _teardownGate = new();
         private int _monitorCancellationDisposalStarted;
@@ -2290,7 +2431,8 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     private sealed record LaunchedRoleProcess(
         ISupervisedProcess Process,
         Task? NativeExitObservation,
-        OneShotPayloadClosureVerifier? PayloadClosureVerifier);
+        Task? PayloadPostExitBoundary,
+        IDisposable? PayloadLifetimeLease);
 
 }
 

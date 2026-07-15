@@ -9,15 +9,23 @@ using HowardLab.EbayCrm.AppHost.Protocol.Control;
 using HowardLab.EbayCrm.AppHost.Windows.Instance;
 using HowardLab.EbayCrm.AppHost.Windows.Postgres;
 using HowardLab.EbayCrm.AppHost.Windows.Processes;
+using HowardLab.EbayCrm.AppHost.Windows.Native;
+using HowardLab.EbayCrm.AppHost.Windows.Payload;
+using Microsoft.Win32.SafeHandles;
+using System.ComponentModel;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.AccessControl;
+using System.Security.Cryptography;
+using System.Security.Principal;
+using System.Text.Json;
 
 namespace HowardLab.EbayCrm.AppHost.Integration.Tests.AppHost;
 
 public sealed class RoleLaunchPlanProviderTests
 {
     [PostgresFact]
-    public async Task CreateForTests_DefaultsToFixtureProviderAndAcceptsAnExplicitProvider()
+    public async Task CreateForTests_UsesTheExplicitFixtureTargetOrExactlyTheInjectedProvider()
     {
         using var layout = TestLayout.CreateReal("ebaycrm-provider-composition");
         var options = AppHostOptions.Parse(layout.Arguments("run"));
@@ -30,10 +38,11 @@ public sealed class RoleLaunchPlanProviderTests
             roleLaunchPlanProvider: injected);
         try
         {
+            Assert.Equal(AppHostRoleTarget.ControlledFixture, options.RoleTarget);
             Assert.IsType<FixtureRoleLaunchPlanProvider>(defaultRuntime.ActiveRoleLaunchPlanProvider);
             Assert.Same(defaultRuntime.FixtureRoleLaunchPlanProvider, defaultRuntime.ActiveRoleLaunchPlanProvider);
             Assert.Same(injected, injectedRuntime.ActiveRoleLaunchPlanProvider);
-            Assert.NotNull(injectedRuntime.FixtureRoleLaunchPlanProvider);
+            Assert.Null(injectedRuntime.FixtureRoleLaunchPlanProvider);
         }
         finally
         {
@@ -109,15 +118,85 @@ public sealed class RoleLaunchPlanProviderTests
     }
 
     [Fact]
+    public async Task NullPayloadLifetimeLeaseFactoryFailsBeforeAnyLeaseOrLaunch()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var bootstrapLease = new TrackingLease();
+        var launcher = new RecordingLauncher((_, _, _) =>
+            throw new InvalidOperationException("must not launch"));
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                leaseFactory: () => bootstrapLease.Open(),
+                useNullPayloadLifetimeLeaseFactory: true)),
+            launcher);
+
+        var error = await Assert.ThrowsAsync<AppHostExecutionException>(() =>
+            harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        Assert.Equal("role-launch-plan-invalid", error.ReasonCode);
+        Assert.False(bootstrapLease.WasOpened);
+        Assert.Empty(launcher.Specifications);
+    }
+
+    [Fact]
+    public async Task PayloadLifetimeTrustFailureIsSanitizedBeforeBootstrapLeaseOrLaunch()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var bootstrapLease = new TrackingLease();
+        var launcher = new RecordingLauncher((_, _, _) =>
+            throw new InvalidOperationException("must not launch"));
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                payloadLifetimeLeaseFactory: () =>
+                    throw new HowardLab.EbayCrm.AppHost.Windows.Payload.NodePayloadManifestException(),
+                leaseFactory: () => bootstrapLease.Open())),
+            launcher);
+
+        var error = await Assert.ThrowsAsync<AppHostExecutionException>(() =>
+            harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        Assert.Equal("role-payload-trust-failed", error.ReasonCode);
+        Assert.Null(error.InnerException);
+        Assert.False(bootstrapLease.WasOpened);
+        Assert.Empty(launcher.Specifications);
+    }
+
+    [Fact]
+    public async Task NullPayloadLifetimeLeaseResultIsInvalidBeforeBootstrapLeaseOrLaunch()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var bootstrapLease = new TrackingLease();
+        var launcher = new RecordingLauncher((_, _, _) =>
+            throw new InvalidOperationException("must not launch"));
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                payloadLifetimeLeaseFactory: () => null!,
+                leaseFactory: () => bootstrapLease.Open())),
+            launcher);
+
+        var error = await Assert.ThrowsAsync<AppHostExecutionException>(() =>
+            harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        Assert.Equal("role-launch-plan-invalid", error.ReasonCode);
+        Assert.False(bootstrapLease.WasOpened);
+        Assert.Empty(launcher.Specifications);
+    }
+
+    [Fact]
     public async Task NonWindowsLauncherContractBreachDoesNotVerifyPayloadClosure()
     {
         var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
         var verificationCount = 0;
+        var payloadLifetimeLease = new TrackingLease();
         var launcher = new RecordingLauncher((_, _, _) =>
             ValueTask.FromResult<ISupervisedProcess>(new StubProcess(generation)));
         await using var harness = CreateHarness(
             new StubProvider(CreatePlan(
                 generation,
+                payloadLifetimeLeaseFactory: () => payloadLifetimeLease.Open(),
                 verifyPayloadClosureAfterShutdown: () => verificationCount++)),
             launcher);
 
@@ -126,6 +205,74 @@ public sealed class RoleLaunchPlanProviderTests
 
         Assert.Equal("role-process-type-invalid", error.ReasonCode);
         Assert.Equal(0, verificationCount);
+        Assert.True(payloadLifetimeLease.IsDisposed);
+    }
+
+    [Fact]
+    public async Task NonWindowsCleanupUncertaintyRetainsPayloadLifetimeLease()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var payloadLifetimeLease = new TrackingLease();
+        var launcher = new RecordingLauncher((_, _, _) =>
+            ValueTask.FromResult<ISupervisedProcess>(new StubProcess(
+                generation,
+                new InvalidOperationException("simulated uncertain cleanup"))));
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                payloadLifetimeLeaseFactory: () => payloadLifetimeLease.Open())),
+            launcher);
+
+        _ = await Assert.ThrowsAnyAsync<Exception>(() =>
+            harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        Assert.False(payloadLifetimeLease.IsDisposed);
+    }
+
+    [Fact]
+    public async Task LaunchFailureWithoutChildReleasesPayloadLifetimeLease()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var payloadLifetimeLease = new TrackingLease();
+        var launcher = new RecordingLauncher((_, _, _) =>
+            throw new InvalidOperationException("simulated launch failure"));
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                payloadLifetimeLeaseFactory: () => payloadLifetimeLease.Open())),
+            launcher);
+
+        _ = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        Assert.True(payloadLifetimeLease.IsDisposed);
+    }
+
+    [Fact]
+    public async Task BootstrapTrustFailureAfterRuntimeLeaseReleasesRuntimeAndNeverLaunches()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var payloadLifetimeLease = new TrackingLease();
+        var launcher = new RecordingLauncher((_, _, _) =>
+            throw new InvalidOperationException("must not launch"));
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                payloadLifetimeLeaseFactory: () => payloadLifetimeLease.Open(),
+                leaseFactory: () =>
+                {
+                    Assert.True(payloadLifetimeLease.WasOpened);
+                    Assert.False(payloadLifetimeLease.IsDisposed);
+                    throw new HowardLab.EbayCrm.AppHost.Windows.Payload.NodePayloadManifestException();
+                })),
+            launcher);
+
+        var error = await Assert.ThrowsAsync<AppHostExecutionException>(() =>
+            harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        Assert.Equal("role-payload-trust-failed", error.ReasonCode);
+        Assert.True(payloadLifetimeLease.IsDisposed);
+        Assert.Empty(launcher.Specifications);
     }
 
     [Fact]
@@ -133,6 +280,7 @@ public sealed class RoleLaunchPlanProviderTests
     {
         var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
         var verificationCount = 0;
+        var payloadLifetimeLease = new TrackingLease();
         var healthPort = ReserveLoopbackPort();
         var fixturePath = Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe");
         var systemRoot = Environment.GetEnvironmentVariable("SystemRoot")!;
@@ -146,19 +294,177 @@ public sealed class RoleLaunchPlanProviderTests
                 secretEnvironment: new Dictionary<string, SecretValue>(),
                 buildIdentity: ControlProtocolConstants.FixtureBuildIdentity,
                 healthPort: healthPort,
+                payloadLifetimeLeaseFactory: () => payloadLifetimeLease.Open(),
                 verifyPayloadClosureAfterShutdown: () =>
-                    Interlocked.Increment(ref verificationCount))),
+                {
+                    Assert.False(payloadLifetimeLease.IsDisposed);
+                    Interlocked.Increment(ref verificationCount);
+                })),
             launcher: null);
 
         var started = await harness.Executor.ExecuteAsync(StartCommand(generation));
 
         Assert.IsType<RoleStarted>(started);
+        Assert.True(payloadLifetimeLease.WasOpened);
+        Assert.False(payloadLifetimeLease.IsDisposed);
         Assert.Equal(0, Volatile.Read(ref verificationCount));
         await Task.WhenAll(Enumerable.Range(0, 8)
             .Select(_ => harness.Executor.DisposeAsync().AsTask()));
         Assert.Equal(1, Volatile.Read(ref verificationCount));
+        Assert.True(payloadLifetimeLease.IsDisposed);
         await harness.Executor.DisposeAsync();
         Assert.Equal(1, Volatile.Read(ref verificationCount));
+    }
+
+    [Fact]
+    public async Task CleanupIndeterminateLaunch_RetainsTrustedPayloadUntilAuthoritativeExit()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var fixturePath = Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe");
+        var payloadContainer = Path.Combine(
+            Path.GetTempPath(),
+            $"cleanup-indeterminate-payload-{Guid.NewGuid():N}");
+        var payloadRoot = Path.Combine(payloadContainer, "payload");
+        var profileRoot = Path.Combine(payloadContainer, "profile");
+        Directory.CreateDirectory(profileRoot);
+        var payload = CreateTrustedPayload(payloadRoot, profileRoot);
+        var cleanup = new BlockingIndeterminateCleanupPolicy();
+        var identityVerifier = new ThrowingIdentityVerifier();
+        var launcher = new WindowsProcessLauncher(
+            NoopDiagnosticSink.Instance,
+            maxOutputBytes: 64 * 1024,
+            maxLineBytes: 4 * 1024,
+            cleanup,
+            identityVerifier);
+        var verificationCount = 0;
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                arguments: ["hold"],
+                applicationPath: fixturePath,
+                workingDirectory: Path.GetDirectoryName(fixturePath),
+                environment: new Dictionary<string, string>
+                {
+                    ["SystemRoot"] = Environment.GetEnvironmentVariable("SystemRoot")!,
+                },
+                secretEnvironment: new Dictionary<string, SecretValue>(),
+                payloadLifetimeLeaseFactory: payload.OpenLifetimeLease,
+                verifyPayloadClosureAfterShutdown: () =>
+                {
+                    payload.VerifyClosure();
+                    Interlocked.Increment(ref verificationCount);
+                })),
+            launcher);
+        var renamedRoot = payloadRoot + "-renamed";
+
+        var startTask = Task.Run(() =>
+            harness.Executor.ExecuteAsync(StartCommand(generation)));
+        await cleanup.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            payload.Dispose();
+            Assert.ThrowsAny<IOException>(() => Directory.Move(payloadRoot, renamedRoot));
+        }
+        finally
+        {
+            cleanup.Release.TrySetResult();
+        }
+
+        var error = await Assert.ThrowsAsync<ProcessCleanupException>(() => startTask);
+        Assert.NotNull(error.AuthoritativeNativeExitObservation);
+        await error.AuthoritativeNativeExitObservation.WaitAsync(TimeSpan.FromSeconds(10));
+        await WaitUntilAsync(
+            () => Volatile.Read(ref verificationCount) == 1,
+            TimeSpan.FromSeconds(5));
+
+        Directory.Move(payloadRoot, renamedRoot);
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+        Directory.Delete(payloadContainer, recursive: true);
+    }
+
+    [Fact]
+    public async Task CleanupIndeterminateResult_RetainsTrustedPayloadUntilCarriedExitProof()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var payloadContainer = Path.Combine(
+            Path.GetTempPath(),
+            $"cleanup-indeterminate-result-{Guid.NewGuid():N}");
+        var payloadRoot = Path.Combine(payloadContainer, "payload");
+        var profileRoot = Path.Combine(payloadContainer, "profile");
+        Directory.CreateDirectory(profileRoot);
+        var payload = CreateTrustedPayload(payloadRoot, profileRoot);
+        var nativeExit = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var verificationCount = 0;
+        var launcher = new RecordingLauncher((_, _, _) =>
+            throw new ProcessCleanupException(
+                RuntimeRole.Server,
+                processTerminationErrorCode: null,
+                jobTerminationErrorCode: null,
+                waitErrorCode: null,
+                timedOut: true,
+                nativeExit.Task));
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                payloadLifetimeLeaseFactory: payload.OpenLifetimeLease,
+                verifyPayloadClosureAfterShutdown: () =>
+                {
+                    payload.VerifyClosure();
+                    Interlocked.Increment(ref verificationCount);
+                })),
+            launcher);
+
+        _ = await Assert.ThrowsAsync<ProcessCleanupException>(() =>
+            harness.Executor.ExecuteAsync(StartCommand(generation)));
+        payload.Dispose();
+        var renamedRoot = payloadRoot + "-renamed";
+
+        Assert.ThrowsAny<IOException>(() => Directory.Move(payloadRoot, renamedRoot));
+
+        nativeExit.SetResult();
+        await WaitUntilAsync(
+            () => Volatile.Read(ref verificationCount) == 1,
+            TimeSpan.FromSeconds(5));
+        Directory.Move(payloadRoot, renamedRoot);
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+        Directory.Delete(payloadContainer, recursive: true);
+    }
+
+    [Fact]
+    public async Task CleanupIndeterminateProofUnavailable_RetainsPayloadLifetimeFailSafe()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var never = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously).Task;
+        var payloadLifetimeLease = new TrackingLease();
+        var launcher = new RecordingLauncher((_, _, _) =>
+            throw new ProcessCleanupException(
+                RuntimeRole.Server,
+                processTerminationErrorCode: null,
+                jobTerminationErrorCode: null,
+                waitErrorCode: null,
+                timedOut: true,
+                never,
+                NativeExitObservationKind.ProofUnavailableContainment));
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                payloadLifetimeLeaseFactory: payloadLifetimeLease.Open,
+                verifyPayloadClosureAfterShutdown: () =>
+                    throw new InvalidOperationException("must not verify without exit proof"))),
+            launcher);
+
+        var error = await Assert.ThrowsAsync<ProcessCleanupException>(() =>
+            harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        Assert.Equal(
+            NativeExitObservationKind.ProofUnavailableContainment,
+            error.NativeExitObservationKind);
+        Assert.True(payloadLifetimeLease.WasOpened);
+        Assert.False(payloadLifetimeLease.IsDisposed);
+        await Task.Delay(100);
+        Assert.False(payloadLifetimeLease.IsDisposed);
     }
 
     [Fact]
@@ -196,10 +502,11 @@ public sealed class RoleLaunchPlanProviderTests
     }
 
     [Fact]
-    public async Task RealWindowsChild_ExitDoesNotVerifyBeforeCleanup()
+    public async Task RealWindowsChild_ExitRunsPostExitBoundaryBeforeCleanupAndOnlyOnce()
     {
         var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
         var verificationCount = 0;
+        var payloadLifetimeLease = new TrackingLease();
         var healthPort = ReserveLoopbackPort();
         var fixturePath = Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe");
         var systemRoot = Environment.GetEnvironmentVariable("SystemRoot")!;
@@ -213,14 +520,21 @@ public sealed class RoleLaunchPlanProviderTests
                 secretEnvironment: new Dictionary<string, SecretValue>(),
                 buildIdentity: ControlProtocolConstants.FixtureBuildIdentity,
                 healthPort: healthPort,
+                payloadLifetimeLeaseFactory: () => payloadLifetimeLease.Open(),
                 verifyPayloadClosureAfterShutdown: () =>
-                    Interlocked.Increment(ref verificationCount))),
+                {
+                    Assert.False(payloadLifetimeLease.IsDisposed);
+                    Interlocked.Increment(ref verificationCount);
+                })),
             launcher: null);
 
         var result = await harness.Executor.ExecuteAsync(StartCommand(generation));
 
         Assert.IsType<RoleStarted>(result);
-        Assert.Equal(0, Volatile.Read(ref verificationCount));
+        await WaitUntilAsync(
+            () => Volatile.Read(ref verificationCount) == 1,
+            TimeSpan.FromSeconds(5));
+        Assert.True(payloadLifetimeLease.IsDisposed);
         await harness.Executor.DisposeAsync();
         Assert.Equal(1, Volatile.Read(ref verificationCount));
     }
@@ -275,7 +589,7 @@ public sealed class RoleLaunchPlanProviderTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task RealWindowsChild_NativeExitFailureFailsClosedWithoutVerification(bool fault)
+    public async Task BoundedNativeExitWaitFailureStillAllowsPostExitVerification(bool fault)
     {
         var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
         var verificationCount = 0;
@@ -292,7 +606,67 @@ public sealed class RoleLaunchPlanProviderTests
             harness.Executor.DisposeRoleForTests(RuntimeRole.Server));
 
         Assert.Equal("role-process-exit-unconfirmed", error.ReasonCode);
-        Assert.Equal(0, Volatile.Read(ref verificationCount));
+        await WaitUntilAsync(
+            () => Volatile.Read(ref verificationCount) == 1,
+            TimeSpan.FromSeconds(5));
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+    }
+
+    [Fact]
+    public async Task BoundedNativeExitTimeout_LateVerifierFailureReportsSanitizedReasonExactlyOnce()
+    {
+        const string secret = "late-verifier-secret";
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        using var releaseVerifier = new ManualResetEventSlim();
+        var verifierEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var harness = CreateRealWindowsHarness(
+            generation,
+            () =>
+            {
+                verifierEntered.TrySetResult();
+                releaseVerifier.Wait();
+                throw new InvalidOperationException(secret);
+            });
+        var reported = new List<string>();
+        harness.Executor.PayloadPostExitFailureObservedForTests = reasonCode =>
+        {
+            lock (reported)
+            {
+                reported.Add(reasonCode);
+            }
+
+            return ValueTask.CompletedTask;
+        };
+        Assert.IsType<RoleStarted>(await harness.Executor.ExecuteAsync(StartCommand(generation)));
+        harness.Executor.NativeExitWaitForTests = (_, _, _) =>
+            Task.FromException(new TimeoutException("simulated bounded timeout"));
+
+        var error = await Assert.ThrowsAsync<AppHostExecutionException>(() =>
+            harness.Executor.DisposeRoleForTests(RuntimeRole.Server));
+
+        Assert.Equal("role-process-exit-unconfirmed", error.ReasonCode);
+        await verifierEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        lock (reported)
+        {
+            Assert.Empty(reported);
+        }
+
+        releaseVerifier.Set();
+        await WaitUntilAsync(
+            () =>
+            {
+                lock (reported)
+                {
+                    return reported.Count == 1;
+                }
+            },
+            TimeSpan.FromSeconds(5));
+        lock (reported)
+        {
+            Assert.Equal(["role-payload-trust-failed"], reported);
+            Assert.DoesNotContain(secret, string.Join('|', reported), StringComparison.Ordinal);
+        }
     }
 
     [Fact]
@@ -730,8 +1104,10 @@ public sealed class RoleLaunchPlanProviderTests
         string? workingDirectory = null,
         string? buildIdentity = null,
         int healthPort = 32123,
+        Func<IDisposable>? payloadLifetimeLeaseFactory = null,
         Action? verifyPayloadClosureAfterShutdown = null,
-        bool useNullPayloadClosureVerifier = false) =>
+        bool useNullPayloadClosureVerifier = false,
+        bool useNullPayloadLifetimeLeaseFactory = false) =>
         new(
             generation.Role,
             generation,
@@ -744,6 +1120,9 @@ public sealed class RoleLaunchPlanProviderTests
             RoleReadinessStrategy.IdentityBoundHttp,
             healthPort,
             TimeSpan.FromMilliseconds(250),
+            useNullPayloadLifetimeLeaseFactory
+                ? null!
+                : payloadLifetimeLeaseFactory ?? NoopPayloadLifetimeLease.Open,
             leaseFactory ?? (() => new TrackingLease().Open()),
             useNullPayloadClosureVerifier
                 ? null!
@@ -751,6 +1130,11 @@ public sealed class RoleLaunchPlanProviderTests
 
     private static void NoopPayloadClosureVerifier()
     {
+    }
+
+    private static class NoopPayloadLifetimeLease
+    {
+        internal static IDisposable Open() => new TrackingLease().Open();
     }
 
     private static LifecycleCommand StartCommand(ProcessGeneration generation) =>
@@ -763,6 +1147,20 @@ public sealed class RoleLaunchPlanProviderTests
             generation.Role == RuntimeRole.Server
                 ? LifecycleDeadlineKey.ServerStart
                 : LifecycleDeadlineKey.WorkerStart);
+
+    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (!condition())
+        {
+            if (DateTime.UtcNow >= deadline)
+            {
+                throw new TimeoutException("condition-not-reached");
+            }
+
+            await Task.Delay(10);
+        }
+    }
 
     private static ExecutorHarness CreateHarness(
         IRoleLaunchPlanProvider provider,
@@ -778,7 +1176,8 @@ public sealed class RoleLaunchPlanProviderTests
             Path.GetFullPath(Environment.ProcessPath!),
             15432,
             AppHostMode.Run,
-            AppHostRuntimeBackend.RedisCompatibility);
+            AppHostRuntimeBackend.RedisCompatibility,
+            AppHostRoleTarget.ControlledFixture);
         var postgresLayout = new PostgresBinaryLayout(
             postgresBin,
             Path.Combine(postgresBin, "initdb.exe"),
@@ -790,8 +1189,7 @@ public sealed class RoleLaunchPlanProviderTests
             DataProfileIdentity.Create(profileRoot),
             postgresLayout,
             PostgresClusterPaths.Create(profileRoot),
-            Path.Combine(profileRoot, "unused-migration.sql"),
-            "unused-fixture-build");
+            Path.Combine(profileRoot, "unused-migration.sql"));
         var secrets = new DiagnosticSecretRegistry();
         var sink = new JsonLinesDiagnosticSink(
             (_, _) => ValueTask.FromResult<Stream>(Stream.Null),
@@ -886,7 +1284,9 @@ public sealed class RoleLaunchPlanProviderTests
         }
     }
 
-    private sealed class StubProcess(ProcessGeneration generation) : ISupervisedProcess
+    private sealed class StubProcess(
+        ProcessGeneration generation,
+        Exception? disposeError = null) : ISupervisedProcess
     {
         public SupervisedProcessIdentity Identity { get; } = new(
             generation.Role,
@@ -906,6 +1306,11 @@ public sealed class RoleLaunchPlanProviderTests
         public ValueTask DisposeAsync()
         {
             IsDisposed = true;
+            if (disposeError is not null)
+            {
+                throw disposeError;
+            }
+
             return ValueTask.CompletedTask;
         }
     }
@@ -933,6 +1338,111 @@ public sealed class RoleLaunchPlanProviderTests
     }
 
     private sealed class ExpectedLaunchException : Exception;
+
+    private static TrustedNodePayload CreateTrustedPayload(
+        string payloadRoot,
+        string profileRoot)
+    {
+        Directory.CreateDirectory(Path.Combine(payloadRoot, "app"));
+        var artifacts = new Dictionary<string, byte[]>
+        {
+            ["node.exe"] = "node"u8.ToArray(),
+            ["app/server.js"] = "server"u8.ToArray(),
+            ["app/worker.js"] = "worker"u8.ToArray(),
+        };
+        foreach (var artifact in artifacts)
+        {
+            File.WriteAllBytes(
+                Path.Combine(
+                    payloadRoot,
+                    artifact.Key.Replace('/', Path.DirectorySeparatorChar)),
+                artifact.Value);
+        }
+
+        var manifest = new
+        {
+            version = 1,
+            buildIdentity = "cleanup-indeterminate-test/1",
+            nodeExecutable = "node.exe",
+            serverEntrypoint = "app/server.js",
+            workerEntrypoint = "app/worker.js",
+            artifacts = artifacts.Select(artifact => new
+            {
+                path = artifact.Key,
+                length = artifact.Value.LongLength,
+                sha256 = Convert.ToHexString(SHA256.HashData(artifact.Value)),
+            }).ToArray(),
+        };
+        File.WriteAllText(
+            Path.Combine(payloadRoot, TrustedNodePayloadValidator.ManifestFileName),
+            JsonSerializer.Serialize(manifest));
+        return new TrustedNodePayloadValidator(
+            inspectHandle: null,
+            readSecurityDescriptor: (_, _) => TrustedDescriptor())
+            .Validate(payloadRoot, profileRoot);
+    }
+
+    private static RawSecurityDescriptor TrustedDescriptor()
+    {
+        var administrators = new SecurityIdentifier(
+            WellKnownSidType.BuiltinAdministratorsSid,
+            domainSid: null);
+        return new RawSecurityDescriptor(
+            ControlFlags.SelfRelative |
+                ControlFlags.DiscretionaryAclPresent |
+                ControlFlags.DiscretionaryAclProtected,
+            administrators,
+            group: null,
+            systemAcl: null,
+            discretionaryAcl: new RawAcl(GenericAcl.AclRevision, 0));
+    }
+
+    private sealed class ThrowingIdentityVerifier : IWindowsProcessIdentityVerifier
+    {
+        public SupervisedProcessIdentity Capture(
+            RuntimeRole role,
+            ProcessGeneration generation,
+            SafeProcessHandle processHandle)
+        {
+            _ = NativeMethods.GetProcessId(processHandle);
+            throw new Win32Exception(87);
+        }
+    }
+
+    private sealed class BlockingIndeterminateCleanupPolicy : IProcessCleanupPolicy
+    {
+        internal TaskCompletionSource Entered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal TaskCompletionSource Release { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public ProcessCleanupResult Cleanup(
+            SafeProcessHandle processHandle,
+            IProcessTreeTerminator job)
+        {
+            Entered.TrySetResult();
+            Release.Task.GetAwaiter().GetResult();
+            return new ProcessCleanupResult(
+                Signaled: false,
+                EscalatedToJob: true,
+                ProcessTerminationErrorCode: null,
+                JobTerminationErrorCode: null,
+                WaitErrorCode: null,
+                TimedOut: true);
+        }
+    }
+
+    private sealed class NoopDiagnosticSink : IDiagnosticSink
+    {
+        internal static NoopDiagnosticSink Instance { get; } = new();
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        public ValueTask WriteAsync(
+            DiagnosticEvent diagnosticEvent,
+            CancellationToken cancellationToken = default) => ValueTask.CompletedTask;
+    }
 
     private sealed class ExecutorHarness(string profileRoot, LifecycleCommandExecutor executor)
         : IAsyncDisposable

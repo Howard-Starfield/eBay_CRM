@@ -9,7 +9,6 @@ namespace HowardLab.EbayCrm.AppHost.Composition;
 internal sealed class FixtureRoleLaunchPlanProvider : IRoleLaunchPlanProvider
 {
     private readonly AppHostOptions _options;
-    private readonly ValidatedAppHostPayload _payload;
     private string? _workerModeForTests;
     private Action _verifyPayloadClosureAfterShutdown = static () => { };
 
@@ -18,7 +17,7 @@ internal sealed class FixtureRoleLaunchPlanProvider : IRoleLaunchPlanProvider
         ValidatedAppHostPayload payload)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
-        _payload = payload ?? throw new ArgumentNullException(nameof(payload));
+        ArgumentNullException.ThrowIfNull(payload);
     }
 
     internal string? WorkerModeForTests
@@ -54,10 +53,11 @@ internal sealed class FixtureRoleLaunchPlanProvider : IRoleLaunchPlanProvider
                 ["SystemRoot"] = systemRoot,
             },
             new Dictionary<string, SecretValue>(StringComparer.OrdinalIgnoreCase),
-            _payload.FixtureBuildIdentity,
+            ControlProtocolConstants.FixtureBuildIdentity,
             RoleReadinessStrategy.IdentityBoundHttp,
             healthPort,
             TimeSpan.FromMilliseconds(100),
+            NoopPayloadLifetimeLease.Open,
             () => AppHostComposition.OpenTrustedFixtureArtifacts(_options.FixturePath),
             Volatile.Read(ref _verifyPayloadClosureAfterShutdown));
     }
