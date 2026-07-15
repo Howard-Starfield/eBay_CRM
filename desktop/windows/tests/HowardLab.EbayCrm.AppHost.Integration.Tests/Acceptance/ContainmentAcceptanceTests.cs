@@ -1,14 +1,16 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Security.Cryptography;
 using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
 using HowardLab.EbayCrm.AppHost.Integration.Tests.AppHost;
 using HowardLab.EbayCrm.AppHost.Integration.Tests.Postgres;
 using System.Text.Json;
+using Xunit.Abstractions;
 
 namespace HowardLab.EbayCrm.AppHost.Integration.Tests.Acceptance;
 
 [Collection("Destructive containment")]
-public sealed class ContainmentAcceptanceTests
+public sealed class ContainmentAcceptanceTests(ITestOutputHelper output)
 {
     private static readonly HashSet<string> ApprovedImages = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -23,17 +25,20 @@ public sealed class ContainmentAcceptanceTests
     [PostgresFact, Trait("Category", "DestructiveContainment")]
     public async Task PublishedHost_ExternalTerminationContainsEveryRetainedDescendantAndColdRestarts()
     {
+        var publishInventory = CapturePublishedInventory();
+        Assert.Equal(204, publishInventory.Length);
         using var layout = TestLayout.CreatePublished();
         var executable = Path.Combine(TestLayout.FindPublishedDirectory(), "HowardLab.EbayCrm.AppHost.exe");
         var retained = new ConcurrentDictionary<int, ProcessIdentitySnapshot>();
         var observedImages = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
         using var host = Start(executable, layout.Arguments("run"));
-        Assert.True(ProcessIdentitySnapshot.TryOpen(host.Id, 0, out var hostIdentity));
-        retained.TryAdd(host.Id, hostIdentity!);
         using var sampling = new CancellationTokenSource();
-        var sampler = SampleTreeAsync(host.Id, retained, observedImages, sampling.Token);
+        var sampler = Task.CompletedTask;
         try
         {
+            Assert.True(ProcessIdentitySnapshot.TryOpen(host.Id, 0, out var hostIdentity));
+            retained.TryAdd(host.Id, hostIdentity!);
+            sampler = SampleTreeAsync(host.Id, retained, observedImages, sampling.Token);
             await WaitForReadyAsync(host).WaitAsync(TimeSpan.FromMinutes(2));
             await Task.Delay(250);
             AssertExpectedClosure(retained, requireInitialization: true);
@@ -54,29 +59,49 @@ public sealed class ContainmentAcceptanceTests
                 Assert.True(identity.HasExited, $"Survivor: {identity.ImageName} {identity.ProcessId}");
                 Assert.True(identity.SameIdentityIfReopened());
             });
-            await WriteIdentityEvidenceAsync(retained.Values);
+            WriteIdentityEvidence(retained.Values);
         }
         finally
         {
             sampling.Cancel();
-            await sampler;
-            await TerminateRetainedAsync(retained.Values);
-            foreach (var identity in retained.Values) identity.Dispose();
+            try
+            {
+                await sampler;
+            }
+            finally
+            {
+                try
+                {
+                    try
+                    {
+                        await TerminateRootIfRunningAsync(host);
+                    }
+                    finally
+                    {
+                        await TerminateRetainedAsync(retained.Values);
+                    }
+                }
+                finally
+                {
+                    foreach (var identity in retained.Values) identity.Dispose();
+                }
+            }
         }
 
         var restartedRetained = new ConcurrentDictionary<int, ProcessIdentitySnapshot>();
         var restartedImages = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
         using var restarted = Start(executable, layout.Arguments("run"));
-        Assert.True(ProcessIdentitySnapshot.TryOpen(restarted.Id, 0, out var restartedHostIdentity));
-        restartedRetained.TryAdd(restarted.Id, restartedHostIdentity!);
         using var restartedSampling = new CancellationTokenSource();
-        var restartedSampler = SampleTreeAsync(
-            restarted.Id,
-            restartedRetained,
-            restartedImages,
-            restartedSampling.Token);
+        var restartedSampler = Task.CompletedTask;
         try
         {
+            Assert.True(ProcessIdentitySnapshot.TryOpen(restarted.Id, 0, out var restartedHostIdentity));
+            restartedRetained.TryAdd(restarted.Id, restartedHostIdentity!);
+            restartedSampler = SampleTreeAsync(
+                restarted.Id,
+                restartedRetained,
+                restartedImages,
+                restartedSampling.Token);
             await WaitForReadyAsync(restarted).WaitAsync(TimeSpan.FromMinutes(2));
             await Task.Delay(250);
             AssertExpectedClosure(restartedRetained, requireInitialization: false);
@@ -89,10 +114,31 @@ public sealed class ContainmentAcceptanceTests
         finally
         {
             restartedSampling.Cancel();
-            await restartedSampler;
-            await TerminateRetainedAsync(restartedRetained.Values);
-            foreach (var identity in restartedRetained.Values) identity.Dispose();
+            try
+            {
+                await restartedSampler;
+            }
+            finally
+            {
+                try
+                {
+                    try
+                    {
+                        await TerminateRootIfRunningAsync(restarted);
+                    }
+                    finally
+                    {
+                        await TerminateRetainedAsync(restartedRetained.Values);
+                    }
+                }
+                finally
+                {
+                    foreach (var identity in restartedRetained.Values) identity.Dispose();
+                }
+            }
         }
+
+        Assert.Equal(publishInventory, CapturePublishedInventory());
     }
 
     private static Process Start(string executable, IEnumerable<string> arguments)
@@ -179,11 +225,31 @@ public sealed class ContainmentAcceptanceTests
         Task.WhenAll(identities.Select(identity =>
             identity.TerminateIfRunningAsync(TimeSpan.FromSeconds(10))));
 
-    private static Task WriteIdentityEvidenceAsync(IEnumerable<ProcessIdentitySnapshot> identities)
+    private static async Task TerminateRootIfRunningAsync(Process root)
     {
-        var path = Path.Combine(
-            TestLayout.FindPublishedDirectory(),
-            "acceptance-containment-identities.json");
+        if (root.HasExited) return;
+        root.Kill(entireProcessTree: false);
+        await root.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    private static PublishedArtifact[] CapturePublishedInventory()
+    {
+        var publish = TestLayout.FindPublishedDirectory();
+        return Directory.EnumerateFiles(publish, "*", SearchOption.AllDirectories)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .Select(path =>
+            {
+                using var stream = File.OpenRead(path);
+                return new PublishedArtifact(
+                    Path.GetRelativePath(publish, path).Replace('\\', '/'),
+                    stream.Length,
+                    Convert.ToHexString(SHA256.HashData(stream)));
+            })
+            .ToArray();
+    }
+
+    private void WriteIdentityEvidence(IEnumerable<ProcessIdentitySnapshot> identities)
+    {
         var evidence = identities
             .OrderBy(identity => identity.CreationTimeUtc)
             .Select(identity => new
@@ -194,7 +260,7 @@ public sealed class ContainmentAcceptanceTests
                 identity.ImageName,
                 Signaled = identity.HasExited,
             });
-        return File.WriteAllTextAsync(path, JsonSerializer.Serialize(evidence, new JsonSerializerOptions
+        output.WriteLine(JsonSerializer.Serialize(evidence, new JsonSerializerOptions
         {
             WriteIndented = true,
         }));
@@ -230,6 +296,8 @@ public sealed class ContainmentAcceptanceTests
     }
 
 }
+
+internal sealed record PublishedArtifact(string RelativePath, long Length, string Sha256);
 
 [CollectionDefinition("Destructive containment", DisableParallelization = true)]
 public sealed class DestructiveContainmentCollection;

@@ -25,6 +25,7 @@ published folder, and runs host-kill tests in their own nonparallel command.
 ```powershell
 dotnet restore desktop\windows\EbayCrm.Desktop.sln --locked-mode
 dotnet build desktop\windows\EbayCrm.Desktop.sln --configuration Release --no-restore
+Remove-Item -Recurse -Force desktop\windows\artifacts\win-x64 -ErrorAction SilentlyContinue
 dotnet publish desktop\windows\src\HowardLab.EbayCrm.AppHost\HowardLab.EbayCrm.AppHost.csproj --configuration Release --runtime win-x64 --self-contained true --output desktop\windows\artifacts\win-x64 -p:PublishSingleFile=false -p:PublishTrimmed=false -p:PublishAot=false
 dotnet test desktop\windows\tests\HowardLab.EbayCrm.AppHost.Core.Tests --configuration Release --no-restore --no-build
 dotnet test desktop\windows\tests\HowardLab.EbayCrm.AppHost.Windows.Tests --configuration Release --no-restore --no-build

@@ -1,6 +1,6 @@
 # Phase 1A Windows AppHost supervision evidence
 
-Date: 2026-07-14 (America/Los_Angeles)
+Date: 2026-07-14–15 (America/Los_Angeles)
 
 Branch: `codex/phase-1a-apphost`
 
@@ -48,10 +48,27 @@ ran before acceptance tests that consume its folder.
 
 Total: 381 passed, 0 failed, 0 skipped. PostgreSQL-backed tests had zero skips.
 
-The generated `win-x64` folder contained 204 files totaling 81,233,626 bytes.
+The generated `win-x64` folder contained 204 files totaling 81,233,630 bytes.
 It contained AppHost EXE/DLL, Fixture EXE/DLL and its attested dependency
 closure, migration `0001_apphost_control.sql`, `hostfxr.dll`, `coreclr.dll`, and
 `System.Private.CoreLib.dll`. The generated folder is ignored and not committed.
+
+### 2026-07-15 evidence-cleanup replay
+
+The follow-up replay based on commit `65039dabf54b0e42cd4247c993030b8f502f4729`
+removed the publish directory before publishing. Two consecutive clean publishes
+both produced 204 files totaling 81,233,630 bytes, with zero differences across
+relative path, length, and SHA-256. This current reproducible total supersedes
+the earlier recorded 81,233,626-byte total; the earlier per-file inventory was
+not retained, so no unsupported attribution is made for the four-byte change.
+The tested follow-up staged tree before the final metadata additions was
+`3f2088f95c474f960b1fc91d63f5c907b4b11b55`.
+
+Before and after the complete destructive partition, the inventory remained
+204 files and 81,233,630 bytes. The containment test now emits current-run
+identity JSON through xUnit output and asserts that every published artifact's
+relative path, length, and SHA-256 remains unchanged. It does not write test
+evidence into the application publish directory.
 
 ## Acceptance-gate observations
 
@@ -124,10 +141,11 @@ closure, migration `0001_apphost_control.sql`, `hostfxr.dll`, `coreclr.dll`, and
     Redis, or full Twenty process was launched or globally inspected/killed.
 
 The passing external-death run retained each native handle and PID/creation-time
-pair during the run and wrote the following exact evidence before test cleanup.
-Every listed retained identity was signaled after external AppHost termination.
-The generated JSON evidence file remained ignored and was not counted as a
-published application artifact.
+pair during the run and emitted the current-run JSON through xUnit output rather
+than writing into the publish folder. Every listed retained identity was
+signaled after external AppHost termination. The exact evidence below remains
+committed for the recorded run, while the destructive regression asserts that
+the publish folder's relative paths, lengths, and SHA-256 values are unchanged.
 
 | PID | Parent PID | UTC creation time | Image | Signaled |
 |---:|---:|---|---|---|
