@@ -50,6 +50,9 @@ public sealed class AppHostShutdownTests
                 TimeSpan.FromSeconds(30),
                 TimeSpan.FromMilliseconds(25)));
         runtime.Executor.RoleLaunchedForTests = boundary.RecordLaunched;
+        var payloadClosureVerificationCount = 0;
+        runtime.FixtureRoleLaunchPlanProvider.VerifyPayloadClosureAfterShutdownForTests =
+            () => Interlocked.Increment(ref payloadClosureVerificationCount);
         ProcessIdentitySnapshot? databaseIdentity = null;
         try
         {
@@ -86,6 +89,9 @@ public sealed class AppHostShutdownTests
             Assert.True(databaseIdentity!.HasExited);
             Assert.True(databaseIdentity.SameIdentityIfReopened());
             Assert.False(File.Exists(Path.Combine(layout.ProfileRoot, "postgres-data", "postmaster.pid")));
+            Assert.Equal(2, Volatile.Read(ref payloadClosureVerificationCount));
+            await runtime.Orchestrator.StopAsync();
+            Assert.Equal(2, Volatile.Read(ref payloadClosureVerificationCount));
             Assert.Equal(1, runtime.Executor.ReleaseInstanceCountForTests);
             var profile = DataProfileIdentity.Create(layout.ProfileRoot);
             var ownership = await UserProfileInstanceLock.TryAcquireAsync(profile, CancellationToken.None);
@@ -119,6 +125,9 @@ public sealed class AppHostShutdownTests
             TimeSpan.FromMilliseconds(120));
         var runtime = AppHostComposition.CreateForTests(options, budget);
         runtime.FixtureRoleLaunchPlanProvider.WorkerModeForTests = "ignore-shutdown";
+        var payloadClosureVerificationCount = 0;
+        runtime.FixtureRoleLaunchPlanProvider.VerifyPayloadClosureAfterShutdownForTests =
+            () => Interlocked.Increment(ref payloadClosureVerificationCount);
         try
         {
             await runtime.Orchestrator.StartAsync().WaitAsync(TimeSpan.FromMinutes(2));
@@ -135,6 +144,9 @@ public sealed class AppHostShutdownTests
             Assert.Contains("shutdown-budget-exhausted", fault, StringComparison.Ordinal);
             AssertProcessExited(started.ServerProcessId);
             AssertProcessExited(started.WorkerProcessId);
+            Assert.Equal(2, Volatile.Read(ref payloadClosureVerificationCount));
+            await runtime.Orchestrator.StopAsync();
+            Assert.Equal(2, Volatile.Read(ref payloadClosureVerificationCount));
         }
         finally
         {

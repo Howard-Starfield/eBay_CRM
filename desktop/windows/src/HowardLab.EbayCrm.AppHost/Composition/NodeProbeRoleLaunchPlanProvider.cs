@@ -77,7 +77,8 @@ internal sealed class NodeProbeRoleLaunchPlanProvider : IRoleLaunchPlanProvider
             RoleReadinessStrategy.IdentityBoundHttp,
             healthPort,
             TimeSpan.FromMilliseconds(100),
-            _openBootstrapArtifactLease);
+            _openBootstrapArtifactLease,
+            static () => { });
     }
 
     private static string ValidateFile(string path, string expectedName, string parameterName)

@@ -3,10 +3,14 @@ using HowardLab.EbayCrm.AppHost.Core.Diagnostics;
 using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
 using HowardLab.EbayCrm.AppHost.Core.Processes;
 using HowardLab.EbayCrm.AppHost.Core.Time;
+using HowardLab.EbayCrm.AppHost.Fixture;
 using HowardLab.EbayCrm.AppHost.Integration.Tests.Postgres;
 using HowardLab.EbayCrm.AppHost.Protocol.Control;
 using HowardLab.EbayCrm.AppHost.Windows.Instance;
 using HowardLab.EbayCrm.AppHost.Windows.Postgres;
+using HowardLab.EbayCrm.AppHost.Windows.Processes;
+using System.Net;
+using System.Net.Sockets;
 
 namespace HowardLab.EbayCrm.AppHost.Integration.Tests.AppHost;
 
@@ -80,6 +84,278 @@ public sealed class RoleLaunchPlanProviderTests
             plan.BuildIdentity,
             launched.Environment[HowardLab.EbayCrm.AppHost.Windows.Control.WindowsControlChannel.BuildEnvironmentVariable]);
         Assert.Equal(new RoleLaunchRequest(role, generation), provider.LastRequest);
+    }
+
+    [Fact]
+    public async Task NullPayloadClosureVerifierFailsBeforeLeaseOrLaunch()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var lease = new TrackingLease();
+        var launcher = new RecordingLauncher((_, _, _) =>
+            throw new InvalidOperationException("must not launch"));
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                leaseFactory: () => lease.Open(),
+                useNullPayloadClosureVerifier: true)),
+            launcher);
+
+        var error = await Assert.ThrowsAsync<AppHostExecutionException>(() =>
+            harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        Assert.Equal("role-launch-plan-invalid", error.ReasonCode);
+        Assert.False(lease.WasOpened);
+        Assert.Empty(launcher.Specifications);
+    }
+
+    [Fact]
+    public async Task NonWindowsLauncherContractBreachDoesNotVerifyPayloadClosure()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var verificationCount = 0;
+        var launcher = new RecordingLauncher((_, _, _) =>
+            ValueTask.FromResult<ISupervisedProcess>(new StubProcess(generation)));
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                verifyPayloadClosureAfterShutdown: () => verificationCount++)),
+            launcher);
+
+        var error = await Assert.ThrowsAsync<AppHostExecutionException>(() =>
+            harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        Assert.Equal("role-process-type-invalid", error.ReasonCode);
+        Assert.Equal(0, verificationCount);
+    }
+
+    [Fact]
+    public async Task RealWindowsChild_DisposeWaitsForExitAndVerifiesExactlyOnce()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var verificationCount = 0;
+        var healthPort = ReserveLoopbackPort();
+        var fixturePath = Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe");
+        var systemRoot = Environment.GetEnvironmentVariable("SystemRoot")!;
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                arguments: ["server", healthPort.ToString(System.Globalization.CultureInfo.InvariantCulture)],
+                applicationPath: fixturePath,
+                workingDirectory: Path.GetDirectoryName(fixturePath),
+                environment: new Dictionary<string, string> { ["SystemRoot"] = systemRoot },
+                secretEnvironment: new Dictionary<string, SecretValue>(),
+                buildIdentity: ControlProtocolConstants.FixtureBuildIdentity,
+                healthPort: healthPort,
+                verifyPayloadClosureAfterShutdown: () =>
+                    Interlocked.Increment(ref verificationCount))),
+            launcher: null);
+
+        var started = await harness.Executor.ExecuteAsync(StartCommand(generation));
+
+        Assert.IsType<RoleStarted>(started);
+        Assert.Equal(0, Volatile.Read(ref verificationCount));
+        await Task.WhenAll(Enumerable.Range(0, 8)
+            .Select(_ => harness.Executor.DisposeAsync().AsTask()));
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+        await harness.Executor.DisposeAsync();
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+    }
+
+    [Fact]
+    public async Task RealWindowsChild_LeaseReleaseFailureVerifiesAfterCleanup()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var verificationCount = 0;
+        var healthPort = ReserveLoopbackPort();
+        var fixturePath = Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe");
+        var systemRoot = Environment.GetEnvironmentVariable("SystemRoot")!;
+        var lease = new TrackingLease(new InvalidOperationException("untrusted-lease-detail"));
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                arguments: ["server", healthPort.ToString(System.Globalization.CultureInfo.InvariantCulture)],
+                applicationPath: fixturePath,
+                workingDirectory: Path.GetDirectoryName(fixturePath),
+                environment: new Dictionary<string, string> { ["SystemRoot"] = systemRoot },
+                secretEnvironment: new Dictionary<string, SecretValue>(),
+                leaseFactory: () => lease.Open(),
+                buildIdentity: ControlProtocolConstants.FixtureBuildIdentity,
+                healthPort: healthPort,
+                verifyPayloadClosureAfterShutdown: () =>
+                    Interlocked.Increment(ref verificationCount))),
+            launcher: null);
+
+        var error = await Assert.ThrowsAsync<AppHostExecutionException>(() =>
+            harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        Assert.Equal("role-payload-trust-failed", error.ReasonCode);
+        Assert.DoesNotContain("untrusted-lease-detail", error.ToString(), StringComparison.Ordinal);
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+        await harness.Executor.DisposeAsync();
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+    }
+
+    [Fact]
+    public async Task RealWindowsChild_ExitDoesNotVerifyBeforeCleanup()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var verificationCount = 0;
+        var healthPort = ReserveLoopbackPort();
+        var fixturePath = Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe");
+        var systemRoot = Environment.GetEnvironmentVariable("SystemRoot")!;
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                arguments: ["crash-after-hello", healthPort.ToString(System.Globalization.CultureInfo.InvariantCulture)],
+                applicationPath: fixturePath,
+                workingDirectory: Path.GetDirectoryName(fixturePath),
+                environment: new Dictionary<string, string> { ["SystemRoot"] = systemRoot },
+                secretEnvironment: new Dictionary<string, SecretValue>(),
+                buildIdentity: ControlProtocolConstants.FixtureBuildIdentity,
+                healthPort: healthPort,
+                verifyPayloadClosureAfterShutdown: () =>
+                    Interlocked.Increment(ref verificationCount))),
+            launcher: null);
+
+        var result = await harness.Executor.ExecuteAsync(StartCommand(generation));
+
+        Assert.IsType<RoleStarted>(result);
+        Assert.Equal(0, Volatile.Read(ref verificationCount));
+        await harness.Executor.DisposeAsync();
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+    }
+
+    [Fact]
+    public async Task RealWindowsChild_EscalationWithCanceledCallerStillVerifiesAfterExit()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var verificationCount = 0;
+        var healthPort = ReserveLoopbackPort();
+        var fixturePath = Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe");
+        var systemRoot = Environment.GetEnvironmentVariable("SystemRoot")!;
+        await using var harness = CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                arguments: ["server", healthPort.ToString(System.Globalization.CultureInfo.InvariantCulture)],
+                applicationPath: fixturePath,
+                workingDirectory: Path.GetDirectoryName(fixturePath),
+                environment: new Dictionary<string, string> { ["SystemRoot"] = systemRoot },
+                secretEnvironment: new Dictionary<string, SecretValue>(),
+                buildIdentity: ControlProtocolConstants.FixtureBuildIdentity,
+                healthPort: healthPort,
+                verifyPayloadClosureAfterShutdown: () =>
+                    Interlocked.Increment(ref verificationCount))),
+            launcher: null);
+        Assert.IsType<RoleStarted>(await harness.Executor.ExecuteAsync(StartCommand(generation)));
+        using var canceledCaller = new CancellationTokenSource();
+        canceledCaller.Cancel();
+
+        var escalationError = await Record.ExceptionAsync(() =>
+            harness.Executor.ExecuteAsync(
+                new LifecycleCommand(
+                    LifecycleCommandType.EscalateJob,
+                    Generation: null,
+                    Guid.NewGuid(),
+                    LifecycleDeadlineKey.None),
+                canceledCaller.Token));
+
+        Assert.DoesNotContain(
+            "role-process-exit-unconfirmed",
+            escalationError?.ToString() ?? string.Empty,
+            StringComparison.Ordinal);
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+        _ = await harness.Executor.ExecuteAsync(new LifecycleCommand(
+            LifecycleCommandType.EscalateJob,
+            Generation: null,
+            Guid.NewGuid(),
+            LifecycleDeadlineKey.None));
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RealWindowsChild_NativeExitFailureFailsClosedWithoutVerification(bool fault)
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var verificationCount = 0;
+        await using var harness = CreateRealWindowsHarness(
+            generation,
+            () => Interlocked.Increment(ref verificationCount));
+        Assert.IsType<RoleStarted>(await harness.Executor.ExecuteAsync(StartCommand(generation)));
+        harness.Executor.NativeExitWaitForTests = (_, _, _) => Task.FromException(
+            fault
+                ? new InvalidOperationException("simulated native-exit fault")
+                : new TimeoutException("simulated native-exit timeout"));
+
+        var error = await Assert.ThrowsAsync<AppHostExecutionException>(() =>
+            harness.Executor.DisposeRoleForTests(RuntimeRole.Server));
+
+        Assert.Equal("role-process-exit-unconfirmed", error.ReasonCode);
+        Assert.Equal(0, Volatile.Read(ref verificationCount));
+    }
+
+    [Fact]
+    public async Task RealWindowsChild_MonitorFailureStillCleansAndVerifies()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var verificationCount = 0;
+        await using var harness = CreateRealWindowsHarness(
+            generation,
+            () => Interlocked.Increment(ref verificationCount));
+        Assert.IsType<RoleStarted>(await harness.Executor.ExecuteAsync(StartCommand(generation)));
+        harness.Executor.StopMonitoringCompletedForTests = static _ =>
+            Task.FromException(new InvalidOperationException("simulated monitor failure"));
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            harness.Executor.DisposeRoleForTests(RuntimeRole.Server));
+
+        Assert.Equal("simulated monitor failure", error.Message);
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
+    }
+
+    [Fact]
+    public async Task RealWindowsChild_NormalAndEscalationRaceShareOneTeardownAndVerifier()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var verificationCount = 0;
+        await using var harness = CreateRealWindowsHarness(
+            generation,
+            () => Interlocked.Increment(ref verificationCount));
+        Assert.IsType<RoleStarted>(await harness.Executor.ExecuteAsync(StartCommand(generation)));
+        var teardownEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseTeardown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        harness.Executor.RoleTeardownStartedForTests = async _ =>
+        {
+            teardownEntered.TrySetResult();
+            await releaseTeardown.Task;
+        };
+
+        var normalTeardown = Record.ExceptionAsync(() =>
+            harness.Executor.DisposeRoleForTests(RuntimeRole.Server));
+        await teardownEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.NotNull(harness.Executor.SnapshotForTests().ServerProcessId);
+        var escalation = Record.ExceptionAsync(() => harness.Executor.ExecuteAsync(
+            new LifecycleCommand(
+                LifecycleCommandType.EscalateJob,
+                Generation: null,
+                Guid.NewGuid(),
+                LifecycleDeadlineKey.None)));
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (harness.Executor.SnapshotForTests().ServerProcessId is not null &&
+               DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(10);
+        }
+
+        Assert.Null(harness.Executor.SnapshotForTests().ServerProcessId);
+        await Task.Delay(50);
+        Assert.False(escalation.IsCompleted);
+        releaseTeardown.TrySetResult();
+        var errors = await Task.WhenAll(normalTeardown, escalation);
+
+        Assert.All(errors, error => Assert.Null(error));
+        Assert.Equal(1, Volatile.Read(ref verificationCount));
     }
 
     public static TheoryData<string, bool> ReservedEnvironmentKeys()
@@ -452,7 +728,10 @@ public sealed class RoleLaunchPlanProviderTests
         IReadOnlyList<string>? arguments = null,
         string? applicationPath = null,
         string? workingDirectory = null,
-        string? buildIdentity = null) =>
+        string? buildIdentity = null,
+        int healthPort = 32123,
+        Action? verifyPayloadClosureAfterShutdown = null,
+        bool useNullPayloadClosureVerifier = false) =>
         new(
             generation.Role,
             generation,
@@ -463,9 +742,16 @@ public sealed class RoleLaunchPlanProviderTests
             secretEnvironment ?? new Dictionary<string, SecretValue> { ["CUSTOM_SECRET"] = new("secret-value") },
             buildIdentity ?? "provider-build",
             RoleReadinessStrategy.IdentityBoundHttp,
-            32123,
+            healthPort,
             TimeSpan.FromMilliseconds(250),
-            leaseFactory ?? (() => new TrackingLease().Open()));
+            leaseFactory ?? (() => new TrackingLease().Open()),
+            useNullPayloadClosureVerifier
+                ? null!
+                : verifyPayloadClosureAfterShutdown ?? NoopPayloadClosureVerifier);
+
+    private static void NoopPayloadClosureVerifier()
+    {
+    }
 
     private static LifecycleCommand StartCommand(ProcessGeneration generation) =>
         new(
@@ -480,7 +766,7 @@ public sealed class RoleLaunchPlanProviderTests
 
     private static ExecutorHarness CreateHarness(
         IRoleLaunchPlanProvider provider,
-        IProcessLauncher launcher)
+        IProcessLauncher? launcher)
     {
         var profileRoot = Path.Combine(Path.GetTempPath(), $"role-plan-{Guid.NewGuid():N}");
         Directory.CreateDirectory(profileRoot);
@@ -511,18 +797,54 @@ public sealed class RoleLaunchPlanProviderTests
             (_, _) => ValueTask.FromResult<Stream>(Stream.Null),
             new SystemClock(),
             secrets);
+        var gatedSink = new OwnershipGatedDiagnosticSink(sink, TimeSpan.FromSeconds(1));
         var executor = new LifecycleCommandExecutor(
             options,
             payload,
             identityStore: null,
             NoopRoleOperationBoundary.Instance,
             RoleOperationDeadlines.Production,
-            new OwnershipGatedDiagnosticSink(sink, TimeSpan.FromSeconds(1)),
+            gatedSink,
             secrets,
             diagnosticSecretObserver: null,
             provider,
-            launcher);
+            launcher ?? new WindowsProcessLauncher(gatedSink));
         return new ExecutorHarness(profileRoot, executor);
+    }
+
+    private static ExecutorHarness CreateRealWindowsHarness(
+        ProcessGeneration generation,
+        Action verifyPayloadClosureAfterShutdown)
+    {
+        var healthPort = ReserveLoopbackPort();
+        var fixturePath = Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe");
+        var systemRoot = Environment.GetEnvironmentVariable("SystemRoot")!;
+        return CreateHarness(
+            new StubProvider(CreatePlan(
+                generation,
+                arguments: ["server", healthPort.ToString(System.Globalization.CultureInfo.InvariantCulture)],
+                applicationPath: fixturePath,
+                workingDirectory: Path.GetDirectoryName(fixturePath),
+                environment: new Dictionary<string, string> { ["SystemRoot"] = systemRoot },
+                secretEnvironment: new Dictionary<string, SecretValue>(),
+                buildIdentity: ControlProtocolConstants.FixtureBuildIdentity,
+                healthPort: healthPort,
+                verifyPayloadClosureAfterShutdown: verifyPayloadClosureAfterShutdown)),
+            launcher: null);
+    }
+
+    private static int ReserveLoopbackPort()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        try
+        {
+            return ((IPEndPoint)listener.LocalEndpoint).Port;
+        }
+        finally
+        {
+            listener.Stop();
+        }
     }
 
     private sealed class StubProvider : IRoleLaunchPlanProvider

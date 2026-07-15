@@ -133,6 +133,12 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
 
     internal Func<RuntimeRole, Task>? ControlMonitorDisconnectObservedForTests { get; set; }
 
+    internal Func<RuntimeRole, Task>? RoleTeardownStartedForTests { get; set; }
+
+    internal Func<RuntimeRole, Task>? StopMonitoringCompletedForTests { get; set; }
+
+    internal Func<RuntimeRole, Task, TimeSpan, Task>? NativeExitWaitForTests { get; set; }
+
     internal Action? ReadinessLoserObservedForTests { get; set; }
 
     internal int ReleaseInstanceCountForTests => Volatile.Read(ref _releaseInstanceCountForTests);
@@ -167,6 +173,8 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     internal static bool TryTakeExactRoleResource<T>(ref T? current, T expected)
         where T : class =>
         ReferenceEquals(Interlocked.CompareExchange(ref current, null, expected), expected);
+
+    internal Task DisposeRoleForTests(RuntimeRole role) => DisposeRoleAsync(role);
 
     internal AppHostRuntimeSnapshot SnapshotForTests() => new(
         _databaseIdentity?.ProcessId,
@@ -476,7 +484,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             plan.BuildIdentity,
             ControlDeadline);
         var job = WindowsJobObject.CreateKillOnClose();
-        ISupervisedProcess? process = null;
+        LaunchedRoleProcess? launched = null;
         RoleResource? resource = null;
         try
         {
@@ -516,13 +524,16 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
                 environment,
                 secretEnvironment,
                 plan.OutputDrainTimeout);
-            process = await LaunchWithArtifactLeaseAsync(
+            launched = await LaunchWithArtifactLeaseAsync(
                 plan,
                 specification,
+                channel,
                 job,
                 cancellationToken).ConfigureAwait(false);
 
-            if (process is not WindowsSupervisedProcess windowsProcess)
+            if (launched.Process is not WindowsSupervisedProcess windowsProcess ||
+                launched.PayloadClosureVerifier is null ||
+                launched.NativeExitObservation is null)
             {
                 throw new AppHostExecutionException("role-process-type-invalid");
             }
@@ -532,9 +543,11 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
                 generation,
                 command.OperationId,
                 plan.HealthPort!.Value,
-                process,
+                windowsProcess,
                 channel,
-                job);
+                job,
+                launched.NativeExitObservation,
+                launched.PayloadClosureVerifier);
             SetRole(resource);
             resource.AcceptTask = AcceptRoleAsync(resource);
             using var commandDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -552,29 +565,77 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
 
             return new RoleStarted(generation);
         }
-        catch
+        catch (Exception primaryError)
         {
+            var cleanupErrors = new List<Exception>();
             if (resource is not null)
             {
-                await DisposeRoleAsync(resource).ConfigureAwait(false);
+                await CaptureCleanupAsync(
+                    () => DisposeRoleAsync(resource),
+                    cleanupErrors).ConfigureAwait(false);
             }
             else
             {
-                if (process is not null)
+                if (launched?.Process is WindowsSupervisedProcess windowsProcess &&
+                    launched.PayloadClosureVerifier is not null &&
+                    launched.NativeExitObservation is not null)
                 {
-                    await process.DisposeAsync().ConfigureAwait(false);
+                    await CaptureCleanupAsync(
+                        () => CleanupUnownedWindowsChildAsync(
+                            windowsProcess,
+                            channel,
+                            job,
+                            launched.NativeExitObservation,
+                            launched.PayloadClosureVerifier),
+                        cleanupErrors).ConfigureAwait(false);
                 }
+                else if (launched?.Process is { } process)
+                {
+                    await CaptureCleanupAsync(
+                        () => process.DisposeAsync().AsTask(),
+                        cleanupErrors).ConfigureAwait(false);
 
-                await channel.DisposeAsync().ConfigureAwait(false);
-                job.Dispose();
+                    await CaptureCleanupAsync(
+                        () => channel.DisposeAsync().AsTask(),
+                        cleanupErrors).ConfigureAwait(false);
+                    try
+                    {
+                        job.Dispose();
+                    }
+                    catch (Exception cleanupError)
+                    {
+                        cleanupErrors.Add(cleanupError);
+                    }
+                }
+                else
+                {
+                    await CaptureCleanupAsync(
+                        () => channel.DisposeAsync().AsTask(),
+                        cleanupErrors).ConfigureAwait(false);
+                    try
+                    {
+                        job.Dispose();
+                    }
+                    catch (Exception cleanupError)
+                    {
+                        cleanupErrors.Add(cleanupError);
+                    }
+                }
             }
-            throw;
+
+            if (cleanupErrors.Count == 0)
+            {
+                ExceptionDispatchInfo.Capture(primaryError).Throw();
+            }
+
+            throw new AggregateException([primaryError, .. cleanupErrors]);
         }
     }
 
-    private async ValueTask<ISupervisedProcess> LaunchWithArtifactLeaseAsync(
+    private async ValueTask<LaunchedRoleProcess> LaunchWithArtifactLeaseAsync(
         RoleLaunchPlan plan,
         LaunchSpecification specification,
+        WindowsControlChannel channel,
         WindowsJobObject job,
         CancellationToken cancellationToken)
     {
@@ -611,6 +672,11 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             launchFailure = ExceptionDispatchInfo.Capture(error);
         }
 
+        var windowsProcess = launchedProcess as WindowsSupervisedProcess;
+        var payloadClosureVerifier = windowsProcess is null
+            ? null
+            : new OneShotPayloadClosureVerifier(plan.VerifyPayloadClosureAfterShutdown);
+
         try
         {
             artifactLease.Dispose();
@@ -622,7 +688,23 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
         catch (Exception)
         {
-            if (launchedProcess is not null)
+            if (windowsProcess is not null && payloadClosureVerifier is not null)
+            {
+                try
+                {
+                    await CleanupUnownedWindowsChildAsync(
+                        windowsProcess,
+                        channel,
+                        job,
+                        windowsProcess.NativeExitObservation,
+                        payloadClosureVerifier).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // The enclosing role job remains the cleanup authority.
+                }
+            }
+            else if (launchedProcess is not null)
             {
                 try
                 {
@@ -638,8 +720,18 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
 
         launchFailure?.Throw();
-        return launchedProcess
-            ?? throw new AppHostExecutionException("role-process-type-invalid");
+        if (windowsProcess is not null && payloadClosureVerifier is not null)
+        {
+            return new LaunchedRoleProcess(
+                windowsProcess,
+                windowsProcess.NativeExitObservation,
+                payloadClosureVerifier);
+        }
+
+        return new LaunchedRoleProcess(
+            launchedProcess ?? throw new AppHostExecutionException("role-process-type-invalid"),
+            NativeExitObservation: null,
+            PayloadClosureVerifier: null);
     }
 
     private async Task AcceptRoleAsync(RoleResource resource)
@@ -1476,46 +1568,58 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     {
         var worker = Interlocked.Exchange(ref _worker, null);
         var server = Interlocked.Exchange(ref _server, null);
+        var roleResources = new[] { worker, server }
+            .Where(value => value is not null)
+            .Cast<RoleResource>()
+            .ToArray();
         var errors = new List<Exception>();
 
         // Close every containment boundary before awaiting any descendant.
-        foreach (var resource in new[] { worker, server }.Where(value => value is not null).Cast<RoleResource>())
+        foreach (var resource in roleResources)
         {
-            resource.RoleLifetimeCancellation.Cancel();
-            resource.MonitorCancellation.Cancel();
-            var termination = resource.Job.TerminateTree(exitCode: 1);
-            if (!termination.Succeeded)
-            {
-                errors.Add(new AppHostExecutionException(
-                    $"role-job-termination-failed-{termination.ErrorCode.ToString(CultureInfo.InvariantCulture)}"));
-            }
-        }
-        foreach (var resource in new[] { worker, server }.Where(value => value is not null).Cast<RoleResource>())
-        {
-            try { resource.Job.Dispose(); } catch (Exception error) { errors.Add(error); }
-        }
-        try { _databaseJob?.Dispose(); } catch (Exception error) { errors.Add(error); }
-
-        foreach (var resource in new[] { worker, server }.Where(value => value is not null).Cast<RoleResource>())
-        {
-            try { resource.Channel.ForceCloseAfterJobClose(); } catch (Exception error) { errors.Add(error); }
             try
             {
-                if (resource.Process is WindowsSupervisedProcess process)
+                resource.RoleLifetimeCancellation.Cancel();
+            }
+            catch (Exception error)
+            {
+                errors.Add(error);
+            }
+
+            try
+            {
+                resource.MonitorCancellation.Cancel();
+            }
+            catch (Exception error)
+            {
+                errors.Add(error);
+            }
+
+            try
+            {
+                var termination = resource.Job.TerminateTree(exitCode: 1);
+                if (!termination.Succeeded)
                 {
-                    process.TerminateAndForceCloseAfterJobClose(cancellationToken);
-                }
-                else
-                {
-                    throw new AppHostExecutionException("role-process-type-invalid");
+                    errors.Add(new AppHostExecutionException(
+                        $"role-job-termination-failed-{termination.ErrorCode.ToString(CultureInfo.InvariantCulture)}"));
                 }
             }
             catch (Exception error)
             {
                 errors.Add(error);
             }
-            resource.DisposeMonitorCancellationWhenQuiescent();
-            resource.DisposeRoleLifetimeCancellationWhenQuiescent();
+        }
+        foreach (var resource in roleResources)
+        {
+            try { resource.Job.Dispose(); } catch (Exception error) { errors.Add(error); }
+        }
+        try { _databaseJob?.Dispose(); } catch (Exception error) { errors.Add(error); }
+
+        var roleTeardowns = new List<Task>(roleResources.Length);
+        foreach (var resource in roleResources)
+        {
+            roleTeardowns.Add(resource.GetOrStartTeardown(
+                () => EscalateRoleResourceCoreAsync(resource, cancellationToken)));
         }
 
         if (_databaseIdentity is { } identity && _databaseRuntime is { } runtime)
@@ -1551,8 +1655,54 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         _databaseIdentity = null;
         _databaseJob = null;
         _databaseOperationId = null;
+        foreach (var teardown in roleTeardowns)
+        {
+            await CaptureCleanupAsync(() => teardown, errors).ConfigureAwait(false);
+        }
+
         ThrowCleanupErrors(errors);
         return null;
+    }
+
+    private async Task EscalateRoleResourceCoreAsync(
+        RoleResource resource,
+        CancellationToken cancellationToken)
+    {
+        var errors = new List<Exception>();
+        resource.RoleLifetimeCancellation.Cancel();
+        await CaptureCleanupAsync(
+            () => StopMonitoringAsync(resource),
+            errors).ConfigureAwait(false);
+        try
+        {
+            resource.Channel.ForceCloseAfterJobClose();
+        }
+        catch (Exception error)
+        {
+            errors.Add(error);
+        }
+
+        try
+        {
+            resource.Process.TerminateAndForceCloseAfterJobClose(cancellationToken);
+        }
+        catch (Exception error)
+        {
+            errors.Add(error);
+            try
+            {
+                resource.Process.ForceCloseAfterJobClose();
+            }
+            catch (Exception forceCloseError)
+            {
+                errors.Add(forceCloseError);
+            }
+        }
+
+        resource.DisposeMonitorCancellationWhenQuiescent();
+        resource.DisposeRoleLifetimeCancellationWhenQuiescent();
+        await ConfirmNativeExitAndVerifyPayloadAsync(resource, errors).ConfigureAwait(false);
+        ThrowCleanupErrors(errors);
     }
 
     public async Task RollbackAsync(Guid operationId, CancellationToken cancellationToken = default)
@@ -1652,7 +1802,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
     }
 
-    private static async Task StopMonitoringAsync(RoleResource resource)
+    private async Task StopMonitoringAsync(RoleResource resource)
     {
         resource.MonitorCancellation.Cancel();
         var monitors = new[]
@@ -1664,6 +1814,10 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             .Where(task => task is not null)
             .Cast<Task>();
         await Task.WhenAll(monitors).ConfigureAwait(false);
+        if (StopMonitoringCompletedForTests is { } completed)
+        {
+            await completed(resource.Generation.Role).ConfigureAwait(false);
+        }
     }
 
     private void MonitorDatabase(ProcessGeneration generation, PostgresInstanceIdentity identity) =>
@@ -1706,34 +1860,45 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     private async Task DisposeRoleAsync(RuntimeRole role)
     {
         var resource = role == RuntimeRole.Server
-            ? Interlocked.Exchange(ref _server, null)
-            : Interlocked.Exchange(ref _worker, null);
+            ? Volatile.Read(ref _server)
+            : Volatile.Read(ref _worker);
         if (resource is null)
         {
             return;
         }
 
-        await DisposeRoleResourceAsync(resource).ConfigureAwait(false);
+        await DisposeRoleAsync(resource).ConfigureAwait(false);
     }
 
     private async Task DisposeRoleAsync(RoleResource resource)
     {
-        var removed = resource.Generation.Role == RuntimeRole.Server
-            ? TryTakeExactRoleResource(ref _server, resource)
-            : TryTakeExactRoleResource(ref _worker, resource);
-        if (!removed)
+        try
         {
-            return;
+            await DisposeRoleResourceAsync(resource).ConfigureAwait(false);
         }
-
-        await DisposeRoleResourceAsync(resource).ConfigureAwait(false);
+        finally
+        {
+            _ = resource.Generation.Role == RuntimeRole.Server
+                ? TryTakeExactRoleResource(ref _server, resource)
+                : TryTakeExactRoleResource(ref _worker, resource);
+        }
     }
 
-    private static async Task DisposeRoleResourceAsync(RoleResource resource)
+    private Task DisposeRoleResourceAsync(RoleResource resource) =>
+        resource.GetOrStartTeardown(() => DisposeRoleResourceCoreAsync(resource));
+
+    private async Task DisposeRoleResourceCoreAsync(RoleResource resource)
     {
         var errors = new List<Exception>();
+        if (RoleTeardownStartedForTests is { } started)
+        {
+            await started(resource.Generation.Role).ConfigureAwait(false);
+        }
+
         resource.RoleLifetimeCancellation.Cancel();
-        await StopMonitoringAsync(resource).ConfigureAwait(false);
+        await CaptureCleanupAsync(
+            () => StopMonitoringAsync(resource),
+            errors).ConfigureAwait(false);
         await CaptureCleanupAsync(
             () => resource.Channel.DisposeAsync().AsTask(),
             errors).ConfigureAwait(false);
@@ -1750,8 +1915,77 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
         resource.DisposeMonitorCancellationWhenQuiescent();
         resource.DisposeRoleLifetimeCancellationWhenQuiescent();
+        await ConfirmNativeExitAndVerifyPayloadAsync(resource, errors).ConfigureAwait(false);
         ThrowCleanupErrors(errors);
     }
+
+    private async Task ConfirmNativeExitAndVerifyPayloadAsync(
+        RoleResource resource,
+        ICollection<Exception> errors)
+    {
+        try
+        {
+            await WaitForNativeExitAsync(
+                resource.Generation.Role,
+                resource.NativeExitObservation).ConfigureAwait(false);
+        }
+        catch
+        {
+            errors.Add(new AppHostExecutionException("role-process-exit-unconfirmed"));
+            return;
+        }
+
+        await CaptureCleanupAsync(
+            resource.PayloadClosureVerifier.VerifyAsync,
+            errors).ConfigureAwait(false);
+    }
+
+    private async Task CleanupUnownedWindowsChildAsync(
+        WindowsSupervisedProcess process,
+        WindowsControlChannel channel,
+        WindowsJobObject job,
+        Task nativeExitObservation,
+        OneShotPayloadClosureVerifier payloadClosureVerifier)
+    {
+        var errors = new List<Exception>();
+        await CaptureCleanupAsync(
+            () => channel.DisposeAsync().AsTask(),
+            errors).ConfigureAwait(false);
+        await CaptureCleanupAsync(
+            () => process.DisposeAsync().AsTask(),
+            errors).ConfigureAwait(false);
+        try
+        {
+            job.Dispose();
+        }
+        catch (Exception error)
+        {
+            errors.Add(error);
+        }
+
+        try
+        {
+            await WaitForNativeExitAsync(
+                process.Identity.Role,
+                nativeExitObservation).ConfigureAwait(false);
+        }
+        catch
+        {
+            errors.Add(new AppHostExecutionException("role-process-exit-unconfirmed"));
+            ThrowCleanupErrors(errors);
+            return;
+        }
+
+        await CaptureCleanupAsync(
+            payloadClosureVerifier.VerifyAsync,
+            errors).ConfigureAwait(false);
+        ThrowCleanupErrors(errors);
+    }
+
+    private Task WaitForNativeExitAsync(RuntimeRole role, Task nativeExitObservation) =>
+        NativeExitWaitForTests is { } wait
+            ? wait(role, nativeExitObservation, _roleOperationDeadlines.StopCommand)
+            : nativeExitObservation.WaitAsync(_roleOperationDeadlines.StopCommand);
 
     private async Task DisposeDatabaseAsync()
     {
@@ -1915,10 +2149,13 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         ProcessGeneration Generation,
         Guid StartupOperationId,
         int HealthPort,
-        ISupervisedProcess Process,
+        WindowsSupervisedProcess Process,
         WindowsControlChannel Channel,
-        WindowsJobObject Job)
+        WindowsJobObject Job,
+        Task NativeExitObservation,
+        OneShotPayloadClosureVerifier PayloadClosureVerifier)
     {
+        private readonly object _teardownGate = new();
         private int _monitorCancellationDisposalStarted;
         private int _roleLifetimeCancellationDisposalStarted;
         private int _monitoringStarted;
@@ -1947,6 +2184,43 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         internal Guid? DrainOperationId { get; set; }
 
         internal bool ReadinessConfirmed { get; set; }
+
+        private Task? TeardownCompletion { get; set; }
+
+        internal Task GetOrStartTeardown(Func<Task> teardown)
+        {
+            ArgumentNullException.ThrowIfNull(teardown);
+            TaskCompletionSource completion;
+            lock (_teardownGate)
+            {
+                if (TeardownCompletion is not null)
+                {
+                    return TeardownCompletion;
+                }
+
+                completion = new TaskCompletionSource(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+                TeardownCompletion = completion.Task;
+            }
+
+            _ = CompleteTeardownAsync(teardown, completion);
+            return completion.Task;
+        }
+
+        private static async Task CompleteTeardownAsync(
+            Func<Task> teardown,
+            TaskCompletionSource completion)
+        {
+            try
+            {
+                await teardown().ConfigureAwait(false);
+                completion.TrySetResult();
+            }
+            catch (Exception error)
+            {
+                completion.TrySetException(error);
+            }
+        }
 
         internal bool TryStartMonitoring() =>
             Interlocked.CompareExchange(ref _monitoringStarted, 1, 0) == 0;
@@ -2012,6 +2286,11 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             }
         }
     }
+
+    private sealed record LaunchedRoleProcess(
+        ISupervisedProcess Process,
+        Task? NativeExitObservation,
+        OneShotPayloadClosureVerifier? PayloadClosureVerifier);
 
 }
 

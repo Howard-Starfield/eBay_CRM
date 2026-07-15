@@ -36,7 +36,8 @@ internal sealed class RoleLaunchPlan
         RoleReadinessStrategy readinessStrategy,
         int? healthPort,
         TimeSpan outputDrainTimeout,
-        Func<IDisposable> openBootstrapArtifactLease)
+        Func<IDisposable> openBootstrapArtifactLease,
+        Action verifyPayloadClosureAfterShutdown)
     {
         Role = role;
         Generation = generation;
@@ -57,6 +58,7 @@ internal sealed class RoleLaunchPlan
         HealthPort = healthPort;
         OutputDrainTimeout = outputDrainTimeout;
         OpenBootstrapArtifactLease = openBootstrapArtifactLease;
+        VerifyPayloadClosureAfterShutdown = verifyPayloadClosureAfterShutdown;
     }
 
     internal RuntimeRole Role { get; }
@@ -82,6 +84,8 @@ internal sealed class RoleLaunchPlan
     internal TimeSpan OutputDrainTimeout { get; }
 
     internal Func<IDisposable> OpenBootstrapArtifactLease { get; }
+
+    internal Action VerifyPayloadClosureAfterShutdown { get; }
 
     internal void ValidateFor(RoleLaunchRequest request)
     {
@@ -109,7 +113,8 @@ internal sealed class RoleLaunchPlan
             ReadinessStrategy != RoleReadinessStrategy.IdentityBoundHttp ||
             HealthPort is not (> 0 and <= 65_535) ||
             OutputDrainTimeout <= TimeSpan.Zero ||
-            OpenBootstrapArtifactLease is null)
+            OpenBootstrapArtifactLease is null ||
+            VerifyPayloadClosureAfterShutdown is null)
         {
             throw new InvalidOperationException("The role launch plan is invalid.");
         }

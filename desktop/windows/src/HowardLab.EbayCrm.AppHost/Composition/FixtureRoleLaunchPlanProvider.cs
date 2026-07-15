@@ -11,6 +11,7 @@ internal sealed class FixtureRoleLaunchPlanProvider : IRoleLaunchPlanProvider
     private readonly AppHostOptions _options;
     private readonly ValidatedAppHostPayload _payload;
     private string? _workerModeForTests;
+    private Action _verifyPayloadClosureAfterShutdown = static () => { };
 
     internal FixtureRoleLaunchPlanProvider(
         AppHostOptions options,
@@ -23,6 +24,13 @@ internal sealed class FixtureRoleLaunchPlanProvider : IRoleLaunchPlanProvider
     internal string? WorkerModeForTests
     {
         set => Interlocked.Exchange(ref _workerModeForTests, value);
+    }
+
+    internal Action VerifyPayloadClosureAfterShutdownForTests
+    {
+        set => Interlocked.Exchange(
+            ref _verifyPayloadClosureAfterShutdown,
+            value ?? throw new ArgumentNullException(nameof(value)));
     }
 
     public RoleLaunchPlan Create(RoleLaunchRequest request)
@@ -50,7 +58,8 @@ internal sealed class FixtureRoleLaunchPlanProvider : IRoleLaunchPlanProvider
             RoleReadinessStrategy.IdentityBoundHttp,
             healthPort,
             TimeSpan.FromMilliseconds(100),
-            () => AppHostComposition.OpenTrustedFixtureArtifacts(_options.FixturePath));
+            () => AppHostComposition.OpenTrustedFixtureArtifacts(_options.FixturePath),
+            Volatile.Read(ref _verifyPayloadClosureAfterShutdown));
     }
 
     private static int ReserveLoopbackPort()
