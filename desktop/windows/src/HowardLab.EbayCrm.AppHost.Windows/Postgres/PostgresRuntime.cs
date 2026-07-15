@@ -353,8 +353,59 @@ public sealed class PostgresRuntime :
     public async Task<PostgresSqlProbe> ProbeAsync(PostgresInstanceIdentity identity, CancellationToken cancellationToken = default)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try { return await ProbeCoreAsync(ValidateCurrentIdentity(identity), _reconciliationDeadline, cancellationToken).ConfigureAwait(false); }
+        try
+        {
+            identity = ValidateCurrentIdentity(identity);
+            ValidateCurrentPidFile(identity);
+            var probe = await ProbeCoreAsync(identity, _reconciliationDeadline, cancellationToken).ConfigureAwait(false);
+            ValidateCurrentPidFile(identity);
+            return probe;
+        }
         finally { _gate.Release(); }
+    }
+
+    internal async ValueTask<ISupervisedProcess> LaunchVerifiedMigrationAsync(
+        PostgresInstanceIdentity identity,
+        Guid expectedClusterId,
+        int startingSchemaVersion,
+        int targetSchemaVersion,
+        ReadOnlyMemory<byte> migrationSql,
+        CancellationToken cancellationToken)
+    {
+        if (expectedClusterId == Guid.Empty) throw new ArgumentException("Expected cluster ID cannot be empty.", nameof(expectedClusterId));
+        if (startingSchemaVersion < 0 || targetSchemaVersion <= startingSchemaVersion)
+            throw new ArgumentException("The migration version transition is invalid.");
+
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            identity = ValidateCurrentIdentity(identity);
+            ValidateCurrentPidFile(identity);
+            _ = await ProbeCoreAsync(identity, _reconciliationDeadline, cancellationToken).ConfigureAwait(false);
+            ValidateCurrentPidFile(identity);
+            if (identity.HasExited || !_job.Contains(identity.PostmasterHandle))
+                throw new PostgresProbeException("postmaster-not-owned-live");
+
+            return await LaunchCommandAsync(
+                _layout.PsqlExe,
+                [
+                    "-X", "-A", "-t", "-q", "-w",
+                    "-h", "127.0.0.1",
+                    "-p", identity.LoopbackPort.ToString(CultureInfo.InvariantCulture),
+                    "-U", "ebaycrm", "-d", "postgres",
+                    "-v", "ON_ERROR_STOP=1",
+                    "-v", $"expected_cluster_id={expectedClusterId:D}",
+                    "-v", $"starting_schema_version={startingSchemaVersion.ToString(CultureInfo.InvariantCulture)}",
+                    "-v", $"target_schema_version={targetSchemaVersion.ToString(CultureInfo.InvariantCulture)}",
+                ],
+                new Dictionary<string, SecretValue>(StringComparer.Ordinal) { ["PGPASSWORD"] = _password },
+                cancellationToken,
+                standardInput: migrationSql).ConfigureAwait(false);
+        }
+        finally
+        {
+            _gate.Release();
+        }
     }
 
     public async Task<PostgreSqlOperationOutcome> StopFastAsync(PostgresInstanceIdentity identity, CancellationToken cancellationToken = default)
@@ -493,21 +544,39 @@ public sealed class PostgresRuntime :
     private async Task<PostgresSqlProbe> ProbeCoreAsync(PostgresInstanceIdentity identity, TimeSpan timeout, CancellationToken cancellationToken)
     {
         if (identity.HasExited || !_job.Contains(identity.PostmasterHandle)) throw new PostgresProbeException("postmaster-not-owned-live");
+        var sql = Encoding.UTF8.GetBytes(
+            "SELECT 1;\n" +
+            "SHOW data_directory;\n" +
+            "SELECT to_regclass('desktop_runtime.apphost_control') IS NOT NULL AS apphost_control_exists \\gset\n" +
+            "\\if :apphost_control_exists\n" +
+            "SELECT COALESCE((SELECT cluster_id::text || '|' || schema_version::text " +
+            "FROM desktop_runtime.apphost_control WHERE singleton_key), 'control-corrupt');\n" +
+            "\\endif\n");
         await using var command = await LaunchCommandAsync(
             _layout.PsqlExe,
             ["-X", "-A", "-t", "-q", "-w", "-h", "127.0.0.1", "-p", identity.LoopbackPort.ToString(CultureInfo.InvariantCulture),
-             "-U", "ebaycrm", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-c", "SELECT 1;", "-c", "SHOW data_directory;"],
+             "-U", "ebaycrm", "-d", "postgres", "-v", "ON_ERROR_STOP=1"],
             new Dictionary<string, SecretValue>(StringComparer.Ordinal) { ["PGPASSWORD"] = _password },
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken,
+            standardInput: sql).ConfigureAwait(false);
         int exit;
         try { exit = await command.Completion.WaitAsync(timeout, cancellationToken).ConfigureAwait(false); }
         catch (TimeoutException) { throw new PostgresProbeException("postgres-sql-probe-timeout"); }
         if (exit != 0) throw new PostgresProbeException("postgres-sql-probe-failed");
         var lines = command.StandardOutput.Snapshot().Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (lines.Length != 2 || lines[0] != "1") throw new PostgresProbeException("postgres-sql-probe-malformed");
+        if (lines.Length is not (2 or 3) || lines[0] != "1") throw new PostgresProbeException("postgres-sql-probe-malformed");
         var reported = Path.TrimEndingDirectorySeparator(Path.GetFullPath(lines[1]));
         if (!StringComparer.OrdinalIgnoreCase.Equals(reported, identity.CanonicalDataDirectory)) throw new PostgresProbeException("postgres-wrong-data-directory");
-        return new PostgresSqlProbe(lines[0], reported);
+        if (lines.Length == 2) return new PostgresSqlProbe(lines[0], reported);
+        var control = lines[2].Split('|');
+        if (control.Length != 2 ||
+            !Guid.TryParseExact(control[0], "D", out var clusterId) ||
+            !int.TryParse(control[1], NumberStyles.None, CultureInfo.InvariantCulture, out var schemaVersion) ||
+            schemaVersion < 0)
+        {
+            throw new PostgresProbeException("postgres-control-state-malformed");
+        }
+        return new PostgresSqlProbe(lines[0], reported, clusterId, schemaVersion);
     }
 
     private PostgresInstanceIdentity CaptureIdentity()
@@ -648,7 +717,7 @@ public sealed class PostgresRuntime :
 
     private async ValueTask<ISupervisedProcess> LaunchCommandAsync(string executable, IReadOnlyList<string> arguments,
         IReadOnlyDictionary<string, SecretValue>? secretEnvironment, CancellationToken cancellationToken,
-        bool launchesPostmaster = false)
+        bool launchesPostmaster = false, ReadOnlyMemory<byte> standardInput = default)
     {
         var env = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var systemRoot = Environment.GetEnvironmentVariable("SystemRoot")
@@ -657,7 +726,7 @@ public sealed class PostgresRuntime :
         foreach (var name in new[] { "SystemRoot", "TEMP", "TMP" })
             if (Environment.GetEnvironmentVariable(name) is { } value) env[name] = value;
         var specification = new LaunchSpecification(RuntimeRole.Database, _generation, executable, arguments,
-            _paths.RuntimeDirectory, env, secretEnvironment ?? new Dictionary<string, SecretValue>(), TimeSpan.FromSeconds(2));
+            _paths.RuntimeDirectory, env, secretEnvironment ?? new Dictionary<string, SecretValue>(), TimeSpan.FromSeconds(2), standardInput);
         if (launchesPostmaster)
             return await _launcher.LaunchAsync(specification, _job, cancellationToken).ConfigureAwait(false);
 

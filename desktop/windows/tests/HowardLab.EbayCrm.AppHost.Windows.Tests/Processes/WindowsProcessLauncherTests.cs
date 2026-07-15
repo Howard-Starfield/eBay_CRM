@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text;
 using HowardLab.EbayCrm.AppHost.Core.Diagnostics;
 using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
 using HowardLab.EbayCrm.AppHost.Core.Processes;
@@ -57,6 +58,64 @@ public sealed class WindowsProcessLauncherTests
         Assert.Equal(0, await process.Completion.WaitAsync(Deadline));
         Assert.Equal("stdout-line\n", process.StandardOutput.Snapshot());
         Assert.Equal("stderr-line\n", process.StandardError.Snapshot());
+    }
+
+    [Fact]
+    public async Task LaunchAsync_WritesBoundedStandardInputAndClosesPipe()
+    {
+        var input = Encoding.UTF8.GetBytes("transactional migration over stdin");
+        using var job = WindowsJobObject.CreateKillOnClose();
+        await using var launched = await CreateLauncher().LaunchAsync(
+            CreateSpecification(["stdin-echo"]) with { StandardInput = input },
+            job,
+            CancellationToken.None);
+
+        Assert.Equal(0, await launched.Completion.WaitAsync(Deadline));
+        Assert.Equal("transactional migration over stdin\n", launched.StandardOutput.Snapshot());
+    }
+
+    [Fact]
+    public async Task Completion_ToleratesChildExitBeforeLargeStandardInputIsConsumed()
+    {
+        using var job = WindowsJobObject.CreateKillOnClose();
+        await using var launched = await CreateLauncher().LaunchAsync(
+            CreateSpecification(["exit-without-stdin"]) with
+            {
+                StandardInput = new byte[WindowsProcessLauncher.MaximumStandardInputBytes],
+            },
+            job,
+            CancellationToken.None);
+
+        Assert.Equal(0, await launched.Completion.WaitAsync(Deadline));
+    }
+
+    [Fact]
+    public async Task LaunchAsync_DrainsOutputWhileWritingStandardInputWithoutDeadlock()
+    {
+        var input = Enumerable.Repeat((byte)'a', 256 * 1024).ToArray();
+        using var job = WindowsJobObject.CreateKillOnClose();
+        await using var launched = await CreateLauncher().LaunchAsync(
+            CreateSpecification(["output-before-stdin"]) with { StandardInput = input },
+            job,
+            CancellationToken.None);
+
+        Assert.Equal(0, await launched.Completion.WaitAsync(Deadline));
+        Assert.EndsWith($"\n{input.Length}\n", launched.StandardOutput.Snapshot(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_CancelsChildThatNeverReadsStandardInputWithoutDeadlock()
+    {
+        using var job = WindowsJobObject.CreateKillOnClose();
+        var launched = await CreateLauncher().LaunchAsync(
+            CreateSpecification(["hold"]) with
+            {
+                StandardInput = new byte[WindowsProcessLauncher.MaximumStandardInputBytes],
+            },
+            job,
+            CancellationToken.None);
+
+        await launched.DisposeAsync().AsTask().WaitAsync(Deadline);
     }
 
     [Fact]
@@ -174,6 +233,7 @@ public sealed class WindowsProcessLauncherTests
                 SecretEnvironment = new Dictionary<string, SecretValue>(StringComparer.Ordinal) { ["PATH"] = new("secret") },
             },
             valid with { OutputDrainTimeout = TimeSpan.Zero },
+            valid with { StandardInput = new byte[WindowsProcessLauncher.MaximumStandardInputBytes + 1] },
         };
     }
 

@@ -3,7 +3,12 @@ using System.Buffers.Binary;
 using System.Globalization;
 using System.IO.Pipes;
 using System.Text.Json;
+using HowardLab.EbayCrm.AppHost.Core.Diagnostics;
+using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
+using HowardLab.EbayCrm.AppHost.Core.Processes;
 using HowardLab.EbayCrm.AppHost.Protocol.Control;
+using HowardLab.EbayCrm.AppHost.Windows.Postgres;
+using HowardLab.EbayCrm.AppHost.Windows.Processes;
 
 if (args.Length == 0)
 {
@@ -157,6 +162,71 @@ switch (args[0])
         Console.Error.WriteLine(secret);
         return 0;
 
+    case "stdin-echo":
+        Console.WriteLine(await Console.In.ReadToEndAsync());
+        return 0;
+
+    case "exit-without-stdin":
+        return 0;
+
+    case "output-before-stdin":
+        Console.Write(new string('x', 128 * 1024));
+        Console.Out.Flush();
+        var received = await Console.In.ReadToEndAsync();
+        Console.WriteLine();
+        Console.WriteLine(received.Length);
+        return 0;
+
+    case "migration-host":
+        if (args.Length != 7)
+        {
+            return 7;
+        }
+        var migrationPasswordText = RequireEnvironment("TASK8_PG_PASSWORD");
+        var migrationPassword = new SecretValue(migrationPasswordText);
+        Environment.SetEnvironmentVariable("TASK8_PG_PASSWORD", null);
+        var migrationLayout = PostgresBinaryLayout.Validate(Path.GetFullPath(args[1]));
+        var migrationPaths = PostgresClusterPaths.Create(Path.GetFullPath(args[2]));
+        var migrationPort = int.Parse(args[3], CultureInfo.InvariantCulture);
+        var migrationClusterId = Guid.ParseExact(args[4], "D");
+        var migrationScript = Path.GetFullPath(args[5]);
+        var migrationGate = Path.GetFullPath(args[6]);
+        using (var databaseJob = WindowsJobObject.CreateKillOnClose())
+        {
+            var migrationGeneration = new ProcessGeneration(RuntimeRole.Database, 1, Guid.NewGuid());
+            var gatedLauncher = new MigrationGateLauncher(
+                new WindowsProcessLauncher(FixtureDiagnosticSink.Instance),
+                migrationGate);
+            await using var migrationRuntime = new PostgresRuntime(
+                migrationLayout,
+                migrationPaths,
+                migrationGeneration,
+                migrationPort,
+                migrationPassword,
+                gatedLauncher,
+                databaseJob,
+                TimeSpan.FromSeconds(60),
+                TimeSpan.FromSeconds(30),
+                TimeSpan.FromSeconds(30));
+            _ = await migrationRuntime.InitializeAsync();
+            var migrationStarted = await migrationRuntime.StartAsync();
+            var migrationIdentity = migrationStarted.Identity
+                ?? throw new InvalidOperationException("The fixture postmaster did not start.");
+            gatedLauncher.PostmasterProcessId = migrationIdentity.ProcessId;
+            var migrationRunner = new PostgresMigrationRunner(
+                migrationRuntime,
+                migrationIdentity,
+                new AtomicMigrationAttemptStore(args[2]),
+                migrationClusterId,
+                new Version(1, 0, 0),
+                0,
+                1,
+                migrationScript,
+                TimeSpan.FromMinutes(10));
+            _ = await migrationRunner.RunAsync();
+        }
+        return 0;
+
     case "orphan-output-handles":
         var orphanStartInfo = new ProcessStartInfo
         {
@@ -245,3 +315,42 @@ static ControlEnvelope CreateEmptyControlEnvelope(
         generation,
         type,
         JsonSerializer.SerializeToElement(new { }, ControlFrameCodec.SerializerOptions));
+
+sealed class MigrationGateLauncher(IProcessLauncher inner, string gatePath) : IProcessLauncher
+{
+    internal int PostmasterProcessId { get; set; }
+
+    public async ValueTask<ISupervisedProcess> LaunchAsync(
+        LaunchSpecification specification,
+        IProcessGroup processGroup,
+        CancellationToken cancellationToken)
+    {
+        var process = await inner.LaunchAsync(specification, processGroup, cancellationToken);
+        if (!specification.Arguments.Any(argument =>
+            argument.StartsWith("expected_cluster_id=", StringComparison.OrdinalIgnoreCase)))
+        {
+            return process;
+        }
+
+        var temporaryGate = gatePath + ".tmp";
+        await File.WriteAllTextAsync(
+            temporaryGate,
+            $"{PostmasterProcessId.ToString(CultureInfo.InvariantCulture)}|" +
+            process.Identity.ProcessId.ToString(CultureInfo.InvariantCulture),
+            CancellationToken.None);
+        File.Move(temporaryGate, gatePath, overwrite: true);
+        await Task.Delay(Timeout.InfiniteTimeSpan, CancellationToken.None);
+        return process;
+    }
+}
+
+sealed class FixtureDiagnosticSink : IDiagnosticSink
+{
+    internal static FixtureDiagnosticSink Instance { get; } = new();
+
+    public ValueTask WriteAsync(
+        DiagnosticEvent diagnosticEvent,
+        CancellationToken cancellationToken = default) => ValueTask.CompletedTask;
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}

@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using HowardLab.EbayCrm.AppHost.Core.Diagnostics;
 using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
 using HowardLab.EbayCrm.AppHost.Core.Processes;
@@ -51,6 +52,43 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
 
     internal static async Task<PostgresTestCluster> CreateUninitializedAsync() =>
         await CreateCoreAsync(initialize: false, null, null, null, null);
+
+    internal static async Task<PostgresTestCluster> OpenExistingAsync(
+        string root,
+        int port,
+        SecretValue password)
+    {
+        var bin = Environment.GetEnvironmentVariable("EBAYCRM_POSTGRES_BIN")
+            ?? throw new InvalidOperationException("EBAYCRM_POSTGRES_BIN is required.");
+        var layout = PostgresBinaryLayout.Validate(Path.GetFullPath(bin));
+        var paths = PostgresClusterPaths.Create(root);
+        var job = WindowsJobObject.CreateKillOnClose();
+        var launcher = new FaultInjectingLauncher(
+            new WindowsProcessLauncher(NoopDiagnosticSink.Instance, maxOutputBytes: 256 * 1024));
+        var runtime = new PostgresRuntime(
+            layout,
+            paths,
+            new ProcessGeneration(RuntimeRole.Database, 2, Guid.NewGuid()),
+            port,
+            password,
+            launcher,
+            job,
+            TimeSpan.FromSeconds(60),
+            TimeSpan.FromSeconds(30),
+            TimeSpan.FromSeconds(30));
+        try
+        {
+            var cluster = new PostgresTestCluster(root, layout, paths, port, password, job, runtime, launcher);
+            Assert.Equal(PostgreSqlOperationOutcome.Completed, await runtime.InitializeAsync());
+            return cluster;
+        }
+        catch
+        {
+            await runtime.DisposeAsync();
+            job.Dispose();
+            throw;
+        }
+    }
 
     private static async Task<PostgresTestCluster> CreateCoreAsync(
         bool initialize,
@@ -235,6 +273,46 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
 
     internal Task<string> ExecuteSqlScalarAsync(string sql) => ExecuteSqlCoreAsync(sql);
 
+    internal async Task<SqlCommandLease> LaunchSqlCommandAsync(string sql)
+    {
+        var systemRoot = Environment.GetEnvironmentVariable("SystemRoot")
+            ?? throw new InvalidOperationException("SystemRoot is unavailable.");
+        var environment = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["PATH"] = string.Join(Path.PathSeparator, Layout.CanonicalBinDirectory, Path.Combine(systemRoot, "System32")),
+            ["SystemRoot"] = systemRoot,
+        };
+        foreach (var name in new[] { "TEMP", "TMP" })
+            if (Environment.GetEnvironmentVariable(name) is { } value) environment[name] = value;
+        var specification = new LaunchSpecification(
+            RuntimeRole.Database,
+            new ProcessGeneration(RuntimeRole.Database, 98, Guid.NewGuid()),
+            Layout.PsqlExe,
+            ["-X", "-A", "-t", "-q", "-w", "-h", "127.0.0.1", "-p", Port.ToString(),
+             "-U", "ebaycrm", "-d", "postgres", "-v", "ON_ERROR_STOP=1"],
+            Paths.RuntimeDirectory,
+            environment,
+            new Dictionary<string, SecretValue>(StringComparer.Ordinal) { ["PGPASSWORD"] = Password },
+            TimeSpan.FromSeconds(2),
+            Encoding.UTF8.GetBytes(sql));
+        var helperJob = WindowsJobObject.CreateKillOnClose();
+        try
+        {
+            var process = await new WindowsProcessLauncher(
+                NoopDiagnosticSink.Instance,
+                maxOutputBytes: 256 * 1024).LaunchAsync(
+                    specification,
+                    helperJob,
+                    CancellationToken.None);
+            return new SqlCommandLease(process, helperJob);
+        }
+        catch
+        {
+            helperJob.Dispose();
+            throw;
+        }
+    }
+
     internal void ConfigureAsDisconnectedStandby()
     {
         File.WriteAllBytes(Path.Combine(Paths.DataDirectory, "standby.signal"), []);
@@ -349,6 +427,9 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
         internal int? LastStopTimeoutSeconds { get; private set; }
         internal string? LastStartLogFile { get; private set; }
         internal bool BlockNextStartLogPath { get; set; }
+        internal ISupervisedProcess? LastMigrationProcess { get; private set; }
+        internal TaskCompletionSource MigrationLaunchObserved { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource StopLaunchObserved { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public async ValueTask<ISupervisedProcess> LaunchAsync(
@@ -356,6 +437,11 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
             IProcessGroup processGroup,
             CancellationToken cancellationToken)
         {
+            var isMigration = Path.GetFileName(specification.ApplicationPath)
+                .Equals("psql.exe", StringComparison.OrdinalIgnoreCase) &&
+                specification.StandardInput.Length > 0 &&
+                specification.Arguments.Any(argument =>
+                    argument.StartsWith("expected_cluster_id=", StringComparison.OrdinalIgnoreCase));
             var isStop = Path.GetFileName(specification.ApplicationPath)
                 .Equals("pg_ctl.exe", StringComparison.OrdinalIgnoreCase) &&
                 specification.Arguments.Count > 0 && specification.Arguments[0] == "stop";
@@ -374,7 +460,13 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
                         Directory.CreateDirectory(LastStartLogFile);
                     }
                 }
-                return await inner.LaunchAsync(specification, processGroup, cancellationToken);
+                var launched = await inner.LaunchAsync(specification, processGroup, cancellationToken);
+                if (isMigration)
+                {
+                    LastMigrationProcess = launched;
+                    MigrationLaunchObserved.TrySetResult();
+                }
+                return launched;
             }
 
             StopLaunchObserved.TrySetResult();
@@ -442,6 +534,25 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
         {
             _pending?.TrySetResult(1);
             return ValueTask.CompletedTask;
+        }
+    }
+
+    internal sealed class SqlCommandLease(
+        ISupervisedProcess process,
+        WindowsJobObject job) : IAsyncDisposable
+    {
+        internal ISupervisedProcess Process { get; } = process;
+
+        public async ValueTask DisposeAsync()
+        {
+            try
+            {
+                await Process.DisposeAsync();
+            }
+            finally
+            {
+                job.Dispose();
+            }
         }
     }
 }

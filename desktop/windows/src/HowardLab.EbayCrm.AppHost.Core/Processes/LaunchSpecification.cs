@@ -12,4 +12,5 @@ public sealed record LaunchSpecification(
     string WorkingDirectory,
     IReadOnlyDictionary<string, string> Environment,
     IReadOnlyDictionary<string, SecretValue> SecretEnvironment,
-    TimeSpan OutputDrainTimeout);
+    TimeSpan OutputDrainTimeout,
+    ReadOnlyMemory<byte> StandardInput = default);

@@ -8,7 +8,9 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\HowardLab.EbayCrm.AppHost.Core\HowardLab.EbayCrm.AppHost.Core.csproj" />
     <ProjectReference Include="..\HowardLab.EbayCrm.AppHost.Protocol\HowardLab.EbayCrm.AppHost.Protocol.csproj" />
+    <ProjectReference Include="..\HowardLab.EbayCrm.AppHost.Windows\HowardLab.EbayCrm.AppHost.Windows.csproj" />
   </ItemGroup>
 
 </Project>

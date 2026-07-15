@@ -116,7 +116,9 @@
       "howardlab.ebaycrm.apphost.fixture": {
         "type": "Project",
         "dependencies": {
-          "HowardLab.EbayCrm.AppHost.Protocol": "[1.0.0, )"
+          "HowardLab.EbayCrm.AppHost.Core": "[1.0.0, )",
+          "HowardLab.EbayCrm.AppHost.Protocol": "[1.0.0, )",
+          "HowardLab.EbayCrm.AppHost.Windows": "[1.0.0, )"
         }
       },
       "howardlab.ebaycrm.apphost.protocol": {

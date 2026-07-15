@@ -4,7 +4,7 @@ public sealed record PostgresSqlProbe(
     string SelectOne,
     string ReportedDataDirectory,
     Guid? ClusterId = null,
-    long? SchemaVersion = null);
+    int? SchemaVersion = null);
 
 public sealed class PostgresProbeException : Exception
 {

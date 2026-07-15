@@ -10,6 +10,7 @@ namespace HowardLab.EbayCrm.AppHost.Windows.Processes;
 
 public sealed class WindowsProcessLauncher : IProcessLauncher
 {
+    public const int MaximumStandardInputBytes = 1024 * 1024;
     private readonly IDiagnosticSink _diagnosticSink;
     private readonly int _maxOutputBytes;
     private readonly int _maxLineBytes;
@@ -84,6 +85,7 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
         SafeFileHandle? standardInputWrite = null;
         SafeProcessHandle? processHandle = null;
         var processInformation = new NativeMethods.ProcessInformation();
+        var standardInputTransferred = false;
 
         try
         {
@@ -154,8 +156,6 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
 
             standardInputRead.Dispose();
             standardInputRead = null;
-            standardInputWrite.Dispose();
-            standardInputWrite = null;
             standardOutputWrite.Dispose();
             standardOutputWrite = null;
             standardErrorWrite.Dispose();
@@ -179,9 +179,16 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
                 _maxOutputBytes,
                 _maxLineBytes,
                 validated.SecretCanaries);
+            if (validated.StandardInput.Length == 0)
+            {
+                standardInputWrite.Dispose();
+                standardInputWrite = null;
+            }
             var supervisedProcess = new WindowsSupervisedProcess(
                 identity,
                 processHandle,
+                standardInputWrite,
+                validated.StandardInput,
                 standardOutputRead,
                 standardErrorRead,
                 standardOutput,
@@ -191,8 +198,10 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
                 _cleanupPolicy,
                 job);
             processHandle = null;
+            standardInputWrite = null;
             standardOutputRead = null;
             standardErrorRead = null;
+            standardInputTransferred = true;
             return supervisedProcess;
         }
         catch (OperationCanceledException)
@@ -229,6 +238,10 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
             standardErrorWrite?.Dispose();
             standardInputRead?.Dispose();
             standardInputWrite?.Dispose();
+            if (!standardInputTransferred)
+            {
+                CryptographicOperations.ZeroMemory(validated.StandardInput);
+            }
             CryptographicOperations.ZeroMemory(
                 MemoryMarshal.AsBytes(validated.CommandLine.AsSpan()));
         }
@@ -264,6 +277,13 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
             throw new ArgumentOutOfRangeException(
                 nameof(specification),
                 "The output drain timeout must be positive.");
+        }
+
+        if (specification.StandardInput.Length > MaximumStandardInputBytes)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(specification),
+                $"Standard input cannot exceed {MaximumStandardInputBytes} bytes.");
         }
 
         foreach (var argument in specification.Arguments)
@@ -304,7 +324,8 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
                 specification.ApplicationPath,
                 specification.Arguments)),
             BuildEnvironmentBlock(environment),
-            secretCanaries.ToArray());
+            secretCanaries.ToArray(),
+            specification.StandardInput.ToArray());
     }
 
     private static void ValidateEnvironmentEntry(string key, string value)
@@ -402,7 +423,8 @@ public sealed class WindowsProcessLauncher : IProcessLauncher
         LaunchSpecification Specification,
         char[] CommandLine,
         char[] EnvironmentBlock,
-        string[] SecretCanaries);
+        string[] SecretCanaries,
+        byte[] StandardInput);
 
     private sealed unsafe class NativeEnvironmentBlock : IDisposable
     {

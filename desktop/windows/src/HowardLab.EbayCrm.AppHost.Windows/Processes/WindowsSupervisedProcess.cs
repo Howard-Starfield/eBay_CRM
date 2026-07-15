@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using HowardLab.EbayCrm.AppHost.Core.Diagnostics;
 using HowardLab.EbayCrm.AppHost.Core.Processes;
 using HowardLab.EbayCrm.AppHost.Windows.Native;
@@ -11,12 +12,14 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
 {
     private readonly FileStream _standardOutputStream;
     private readonly FileStream _standardErrorStream;
+    private readonly FileStream? _standardInputStream;
     private readonly CancellationTokenSource _drainCancellation = new();
     private readonly CancellationTokenSource _completionCancellation = new();
     private readonly TimeSpan _outputDrainTimeout;
     private readonly IDiagnosticSink _diagnosticSink;
     private readonly Task _standardOutputDrain;
     private readonly Task _standardErrorDrain;
+    private readonly Task _standardInputWrite;
     private readonly DrainState _standardOutputState;
     private readonly DrainState _standardErrorState;
     private readonly IProcessCleanupPolicy _cleanupPolicy;
@@ -27,6 +30,8 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
     internal WindowsSupervisedProcess(
         SupervisedProcessIdentity identity,
         SafeProcessHandle processHandle,
+        SafeFileHandle? standardInputWrite,
+        byte[] standardInput,
         SafeFileHandle standardOutputRead,
         SafeFileHandle standardErrorRead,
         BoundedTextCollector standardOutput,
@@ -54,6 +59,9 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
             FileAccess.Read,
             bufferSize: 4096,
             isAsync: false);
+        _standardInputStream = standardInputWrite is null
+            ? null
+            : new FileStream(standardInputWrite, FileAccess.Write, bufferSize: 4096, isAsync: false);
         _standardOutputState = new DrainState(StandardOutput);
         _standardErrorState = new DrainState(StandardError);
         _standardOutputDrain = DrainAsync(
@@ -64,6 +72,7 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
             _standardErrorStream,
             _standardErrorState,
             _drainCancellation.Token);
+        _standardInputWrite = WriteStandardInputAsync(_standardInputStream, standardInput);
         Completion = CompleteAsync(_completionCancellation.Token);
     }
 
@@ -121,6 +130,7 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
             }
 
             await Completion.ConfigureAwait(false);
+            await _standardInputWrite.ConfigureAwait(false);
         }
         finally
         {
@@ -128,9 +138,35 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
             _drainCancellation.Cancel();
             _standardOutputStream.Dispose();
             _standardErrorStream.Dispose();
+            _standardInputStream?.Dispose();
             _drainCancellation.Dispose();
             _completionCancellation.Dispose();
             ProcessHandle.Dispose();
+        }
+    }
+
+    private static async Task WriteStandardInputAsync(FileStream? stream, byte[] input)
+    {
+        try
+        {
+            if (stream is not null)
+            {
+                await stream.WriteAsync(input).ConfigureAwait(false);
+                await stream.FlushAsync().ConfigureAwait(false);
+            }
+        }
+        catch (IOException)
+        {
+            // The child may exit before consuming all bounded input.
+        }
+        catch (ObjectDisposedException)
+        {
+            // Disposal is the cancellation boundary for a blocked pipe write.
+        }
+        finally
+        {
+            stream?.Dispose();
+            CryptographicOperations.ZeroMemory(input);
         }
     }
 
