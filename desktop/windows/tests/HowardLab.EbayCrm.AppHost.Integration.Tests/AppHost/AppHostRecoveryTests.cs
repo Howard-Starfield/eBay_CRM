@@ -250,7 +250,8 @@ public sealed class AppHostRecoveryTests
         Environment.GetEnvironmentVariable("EBAYCRM_POSTGRES_BIN")!,
         Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe"),
         ReserveLoopbackPort(),
-        AppHostMode.Run);
+        AppHostMode.Run,
+        AppHostRuntimeBackend.RedisCompatibility);
 
     private static async Task WaitForReadyCountAsync(
         AppHostTestRuntime runtime,

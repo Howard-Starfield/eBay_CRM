@@ -60,6 +60,7 @@ internal static class AcceptanceBroker
                             "--fixture-path", request.FixturePath,
                             "--port", request.Port.ToString(System.Globalization.CultureInfo.InvariantCulture),
                             "--mode", "run",
+                            "--runtime-backend", "redis",
                         ],
                         request.WorkingDirectory,
                         CreateEnvironment(),

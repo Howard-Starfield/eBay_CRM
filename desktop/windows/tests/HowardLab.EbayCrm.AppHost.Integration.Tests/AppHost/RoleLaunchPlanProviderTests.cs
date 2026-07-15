@@ -491,7 +491,8 @@ public sealed class RoleLaunchPlanProviderTests
             postgresBin,
             Path.GetFullPath(Environment.ProcessPath!),
             15432,
-            AppHostMode.Run);
+            AppHostMode.Run,
+            AppHostRuntimeBackend.RedisCompatibility);
         var postgresLayout = new PostgresBinaryLayout(
             postgresBin,
             Path.Combine(postgresBin, "initdb.exe"),

@@ -33,6 +33,8 @@ spec:
           image: twentycrm/twenty:latest
           imagePullPolicy: Always
           env:
+            - name: RUNTIME_BACKEND
+              value: "redis"
             - name: NODE_PORT
               value: 3000
             - name: SERVER_URL

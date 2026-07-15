@@ -329,6 +329,11 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
 
     private LifecycleEvent ValidatePayload(LifecycleCommand command)
     {
+        if (_options.RuntimeBackend == AppHostRuntimeBackend.PostgresDesktop)
+        {
+            throw new AppHostExecutionException("postgres-desktop-runtime-incomplete");
+        }
+
         AppHostComposition.EnsurePortAvailable(_options.Port);
         return new PayloadValidated(command.OperationId);
     }

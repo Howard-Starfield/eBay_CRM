@@ -110,7 +110,8 @@ public sealed class AppHostShutdownTests
             Environment.GetEnvironmentVariable("EBAYCRM_POSTGRES_BIN")!,
             Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe"),
             ReserveLoopbackPort(),
-            AppHostMode.Run);
+            AppHostMode.Run,
+            AppHostRuntimeBackend.RedisCompatibility);
         var budget = new ShutdownBudget(
             TimeSpan.FromMilliseconds(300),
             TimeSpan.FromMilliseconds(120),
@@ -153,7 +154,8 @@ public sealed class AppHostShutdownTests
                 Environment.GetEnvironmentVariable("EBAYCRM_POSTGRES_BIN")!,
                 Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe"),
                 ReserveLoopbackPort(),
-                AppHostMode.Run),
+                AppHostMode.Run,
+                AppHostRuntimeBackend.RedisCompatibility),
             new ShutdownBudget(
                 TimeSpan.FromMilliseconds(300),
                 TimeSpan.FromMilliseconds(120),

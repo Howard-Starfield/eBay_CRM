@@ -8,15 +8,22 @@ public enum AppHostMode
     Probe,
 }
 
+public enum AppHostRuntimeBackend
+{
+    PostgresDesktop,
+    RedisCompatibility,
+}
+
 public sealed record AppHostOptions(
     string ProfileRoot,
     string PostgresBin,
     string FixturePath,
     int Port,
-    AppHostMode Mode)
+    AppHostMode Mode,
+    AppHostRuntimeBackend RuntimeBackend)
 {
     private static readonly string[] RequiredOptions =
-        ["--profile-root", "--postgres-bin", "--fixture-path", "--port", "--mode"];
+        ["--profile-root", "--postgres-bin", "--fixture-path", "--port", "--mode", "--runtime-backend"];
 
     public static AppHostOptions Parse(IReadOnlyList<string> arguments)
     {
@@ -74,7 +81,14 @@ public sealed record AppHostOptions(
             _ => throw new AppHostOptionsException("invalid-mode"),
         };
 
-        return new AppHostOptions(profileRoot, postgresBin, fixturePath, port, mode);
+        var runtimeBackend = values["--runtime-backend"] switch
+        {
+            "postgres-desktop" => AppHostRuntimeBackend.PostgresDesktop,
+            "redis" => AppHostRuntimeBackend.RedisCompatibility,
+            _ => throw new AppHostOptionsException("invalid-runtime-backend"),
+        };
+
+        return new AppHostOptions(profileRoot, postgresBin, fixturePath, port, mode, runtimeBackend);
     }
 
     private static string ParseAbsoluteLocalPath(string value, string reasonCode)

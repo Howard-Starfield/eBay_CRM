@@ -71,4 +71,32 @@ describe('messageQueueModuleFactory', () => {
     });
     expect(getQueueClient).toHaveBeenCalledTimes(1);
   });
+
+  it.each([undefined, null, 'Redis', ' redis', 'redis ', 'sqlite'])(
+    'fails closed for runtime backend %j without inferring from Redis configuration',
+    async (runtimeBackend) => {
+      const get = jest.fn((key: string) => {
+        if (key === 'RUNTIME_BACKEND') {
+          return runtimeBackend;
+        }
+        if (key === 'REDIS_URL') {
+          return 'redis://localhost:6379';
+        }
+
+        throw new Error(`Unexpected config key: ${key}`);
+      });
+      const twentyConfigService = { get } as unknown as TwentyConfigService;
+
+      await expect(
+        messageQueueModuleFactory(
+          twentyConfigService,
+          redisClientService,
+          metricsService,
+        ),
+      ).rejects.toThrow('Invalid runtime backend');
+      expect(get).toHaveBeenCalledTimes(1);
+      expect(get).toHaveBeenCalledWith('RUNTIME_BACKEND');
+      expect(getQueueClient).not.toHaveBeenCalled();
+    },
+  );
 });

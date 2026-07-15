@@ -38,6 +38,11 @@ resource "kubernetes_deployment" "twentycrm_server" {
           tty   = true
 
           env {
+            name  = "RUNTIME_BACKEND"
+            value = "redis"
+          }
+
+          env {
             name  = "NODE_PORT"
             value = "3000"
           }

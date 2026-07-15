@@ -37,6 +37,50 @@ public sealed class AppHostStartupTests
     }
 
     [Theory, Trait("Category", "AppHost")]
+    [InlineData("postgres-desktop", AppHostRuntimeBackend.PostgresDesktop)]
+    [InlineData("redis", AppHostRuntimeBackend.RedisCompatibility)]
+    public void Options_AcceptExactExplicitRuntimeBackends(
+        string runtimeBackend,
+        AppHostRuntimeBackend expected)
+    {
+        using var layout = TestLayout.Create();
+
+        var options = AppHostOptions.Parse(layout.Arguments("run", runtimeBackend));
+
+        Assert.Equal(expected, options.RuntimeBackend);
+    }
+
+    [Fact, Trait("Category", "AppHost")]
+    public void Options_RequireAnExplicitRuntimeBackend()
+    {
+        using var layout = TestLayout.Create();
+        var arguments = layout.Arguments("run").ToList();
+        arguments.RemoveRange(arguments.IndexOf("--runtime-backend"), 2);
+
+        var error = Assert.Throws<AppHostOptionsException>(() =>
+            AppHostOptions.Parse([.. arguments]));
+
+        Assert.Equal("missing-required-option", error.ReasonCode);
+    }
+
+    [Theory, Trait("Category", "AppHost")]
+    [InlineData("")]
+    [InlineData("Redis")]
+    [InlineData("POSTGRES-DESKTOP")]
+    [InlineData("postgres_desktop")]
+    [InlineData(" redis")]
+    [InlineData("redis ")]
+    public void Options_RejectMalformedRuntimeBackendWithStableReason(string runtimeBackend)
+    {
+        using var layout = TestLayout.Create();
+
+        var error = Assert.Throws<AppHostOptionsException>(() =>
+            AppHostOptions.Parse(layout.Arguments("run", runtimeBackend)));
+
+        Assert.Equal("invalid-runtime-backend", error.ReasonCode);
+    }
+
+    [Theory, Trait("Category", "AppHost")]
     [InlineData("--port=15432")]
     [InlineData("--unknown")]
     [InlineData("--port")]
@@ -61,6 +105,100 @@ public sealed class AppHostStartupTests
         var error = Assert.Throws<AppHostOptionsException>(() => AppHostOptions.Parse(arguments));
 
         Assert.Equal("duplicate-option", error.ReasonCode);
+    }
+
+    [PostgresFact, Trait("Category", "AppHost")]
+    public async Task Startup_PostgresDesktopFailsDuringPayloadValidationBeforeRuntimeOrRoles()
+    {
+        using var layout = TestLayout.CreateReal("ebaycrm-postgres-desktop-preflight");
+        var provider = new FailIfCalledRoleLaunchPlanProvider();
+        var runtime = AppHostComposition.CreateForTests(
+            AppHostOptions.Parse(layout.Arguments("run", "postgres-desktop")),
+            roleLaunchPlanProvider: provider);
+        try
+        {
+            var error = await Assert.ThrowsAsync<AppHostExecutionException>(() =>
+                runtime.Orchestrator.StartAsync());
+
+            Assert.Equal("postgres-desktop-runtime-incomplete", error.ReasonCode);
+            Assert.Contains(RuntimeState.ValidatingPayload, runtime.Orchestrator.StateHistory);
+            Assert.DoesNotContain(RuntimeState.PreparingRuntime, runtime.Orchestrator.StateHistory);
+            Assert.Equal(0, provider.CreateCallCount);
+            Assert.False(File.Exists(Path.Combine(
+                layout.ProfileRoot,
+                "runtime",
+                "profile-identity-v1.json")));
+            Assert.False(File.Exists(Path.Combine(
+                layout.ProfileRoot,
+                "runtime",
+                "postgres-credential-v1.dat")));
+            Assert.False(File.Exists(Path.Combine(
+                layout.ProfileRoot,
+                "postgres-data",
+                "PG_VERSION")));
+        }
+        finally
+        {
+            await runtime.Orchestrator.DisposeAsync();
+        }
+    }
+
+    [Fact, Trait("Category", "AppHost")]
+    public async Task PayloadValidation_PostgresDesktopFailsBeforeAnyRuntimeDependency()
+    {
+        using var layout = TestLayout.Create();
+        var options = AppHostOptions.Parse(layout.Arguments("run", "postgres-desktop"));
+        var postgresLayout = new PostgresBinaryLayout(
+            layout.PostgresBin,
+            Path.Combine(layout.PostgresBin, "initdb.exe"),
+            Path.Combine(layout.PostgresBin, "pg_ctl.exe"),
+            Path.Combine(layout.PostgresBin, "postgres.exe"),
+            Path.Combine(layout.PostgresBin, "psql.exe"),
+            Path.Combine(layout.PostgresBin, "pg_isready.exe"));
+        var payload = new ValidatedAppHostPayload(
+            DataProfileIdentity.Create(layout.ProfileRoot),
+            postgresLayout,
+            PostgresClusterPaths.Create(layout.ProfileRoot),
+            Path.Combine(layout.Root, "unused-migration.sql"),
+            "unused-fixture-build");
+        var provider = new FailIfCalledRoleLaunchPlanProvider();
+        await using var executor = new LifecycleCommandExecutor(
+            options,
+            payload,
+            provider);
+        var operationId = Guid.NewGuid();
+
+        var error = await Assert.ThrowsAsync<AppHostExecutionException>(() =>
+            executor.ExecuteAsync(new LifecycleCommand(
+                LifecycleCommandType.ValidatePayload,
+                Generation: null,
+                operationId,
+                LifecycleDeadlineKey.PayloadValidation)));
+
+        Assert.Equal("postgres-desktop-runtime-incomplete", error.ReasonCode);
+        Assert.Equal(0, provider.CreateCallCount);
+        Assert.False(File.Exists(Path.Combine(
+            layout.ProfileRoot,
+            "runtime",
+            "profile-identity-v1.json")));
+        Assert.False(File.Exists(Path.Combine(
+            layout.ProfileRoot,
+            "postgres-data",
+            "PG_VERSION")));
+    }
+
+    [Fact, Trait("Category", "AppHost")]
+    public async Task Probe_PostgresDesktopReturnsTheSameFailureWithoutSideEffects()
+    {
+        using var layout = TestLayout.Create();
+        var options = AppHostOptions.Parse(layout.Arguments("probe", "postgres-desktop"));
+        Directory.Delete(layout.Root, recursive: true);
+
+        var result = await AppHostComposition.ProbeAsync(options);
+
+        Assert.False(result.IsValid);
+        Assert.Equal("postgres-desktop-runtime-incomplete", result.ReasonCode);
+        Assert.False(Directory.Exists(layout.Root));
     }
 
     [Fact, Trait("Category", "AppHost")]
@@ -655,7 +793,8 @@ public sealed class AppHostStartupTests
             Path.Combine(nonTemporaryProfile, "postgres"),
             Path.Combine(nonTemporaryProfile, "HowardLab.EbayCrm.AppHost.Fixture.exe"),
             15432,
-            AppHostMode.Run);
+            AppHostMode.Run,
+            AppHostRuntimeBackend.RedisCompatibility);
 
         var error = Assert.Throws<AppHostOptionsException>(() => AppHostComposition.CreateForTests(options));
 
@@ -873,6 +1012,17 @@ public sealed class AppHostStartupTests
         }
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class FailIfCalledRoleLaunchPlanProvider : IRoleLaunchPlanProvider
+    {
+        internal int CreateCallCount { get; private set; }
+
+        public RoleLaunchPlan Create(RoleLaunchRequest request)
+        {
+            CreateCallCount++;
+            throw new InvalidOperationException("role-provider-must-not-be-called");
+        }
     }
 
     private sealed class FailingExecutor(LifecycleCommandType failure) : ILifecycleCommandExecutor

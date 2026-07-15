@@ -26,6 +26,8 @@ spec:
           image: twentycrm/twenty:latest
           imagePullPolicy: Always
           env:
+            - name: RUNTIME_BACKEND
+              value: "redis"
             - name: SERVER_URL
               value: "https://crm.example.com:443"
             - name: PG_DATABASE_URL

@@ -131,6 +131,8 @@ spec:
           image: {{ include "twenty.image.repository" $img }}:{{ include "twenty.image.tag" $img }}
           imagePullPolicy: {{ include "twenty.image.pullPolicy" $img }}
           env:
+            - name: RUNTIME_BACKEND
+              value: redis
             - name: SERVER_URL
               value: {{ include "twenty.serverUrl" . | quote }}
             {{- if eq (include "twenty.db.useExternalSecret" .) "true" }}

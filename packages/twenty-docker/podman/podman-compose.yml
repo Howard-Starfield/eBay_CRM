@@ -22,6 +22,7 @@ services:
     container_name: twenty-server
     image: twentycrm/twenty:latest
     environment:
+      RUNTIME_BACKEND: redis
       NODE_PORT: "3000"
       SERVER_URL: ${SERVER_URL}
       PG_DATABASE_URL: "postgresql://twenty:${PG_DATABASE_PASSWORD}@twenty-db:5432/twenty"
@@ -39,6 +40,7 @@ services:
     image: twentycrm/twenty:latest
     command: yarn worker:prod
     environment:
+      RUNTIME_BACKEND: redis
       SERVER_URL: ${SERVER_URL}
       PG_DATABASE_URL: "postgresql://twenty:${PG_DATABASE_PASSWORD}@twenty-db:5432/twenty"
       REDIS_URL: "redis://twenty-redis:6379"

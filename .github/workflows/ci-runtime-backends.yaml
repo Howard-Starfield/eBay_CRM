@@ -54,6 +54,7 @@ jobs:
         run: |
           node --test scripts/check-runtime-backend-boundaries.test.mjs
           yarn check:runtime-boundaries
+          yarn check:runtime-configs
       - name: Run BullMQ compatibility contract
         run: yarn nx test-runtime-contract twenty-server
 
@@ -96,6 +97,7 @@ jobs:
         run: |
           node --test scripts/check-runtime-backend-boundaries.test.mjs
           yarn check:runtime-boundaries
+          yarn check:runtime-configs
       - name: Reproduce pg-boss rejection three times
         shell: bash
         run: |

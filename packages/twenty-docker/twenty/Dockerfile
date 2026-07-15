@@ -104,6 +104,7 @@ WORKDIR /app/packages/twenty-server
 ARG APP_VERSION
 ENV APP_VERSION=$APP_VERSION
 ENV NODE_ENV=production
+ENV RUNTIME_BACKEND=redis
 
 # Workspace root config
 COPY --chown=1000 --from=twenty-server-build /app/package.json /app/yarn.lock /app/.yarnrc.yml /app/
@@ -273,6 +274,7 @@ ARG APP_VERSION=0.0.0
 
 ENV S6_KEEP_ENV=1
 ENV PG_DATABASE_URL=postgres://twenty:twenty@localhost:5432/default \
+    RUNTIME_BACKEND=redis \
     SERVER_URL=http://localhost:2020 \
     REDIS_URL=redis://localhost:6379 \
     STORAGE_TYPE=local \

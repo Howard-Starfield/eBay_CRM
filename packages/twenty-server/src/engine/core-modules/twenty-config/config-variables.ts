@@ -1236,7 +1236,7 @@ export class ConfigVariables {
     isHiddenInAdminPanel: true,
   })
   @IsIn(Object.values(RUNTIME_BACKENDS))
-  RUNTIME_BACKEND: RuntimeBackend = RUNTIME_BACKENDS.POSTGRES_DESKTOP;
+  RUNTIME_BACKEND!: RuntimeBackend;
 
   @ConfigVariablesMetadata({
     group: ConfigVariablesGroup.TOKENS_DURATION,
@@ -2093,6 +2093,19 @@ export class ConfigVariables {
 }
 
 export const validate = (config: Record<string, unknown>): ConfigVariables => {
+  // Environment-only metadata is decorator-optional, so this no-default
+  // selection is required explicitly at the exported validation boundary.
+  if (
+    !Object.prototype.hasOwnProperty.call(config, 'RUNTIME_BACKEND') ||
+    config.RUNTIME_BACKEND === undefined ||
+    config.RUNTIME_BACKEND === null
+  ) {
+    throw new ConfigVariableException(
+      'Config variables validation failed',
+      ConfigVariableExceptionCode.VALIDATION_FAILED,
+    );
+  }
+
   const validatedConfig = plainToClass(ConfigVariables, config);
 
   const validationErrors = validateSync(validatedConfig, {

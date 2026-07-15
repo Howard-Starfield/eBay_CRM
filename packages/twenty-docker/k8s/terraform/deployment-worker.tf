@@ -39,6 +39,11 @@ resource "kubernetes_deployment" "twentycrm_worker" {
           command = ["yarn", "worker:prod"]
 
           env {
+            name  = "RUNTIME_BACKEND"
+            value = "redis"
+          }
+
+          env {
             name  = "SERVER_URL"
             value = var.twentycrm_app_hostname
           }

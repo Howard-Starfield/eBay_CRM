@@ -464,7 +464,8 @@ internal sealed class RoleExecutorHarness : IAsyncDisposable
             postgresBin,
             fixturePath,
             Port: 15432,
-            AppHostMode.Run);
+            AppHostMode.Run,
+            AppHostRuntimeBackend.RedisCompatibility);
         var postgresLayout = new PostgresBinaryLayout(
             postgresBin,
             Path.Combine(postgresBin, "initdb.exe"),

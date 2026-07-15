@@ -144,6 +144,13 @@ public static class AppHostComposition
             throw new AppHostOptionsException("probe-mode-required");
         }
 
+        if (options.RuntimeBackend == AppHostRuntimeBackend.PostgresDesktop)
+        {
+            return Task.FromResult(new AppHostProbeResult(
+                false,
+                "postgres-desktop-runtime-incomplete"));
+        }
+
         _ = Validate(options, requireAvailablePort: true);
         cancellationToken.ThrowIfCancellationRequested();
         return Task.FromResult(new AppHostProbeResult(true, "probe-valid"));

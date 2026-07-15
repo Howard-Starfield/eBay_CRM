@@ -69,6 +69,8 @@ spec:
           command:
 {{- toYaml .Values.worker.command | nindent 12 }}
           env:
+            - name: RUNTIME_BACKEND
+              value: redis
             - name: SERVER_URL
               value: {{ include "twenty.serverUrl" . | quote }}
             {{- if eq (include "twenty.db.useExternalSecret" .) "true" }}

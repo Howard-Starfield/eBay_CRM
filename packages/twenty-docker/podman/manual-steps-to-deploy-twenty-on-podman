@@ -30,6 +30,7 @@ podman run -d --pod twenty-pod --name twenty-redis \
   docker.io/library/redis:latest
 
 podman run -d --pod twenty-pod --name twenty-server \
+  -e RUNTIME_BACKEND=redis \
   -e NODE_PORT=3000 \
   -e SERVER_URL="$SERVER_URL" \
   -e PG_DATABASE_URL="postgresql://twenty:$POSTGRES_PASSWORD@twenty-db:5432/twenty" \
@@ -42,6 +43,7 @@ podman run -d --pod twenty-pod --name twenty-server \
 
 podman run -d --pod twenty-pod --name twenty-worker \
   --init \
+  -e RUNTIME_BACKEND=redis \
   -e SERVER_URL="$SERVER_URL" \
   -e PG_DATABASE_URL="postgresql://twenty:$POSTGRES_PASSWORD@twenty-db:5432/twenty" \
   -e REDIS_URL="redis://twenty-redis:6379" \
