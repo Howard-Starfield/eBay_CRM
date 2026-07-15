@@ -40,6 +40,8 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     private readonly ValidatedAppHostPayload _payload;
     private readonly IProfileRuntimeIdentityStore _identityStore;
     private readonly WindowsProcessLauncher _launcher;
+    private readonly IRoleOperationBoundary _roleOperationBoundary;
+    private readonly RoleOperationDeadlines _roleOperationDeadlines;
     private UserProfileInstanceLock? _instanceLock;
     private Guid? _instanceOperationId;
     private ProfileRuntimeIdentity? _profileIdentity;
@@ -57,10 +59,27 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         AppHostOptions options,
         ValidatedAppHostPayload payload,
         IProfileRuntimeIdentityStore? identityStore = null)
+        : this(
+            options,
+            payload,
+            identityStore,
+            NoopRoleOperationBoundary.Instance,
+            RoleOperationDeadlines.Production)
+    {
+    }
+
+    internal LifecycleCommandExecutor(
+        AppHostOptions options,
+        ValidatedAppHostPayload payload,
+        IProfileRuntimeIdentityStore? identityStore,
+        IRoleOperationBoundary roleOperationBoundary,
+        RoleOperationDeadlines roleOperationDeadlines)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _payload = payload ?? throw new ArgumentNullException(nameof(payload));
         _identityStore = identityStore ?? new ProfileRuntimeIdentityStore();
+        _roleOperationBoundary = roleOperationBoundary ?? throw new ArgumentNullException(nameof(roleOperationBoundary));
+        _roleOperationDeadlines = roleOperationDeadlines ?? throw new ArgumentNullException(nameof(roleOperationDeadlines));
         _launcher = new WindowsProcessLauncher(NoopDiagnosticSink.Instance);
     }
 
@@ -209,6 +228,8 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             LifecycleCommandType.StopDatabaseFast => await StopDatabaseAsync(command, cancellationToken).ConfigureAwait(false),
             LifecycleCommandType.ReconcileDatabaseStart => await ReconcileDatabaseStartAsync(command, cancellationToken).ConfigureAwait(false),
             LifecycleCommandType.ReconcileDatabaseStop => await ReconcileDatabaseStopAsync(command, cancellationToken).ConfigureAwait(false),
+            LifecycleCommandType.ReconcileRoleStart => await ReconcileRoleStartAsync(command, cancellationToken).ConfigureAwait(false),
+            LifecycleCommandType.ReconcileRoleStop => await ReconcileRoleStopAsync(command, cancellationToken).ConfigureAwait(false),
             LifecycleCommandType.ReleaseInstance => await ReleaseInstanceAsync().ConfigureAwait(false),
             LifecycleCommandType.EscalateJob => await EscalateAsync(cancellationToken).ConfigureAwait(false),
             LifecycleCommandType.EnterFault => await EnterFaultAsync(command).ConfigureAwait(false),
@@ -360,6 +381,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             ControlDeadline);
         var job = WindowsJobObject.CreateKillOnClose();
         ISupervisedProcess? process = null;
+        RoleResource? resource = null;
         try
         {
             var child = channel.CreateChildEnvironment();
@@ -392,7 +414,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             }
 
             RoleLaunchedForTests?.Invoke(generation.Role, job, windowsProcess);
-            var resource = new RoleResource(
+            resource = new RoleResource(
                 generation,
                 command.OperationId,
                 healthPort,
@@ -400,21 +422,54 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
                 channel,
                 job);
             SetRole(resource);
-            await channel.AcceptAsync(process, job, cancellationToken).ConfigureAwait(false);
+            resource.AcceptTask = AcceptRoleAsync(resource);
+            using var commandDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            commandDeadline.CancelAfter(_roleOperationDeadlines.StartCommand);
+            try
+            {
+                await resource.AcceptTask.WaitAsync(commandDeadline.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (
+                !cancellationToken.IsCancellationRequested && commandDeadline.IsCancellationRequested)
+            {
+                return new OperationTimedOut(generation, command.OperationId);
+            }
+
             return new RoleStarted(generation);
         }
         catch
         {
-            if (process is not null)
+            if (resource is not null)
             {
-                await process.DisposeAsync().ConfigureAwait(false);
+                await DisposeRoleAsync(resource).ConfigureAwait(false);
             }
+            else
+            {
+                if (process is not null)
+                {
+                    await process.DisposeAsync().ConfigureAwait(false);
+                }
 
-            await channel.DisposeAsync().ConfigureAwait(false);
-            job.Dispose();
-            ClearRole(generation.Role);
+                await channel.DisposeAsync().ConfigureAwait(false);
+                job.Dispose();
+            }
             throw;
         }
+    }
+
+    private async Task AcceptRoleAsync(RoleResource resource)
+    {
+        var roleLifetimeToken = resource.RoleLifetimeCancellation.Token;
+        await _roleOperationBoundary.PauseAsync(
+            RoleOperationBoundaryPoint.StartIdentityRetained,
+            resource.Generation,
+            resource.StartupOperationId,
+            roleLifetimeToken).ConfigureAwait(false);
+        await resource.Channel.AcceptAsync(
+            resource.Process,
+            resource.Job,
+            roleLifetimeToken).ConfigureAwait(false);
+        resource.Authenticated = true;
     }
 
     private async Task<LifecycleEvent> WaitForRoleAsync(
@@ -530,17 +585,24 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         LifecycleCommand command,
         CancellationToken cancellationToken)
     {
+        var commandGeneration = RequireGeneration(command, role);
         var resource = role == RuntimeRole.Server ? _server : _worker;
         if (resource is null)
         {
             return null;
         }
 
+        if (resource.Generation.Role != commandGeneration.Role ||
+            resource.Generation.Value != commandGeneration.Value)
+        {
+            throw new AppHostExecutionException("fixture-retained-identity-mismatch");
+        }
+
         await StopMonitoringAsync(resource).ConfigureAwait(false);
 
         if (resource.Process.Completion.IsCompleted)
         {
-            await DisposeRoleAsync(role).ConfigureAwait(false);
+            await DisposeRoleAsync(resource).ConfigureAwait(false);
             return null;
         }
 
@@ -549,33 +611,47 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             await DrainWorkerAsync(command, cancellationToken).ConfigureAwait(false);
         }
 
-        var stopped = false;
+        await resource.Channel.SendAsync(
+            Empty(ControlMessageType.Shutdown, command.OperationId, resource.Generation),
+            cancellationToken).ConfigureAwait(false);
+        var accepted = await resource.Channel.ReadAsync(cancellationToken).ConfigureAwait(false);
+        if (accepted.Type != ControlMessageType.ShutdownAccepted || accepted.OperationId != command.OperationId)
+        {
+            throw new AppHostExecutionException("fixture-shutdown-sequence-invalid");
+        }
+
+        resource.ShutdownOperationId = command.OperationId;
+        resource.StopCompletionTask = CompleteRoleStopAsync(resource, command.OperationId);
+        using var commandDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        commandDeadline.CancelAfter(_roleOperationDeadlines.StopCommand);
         try
         {
-            await resource.Channel.SendAsync(
-                Empty(ControlMessageType.Shutdown, command.OperationId, resource.Generation),
-                cancellationToken).ConfigureAwait(false);
-            foreach (var expected in new[] { ControlMessageType.ShutdownAccepted, ControlMessageType.Stopped })
-            {
-                var reply = await resource.Channel.ReadAsync(cancellationToken).ConfigureAwait(false);
-                if (reply.Type != expected || reply.OperationId != command.OperationId)
-                {
-                    throw new AppHostExecutionException("fixture-shutdown-sequence-invalid");
-                }
-            }
-
-            _ = await resource.Process.Completion.WaitAsync(cancellationToken).ConfigureAwait(false);
-            stopped = true;
+            await resource.StopCompletionTask.WaitAsync(commandDeadline.Token).ConfigureAwait(false);
         }
-        finally
+        catch (OperationCanceledException) when (!resource.RoleLifetimeCancellation.IsCancellationRequested)
         {
-            if (stopped)
-            {
-                await DisposeRoleAsync(role).ConfigureAwait(false);
-            }
+            return new OperationTimedOut(commandGeneration, command.OperationId);
         }
 
+        await DisposeRoleAsync(resource).ConfigureAwait(false);
         return null;
+    }
+
+    private async Task CompleteRoleStopAsync(RoleResource resource, Guid operationId)
+    {
+        var roleLifetimeToken = resource.RoleLifetimeCancellation.Token;
+        await _roleOperationBoundary.PauseAsync(
+            RoleOperationBoundaryPoint.StopAccepted,
+            resource.Generation,
+            operationId,
+            roleLifetimeToken).ConfigureAwait(false);
+        var stopped = await resource.Channel.ReadAsync(roleLifetimeToken).ConfigureAwait(false);
+        if (stopped.Type != ControlMessageType.Stopped || stopped.OperationId != operationId)
+        {
+            throw new AppHostExecutionException("fixture-shutdown-sequence-invalid");
+        }
+
+        _ = await resource.Process.Completion.WaitAsync(roleLifetimeToken).ConfigureAwait(false);
     }
 
     private async Task<LifecycleEvent?> StopDatabaseAsync(
@@ -653,6 +729,86 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         return new Reconciled(generation, ReconciledState.Unknown);
     }
 
+    private async Task<LifecycleEvent> ReconcileRoleStartAsync(
+        LifecycleCommand command,
+        CancellationToken cancellationToken)
+    {
+        var generation = command.Generation
+            ?? throw new AppHostExecutionException("fixture-generation-missing");
+        if (generation.Role is not (RuntimeRole.Server or RuntimeRole.Worker))
+        {
+            throw new AppHostExecutionException("fixture-role-invalid");
+        }
+
+        var resource = generation.Role == RuntimeRole.Server ? _server : _worker;
+        if (resource is null || resource.Generation != generation)
+        {
+            return new Reconciled(generation, ReconciledState.Stopped);
+        }
+
+        var acceptTask = resource.AcceptTask
+            ?? throw new AppHostExecutionException("fixture-accept-task-missing");
+        using var reconciliationDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        reconciliationDeadline.CancelAfter(_roleOperationDeadlines.Reconciliation);
+        try
+        {
+            await acceptTask.WaitAsync(reconciliationDeadline.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!resource.RoleLifetimeCancellation.IsCancellationRequested)
+        {
+            return new OperationTimedOut(generation, command.OperationId);
+        }
+
+        if (!resource.Authenticated || resource.Process.Completion.IsCompleted)
+        {
+            await DisposeRoleAsync(resource).ConfigureAwait(false);
+            return new Reconciled(generation, ReconciledState.Stopped);
+        }
+
+        return new Reconciled(generation, ReconciledState.Running);
+    }
+
+    private async Task<LifecycleEvent> ReconcileRoleStopAsync(
+        LifecycleCommand command,
+        CancellationToken cancellationToken)
+    {
+        var generation = command.Generation
+            ?? throw new AppHostExecutionException("fixture-generation-missing");
+        if (generation.Role is not (RuntimeRole.Server or RuntimeRole.Worker))
+        {
+            throw new AppHostExecutionException("fixture-role-invalid");
+        }
+
+        var resource = generation.Role == RuntimeRole.Server ? _server : _worker;
+        if (resource is null ||
+            resource.Generation.Role != generation.Role ||
+            resource.Generation.Value != generation.Value)
+        {
+            return new Reconciled(generation, ReconciledState.Stopped);
+        }
+
+        if (resource.ShutdownOperationId != command.OperationId)
+        {
+            throw new AppHostExecutionException("fixture-shutdown-operation-mismatch");
+        }
+
+        var stopCompletionTask = resource.StopCompletionTask
+            ?? throw new AppHostExecutionException("fixture-stop-task-missing");
+        using var reconciliationDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        reconciliationDeadline.CancelAfter(_roleOperationDeadlines.Reconciliation);
+        try
+        {
+            await stopCompletionTask.WaitAsync(reconciliationDeadline.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!resource.RoleLifetimeCancellation.IsCancellationRequested)
+        {
+            return new Reconciled(generation, ReconciledState.Unknown);
+        }
+
+        await DisposeRoleAsync(resource).ConfigureAwait(false);
+        return new Reconciled(generation, ReconciledState.Stopped);
+    }
+
     private async Task<LifecycleEvent?> ReleaseInstanceAsync()
     {
         if (_instanceLock is not null)
@@ -706,6 +862,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         // Close every containment boundary before awaiting any descendant.
         foreach (var resource in new[] { worker, server }.Where(value => value is not null).Cast<RoleResource>())
         {
+            resource.RoleLifetimeCancellation.Cancel();
             resource.MonitorCancellation.Cancel();
             var termination = resource.Job.TerminateTree(exitCode: 1);
             if (!termination.Succeeded)
@@ -739,6 +896,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
                 errors.Add(error);
             }
             resource.DisposeMonitorCancellationWhenQuiescent();
+            resource.DisposeRoleLifetimeCancellationWhenQuiescent();
         }
 
         if (_databaseIdentity is { } identity && _databaseRuntime is { } runtime)
@@ -920,7 +1078,26 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             return;
         }
 
+        await DisposeRoleResourceAsync(resource).ConfigureAwait(false);
+    }
+
+    private async Task DisposeRoleAsync(RoleResource resource)
+    {
+        var removed = resource.Generation.Role == RuntimeRole.Server
+            ? Interlocked.CompareExchange(ref _server, null, resource)
+            : Interlocked.CompareExchange(ref _worker, null, resource);
+        if (!ReferenceEquals(removed, resource))
+        {
+            return;
+        }
+
+        await DisposeRoleResourceAsync(resource).ConfigureAwait(false);
+    }
+
+    private static async Task DisposeRoleResourceAsync(RoleResource resource)
+    {
         var errors = new List<Exception>();
+        resource.RoleLifetimeCancellation.Cancel();
         await StopMonitoringAsync(resource).ConfigureAwait(false);
         await CaptureCleanupAsync(
             () => resource.Channel.DisposeAsync().AsTask(),
@@ -937,6 +1114,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             errors.Add(error);
         }
         resource.DisposeMonitorCancellationWhenQuiescent();
+        resource.DisposeRoleLifetimeCancellationWhenQuiescent();
         ThrowCleanupErrors(errors);
     }
 
@@ -1017,18 +1195,6 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
     }
 
-    private void ClearRole(RuntimeRole role)
-    {
-        if (role == RuntimeRole.Server)
-        {
-            _server = null;
-        }
-        else
-        {
-            _worker = null;
-        }
-    }
-
     private static ProcessGeneration RequireGeneration(LifecycleCommand command, RuntimeRole role)
     {
         if (command.Generation is not { } generation || generation.Role != role)
@@ -1097,8 +1263,19 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         WindowsJobObject Job)
     {
         private int _monitorCancellationDisposalStarted;
+        private int _roleLifetimeCancellationDisposalStarted;
 
         internal CancellationTokenSource MonitorCancellation { get; } = new();
+
+        internal CancellationTokenSource RoleLifetimeCancellation { get; } = new();
+
+        internal Task? AcceptTask { get; set; }
+
+        internal Task? StopCompletionTask { get; set; }
+
+        internal bool Authenticated { get; set; }
+
+        internal Guid? ShutdownOperationId { get; set; }
 
         internal Task? ControlMonitor { get; set; }
 
@@ -1134,6 +1311,35 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             finally
             {
                 MonitorCancellation.Dispose();
+            }
+        }
+
+        internal void DisposeRoleLifetimeCancellationWhenQuiescent()
+        {
+            if (Interlocked.Exchange(ref _roleLifetimeCancellationDisposalStarted, 1) != 0)
+            {
+                return;
+            }
+
+            _ = DisposeRoleLifetimeCancellationWhenQuiescentAsync();
+        }
+
+        private async Task DisposeRoleLifetimeCancellationWhenQuiescentAsync()
+        {
+            try
+            {
+                await Task.WhenAll(
+                    new[] { AcceptTask, StopCompletionTask }
+                        .Where(task => task is not null)
+                        .Cast<Task>()).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Role tasks already reported their terminal outcome to the lifecycle executor.
+            }
+            finally
+            {
+                RoleLifetimeCancellation.Dispose();
             }
         }
     }

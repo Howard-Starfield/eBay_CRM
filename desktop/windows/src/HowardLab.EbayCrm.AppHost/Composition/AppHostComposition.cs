@@ -26,13 +26,19 @@ public static class AppHostComposition
 
     public static RuntimeOrchestrator Create(AppHostOptions options)
     {
-        var runtime = CreateRuntime(options, null);
+        var runtime = CreateRuntime(
+            options,
+            null,
+            NoopRoleOperationBoundary.Instance,
+            RoleOperationDeadlines.Production);
         return runtime.Orchestrator;
     }
 
     internal static AppHostTestRuntime CreateForTests(
         AppHostOptions options,
-        ShutdownBudget? shutdownBudget = null)
+        ShutdownBudget? shutdownBudget = null,
+        IRoleOperationBoundary? roleOperationBoundary = null,
+        RoleOperationDeadlines? roleOperationDeadlines = null)
     {
         var canonical = Path.GetFullPath(options.ProfileRoot);
         var temporary = Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.GetTempPath())) + Path.DirectorySeparatorChar;
@@ -41,12 +47,18 @@ public static class AppHostComposition
             throw new AppHostOptionsException("test-profile-not-disposable");
         }
 
-        return CreateRuntime(options, shutdownBudget);
+        return CreateRuntime(
+            options,
+            shutdownBudget,
+            roleOperationBoundary ?? NoopRoleOperationBoundary.Instance,
+            roleOperationDeadlines ?? RoleOperationDeadlines.Production);
     }
 
     private static AppHostTestRuntime CreateRuntime(
         AppHostOptions options,
-        ShutdownBudget? shutdownBudget)
+        ShutdownBudget? shutdownBudget,
+        IRoleOperationBoundary roleOperationBoundary,
+        RoleOperationDeadlines roleOperationDeadlines)
     {
         ArgumentNullException.ThrowIfNull(options);
         if (options.Mode != AppHostMode.Run)
@@ -60,7 +72,12 @@ public static class AppHostComposition
         var coordinator = new LifecycleCoordinator(
             new SystemClock(),
             new RestartBudget(3, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(5)));
-        var executor = new LifecycleCommandExecutor(options, validated);
+        var executor = new LifecycleCommandExecutor(
+            options,
+            validated,
+            identityStore: null,
+            roleOperationBoundary,
+            roleOperationDeadlines);
         var orchestrator = new RuntimeOrchestrator(coordinator, executor, shutdownBudget);
         executor.EventSink = orchestrator.HandleEventAsync;
         return new AppHostTestRuntime(orchestrator, executor);

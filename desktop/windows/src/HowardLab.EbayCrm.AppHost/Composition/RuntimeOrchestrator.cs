@@ -148,13 +148,13 @@ public sealed class RuntimeOrchestrator : IAsyncDisposable
         var faulted = false;
         foreach (var command in commands.Where(command => command.Type != LifecycleCommandType.ReleaseInstance))
         {
-            var role = ShutdownRole(command.Type);
+            var role = ShutdownRole(command);
             if (role is { } stageRole && !stageStarts.ContainsKey(stageRole))
             {
                 stageStarts.Add(stageRole, stopwatch.Elapsed);
             }
 
-            var remaining = Remaining(command.Type, stopwatch.Elapsed, stageStarts);
+            var remaining = Remaining(command, stopwatch.Elapsed, stageStarts);
             using var stageCancellation = new CancellationTokenSource();
             if (remaining <= TimeSpan.Zero)
             {
@@ -172,14 +172,15 @@ public sealed class RuntimeOrchestrator : IAsyncDisposable
                 if (result is not null)
                 {
                     var next = await _coordinator.DispatchAsync(result, CancellationToken.None).ConfigureAwait(false);
-                    var transitionRemaining = Remaining(command.Type, stopwatch.Elapsed, stageStarts);
+                    var transitionRemaining = Remaining(command, stopwatch.Elapsed, stageStarts);
                     using var transitionCancellation = new CancellationTokenSource();
                     if (transitionRemaining <= TimeSpan.Zero) transitionCancellation.Cancel();
                     else transitionCancellation.CancelAfter(transitionRemaining);
                     await ProcessAsync(
                         next,
-                        transitionCancellation.Token).ConfigureAwait(false);
-                    if (State == RuntimeState.ReconcilingDatabaseStop)
+                        transitionCancellation.Token,
+                        boundRoleReconciliation: true).ConfigureAwait(false);
+                    if (State is RuntimeState.ReconcilingDatabaseStop or RuntimeState.ReconcilingRoleStop)
                     {
                         faulted = true;
                     }
@@ -221,12 +222,12 @@ public sealed class RuntimeOrchestrator : IAsyncDisposable
     }
 
     private TimeSpan Remaining(
-        LifecycleCommandType type,
+        LifecycleCommand command,
         TimeSpan elapsed,
         IReadOnlyDictionary<RuntimeRole, TimeSpan> stageStarts)
     {
         var total = _shutdownBudget.Total - elapsed;
-        var role = ShutdownRole(type);
+        var role = ShutdownRole(command);
         if (role is null)
         {
             return total;
@@ -237,17 +238,19 @@ public sealed class RuntimeOrchestrator : IAsyncDisposable
             RuntimeRole.Worker => _shutdownBudget.Worker,
             RuntimeRole.Server => _shutdownBudget.Server,
             RuntimeRole.Database => _shutdownBudget.Database,
-            _ => throw new ArgumentOutOfRangeException(nameof(type)),
+            _ => throw new ArgumentOutOfRangeException(nameof(command)),
         };
         var stage = allocation - (elapsed - stageStarts[role.Value]);
         return total <= stage ? total : stage;
     }
 
-    private static RuntimeRole? ShutdownRole(LifecycleCommandType type) => type switch
+    private static RuntimeRole? ShutdownRole(LifecycleCommand command) => command.Type switch
     {
         LifecycleCommandType.DrainWorker or LifecycleCommandType.StopWorker => RuntimeRole.Worker,
         LifecycleCommandType.StopServer => RuntimeRole.Server,
         LifecycleCommandType.StopDatabaseFast or LifecycleCommandType.ReconcileDatabaseStop => RuntimeRole.Database,
+        LifecycleCommandType.ReconcileRoleStop when command.Generation is { Role: RuntimeRole.Server } => RuntimeRole.Server,
+        LifecycleCommandType.ReconcileRoleStop when command.Generation is { Role: RuntimeRole.Worker } => RuntimeRole.Worker,
         _ => null,
     };
 
@@ -375,7 +378,8 @@ public sealed class RuntimeOrchestrator : IAsyncDisposable
 
     private async Task ProcessAsync(
         TransitionResult initial,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool boundRoleReconciliation = false)
     {
         var transitions = new Queue<TransitionResult>();
         transitions.Enqueue(initial);
@@ -384,11 +388,19 @@ public sealed class RuntimeOrchestrator : IAsyncDisposable
             PublishState(transition);
             foreach (var command in transition.Commands)
             {
-                var nextEvent = await _executor.ExecuteAsync(command, cancellationToken)
+                var isRoleReconciliation = command.Type is
+                    LifecycleCommandType.ReconcileRoleStart or LifecycleCommandType.ReconcileRoleStop;
+                var commandCancellation = isRoleReconciliation && !boundRoleReconciliation
+                    ? CancellationToken.None
+                    : cancellationToken;
+                var nextEvent = await _executor.ExecuteAsync(command, commandCancellation)
                     .ConfigureAwait(false);
                 if (nextEvent is not null)
                 {
-                    transitions.Enqueue(await _coordinator.DispatchAsync(nextEvent, cancellationToken)
+                    var dispatchCancellation = nextEvent is OperationTimedOut
+                        ? CancellationToken.None
+                        : commandCancellation;
+                    transitions.Enqueue(await _coordinator.DispatchAsync(nextEvent, dispatchCancellation)
                         .ConfigureAwait(false));
                 }
             }

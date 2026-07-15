@@ -1,0 +1,62 @@
+using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
+
+namespace HowardLab.EbayCrm.AppHost.Composition;
+
+internal enum RoleOperationBoundaryPoint
+{
+    StartIdentityRetained,
+    StopAccepted,
+}
+
+internal interface IRoleOperationBoundary
+{
+    ValueTask PauseAsync(
+        RoleOperationBoundaryPoint point,
+        ProcessGeneration generation,
+        Guid operationId,
+        CancellationToken roleLifetimeToken);
+}
+
+internal sealed class NoopRoleOperationBoundary : IRoleOperationBoundary
+{
+    internal static NoopRoleOperationBoundary Instance { get; } = new();
+
+    public ValueTask PauseAsync(
+        RoleOperationBoundaryPoint point,
+        ProcessGeneration generation,
+        Guid operationId,
+        CancellationToken roleLifetimeToken)
+    {
+        roleLifetimeToken.ThrowIfCancellationRequested();
+        return ValueTask.CompletedTask;
+    }
+}
+
+internal sealed record RoleOperationDeadlines
+{
+    internal static RoleOperationDeadlines Production { get; } = new(
+        TimeSpan.FromSeconds(10),
+        TimeSpan.FromSeconds(5),
+        TimeSpan.FromSeconds(30));
+
+    internal RoleOperationDeadlines(
+        TimeSpan startCommand,
+        TimeSpan stopCommand,
+        TimeSpan reconciliation)
+    {
+        if (startCommand <= TimeSpan.Zero || stopCommand <= TimeSpan.Zero || reconciliation <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(startCommand));
+        }
+
+        StartCommand = startCommand;
+        StopCommand = stopCommand;
+        Reconciliation = reconciliation;
+    }
+
+    internal TimeSpan StartCommand { get; }
+
+    internal TimeSpan StopCommand { get; }
+
+    internal TimeSpan Reconciliation { get; }
+}

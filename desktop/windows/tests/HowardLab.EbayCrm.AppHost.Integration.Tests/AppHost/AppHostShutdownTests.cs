@@ -7,11 +7,77 @@ using System.Net;
 using System.Net.Sockets;
 using HowardLab.EbayCrm.AppHost.Fixture;
 using HowardLab.EbayCrm.AppHost.Integration.Tests.Postgres;
+using HowardLab.EbayCrm.AppHost.Integration.Tests.Acceptance;
+using HowardLab.EbayCrm.AppHost.Windows.Instance;
 
 namespace HowardLab.EbayCrm.AppHost.Integration.Tests.AppHost;
 
 public sealed class AppHostShutdownTests
 {
+    [PostgresTheory, Trait("Category", "AppHost")]
+    [InlineData(RuntimeRole.Server)]
+    [InlineData(RuntimeRole.Worker)]
+    public async Task LateFixtureStop_ReconcilesTheRetainedProcessIdentity(RuntimeRole role)
+    {
+        using var layout = TestLayout.CreateReal("ebaycrm-task2-late-stop");
+        var boundary = new BlockingRoleOperationBoundary(role, RoleOperationBoundaryPoint.StopAccepted);
+        var runtime = AppHostComposition.CreateForTests(
+            AppHostOptions.Parse(layout.Arguments("run")),
+            roleOperationBoundary: boundary,
+            roleOperationDeadlines: new RoleOperationDeadlines(
+                TimeSpan.FromSeconds(10),
+                TimeSpan.FromMilliseconds(1),
+                TimeSpan.FromSeconds(30)));
+        runtime.Executor.RoleLaunchedForTests = boundary.RecordLaunched;
+        ProcessIdentitySnapshot? databaseIdentity = null;
+        try
+        {
+            await runtime.Orchestrator.StartAsync().WaitAsync(TimeSpan.FromMinutes(2));
+            var started = runtime.Executor.SnapshotForTests();
+            Assert.True(ProcessIdentitySnapshot.TryOpen(
+                started.DatabaseProcessId!.Value,
+                parentProcessId: 0,
+                out databaseIdentity));
+            var generation = TimeoutReconciliationAcceptanceTests.GenerationFor(started, role)!.Value;
+
+            var shutdown = runtime.Orchestrator.StopAsync();
+            await boundary.WaitUntilBlockedAsync(TimeSpan.FromSeconds(30));
+            await TimeoutReconciliationAcceptanceTests.WaitForStateAsync(
+                runtime.Orchestrator,
+                RuntimeState.ReconcilingRoleStop,
+                TimeSpan.FromSeconds(10));
+
+            Assert.Equal(generation.Role, boundary.ObservedGeneration.Role);
+            Assert.Equal(generation.Value, boundary.ObservedGeneration.Value);
+            Assert.Equal(TimeoutReconciliationAcceptanceTests.ProcessIdFor(started, role), boundary.ObservedIdentity.ProcessId);
+            Assert.Equal(1, boundary.CountRoleLaunches(role));
+            Assert.Equal(1, boundary.CountLaunches(generation));
+            Assert.Equal(1, boundary.CountLiveFixtureProcesses(generation));
+
+            boundary.Release();
+            await shutdown.WaitAsync(TimeSpan.FromSeconds(45));
+
+            Assert.Equal(RuntimeState.Stopped, runtime.Orchestrator.State);
+            Assert.Equal(1, boundary.CountRoleLaunches(role));
+            Assert.Equal(1, boundary.CountLaunches(generation));
+            Assert.Equal(0, boundary.CountLiveFixtureProcesses(generation));
+            Assert.All(boundary.Launches(), identity => Assert.False(BlockingRoleOperationBoundary.IsLiveIdentity(identity)));
+            Assert.True(databaseIdentity!.HasExited);
+            Assert.True(databaseIdentity.SameIdentityIfReopened());
+            Assert.False(File.Exists(Path.Combine(layout.ProfileRoot, "postgres-data", "postmaster.pid")));
+            var profile = DataProfileIdentity.Create(layout.ProfileRoot);
+            var ownership = await UserProfileInstanceLock.TryAcquireAsync(profile, CancellationToken.None);
+            Assert.NotNull(ownership);
+            await ownership!.DisposeAsync();
+        }
+        finally
+        {
+            boundary.Release();
+            databaseIdentity?.Dispose();
+            await runtime.Orchestrator.DisposeAsync();
+        }
+    }
+
     [PostgresFact, Trait("Category", "AppHost")]
     public async Task IgnoredWorkerShutdown_UsesTestBudgetAndLeavesNoRuntimeOrOwnershipLeak()
     {
