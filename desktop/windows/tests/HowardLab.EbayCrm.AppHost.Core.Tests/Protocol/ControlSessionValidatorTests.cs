@@ -359,7 +359,7 @@ public sealed class ControlSessionValidatorTests
         Create(ControlMessageType.ActiveWorkRemaining, operationId, RuntimeRole.Worker, new { count });
 
     private static ControlEnvelope CreateHealth(Guid operationId, string status, int activeWorkRemaining, RuntimeRole role = RuntimeRole.Worker) =>
-        Create(type: ControlMessageType.Health, operationId, role, new HealthPayload(1, "build-1", 7, "generation-7", status, activeWorkRemaining));
+        Create(type: ControlMessageType.Health, operationId, role, new HealthPayload(1, "build-1", 7, CapabilityNonce, status, activeWorkRemaining));
 
     private static ControlEnvelope Create(ControlMessageType type, Guid operationId, RuntimeRole role, object payload) =>
         new(

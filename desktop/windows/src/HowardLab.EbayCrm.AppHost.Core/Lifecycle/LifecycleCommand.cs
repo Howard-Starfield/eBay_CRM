@@ -4,7 +4,8 @@ public sealed record LifecycleCommand(
     LifecycleCommandType Type,
     ProcessGeneration? Generation,
     Guid OperationId,
-    LifecycleDeadlineKey DeadlineKey);
+    LifecycleDeadlineKey DeadlineKey,
+    string? ReasonCode = null);
 
 public enum LifecycleCommandType
 {

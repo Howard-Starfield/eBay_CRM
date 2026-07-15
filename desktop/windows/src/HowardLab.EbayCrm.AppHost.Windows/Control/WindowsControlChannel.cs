@@ -185,6 +185,41 @@ public sealed class WindowsControlChannel : IControlChannel
             Validate(envelope);
             return envelope;
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            Fault();
+            throw;
+        }
+        finally
+        {
+            if (entered)
+            {
+                _readGate.Release();
+            }
+        }
+    }
+
+    public async Task WaitForDisconnectAsync(CancellationToken cancellationToken = default)
+    {
+        EnsureAuthenticated();
+        var entered = false;
+        try
+        {
+            await _readGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            entered = true;
+            // Steady-state supervision is a closure watch, not a protocol
+            // heartbeat. It has no operation timeout or frame budget.
+            _ = await _readCodec.ReadAsync(_pipe, cancellationToken).ConfigureAwait(false);
+            throw new InvalidDataException("unexpected-control-frame-during-steady-state");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
         catch
         {
             Fault();

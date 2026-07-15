@@ -104,6 +104,20 @@ public sealed class WindowsProcessLauncherTests
     }
 
     [Fact]
+    public async Task FloodOutputMode_DrainsBoundedOutputWithoutDeadlock()
+    {
+        var input = Enumerable.Repeat((byte)'a', 256 * 1024).ToArray();
+        using var job = WindowsJobObject.CreateKillOnClose();
+        await using var launched = await CreateLauncher().LaunchAsync(
+            CreateSpecification(["flood-output"]) with { StandardInput = input },
+            job,
+            CancellationToken.None);
+
+        Assert.Equal(0, await launched.Completion.WaitAsync(Deadline));
+        Assert.EndsWith($"\n{input.Length}\n", launched.StandardOutput.Snapshot(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task DisposeAsync_CancelsChildThatNeverReadsStandardInputWithoutDeadlock()
     {
         using var job = WindowsJobObject.CreateKillOnClose();
@@ -116,6 +130,26 @@ public sealed class WindowsProcessLauncherTests
             CancellationToken.None);
 
         await launched.DisposeAsync().AsTask().WaitAsync(Deadline);
+    }
+
+    [Fact]
+    public async Task ForceCloseAfterJobClose_SynchronouslyReleasesProcessAndPipeResources()
+    {
+        using var job = WindowsJobObject.CreateKillOnClose();
+        var launched = await CreateLauncher().LaunchAsync(
+            CreateSpecification(["hold"]) with
+            {
+                StandardInput = new byte[WindowsProcessLauncher.MaximumStandardInputBytes],
+            },
+            job,
+            CancellationToken.None);
+        var process = Assert.IsType<WindowsSupervisedProcess>(launched);
+
+        job.Dispose();
+        process.ForceCloseAfterJobClose();
+
+        Assert.True(process.ProcessHandle.IsClosed);
+        await process.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromMilliseconds(100));
     }
 
     [Fact]

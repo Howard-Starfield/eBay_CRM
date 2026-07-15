@@ -162,6 +162,8 @@ public sealed class PostgresRuntimeTests
 
         Assert.Equal(PostgreSqlOperationOutcome.Failed, result.Outcome);
         Assert.Null(result.Identity);
+        Assert.False(await cluster.Runtime.RepairConclusiveStalePidFileAsync());
+        Assert.True(File.Exists(cluster.Paths.PostmasterPidFile));
     }
 
     [PostgresFact, Trait("Category", "Postgres")]
@@ -172,6 +174,8 @@ public sealed class PostgresRuntimeTests
         var corruptResult = await corrupt.Runtime.StartAsync();
         Assert.Equal(PostgreSqlOperationOutcome.Failed, corruptResult.Outcome);
         Assert.Equal("postmaster-pid-malformed", corruptResult.ReasonCode);
+        Assert.False(await corrupt.Runtime.RepairConclusiveStalePidFileAsync());
+        Assert.True(File.Exists(corrupt.Paths.PostmasterPidFile));
 
         await using var stale = await PostgresTestCluster.CreateAsync();
         await File.WriteAllTextAsync(stale.Paths.PostmasterPidFile,
@@ -179,6 +183,8 @@ public sealed class PostgresRuntimeTests
         var staleResult = await stale.Runtime.StartAsync();
         Assert.Equal(PostgreSqlOperationOutcome.Failed, staleResult.Outcome);
         Assert.Equal("postmaster-pid-stale", staleResult.ReasonCode);
+        Assert.True(await stale.Runtime.RepairConclusiveStalePidFileAsync());
+        Assert.False(File.Exists(stale.Paths.PostmasterPidFile));
     }
 
     [PostgresFact, Trait("Category", "Postgres")]

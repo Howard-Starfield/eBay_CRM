@@ -37,6 +37,9 @@ public sealed class PostgresRuntime :
     private bool _requiresStartQuietReconciliation;
     private RuntimeState _state;
 
+    internal IPostmasterProcessProbe ProcessProbeForTests { get; set; } =
+        WindowsPostmasterProcessProbe.Instance;
+
     public PostgresRuntime(
         PostgresBinaryLayout layout,
         PostgresClusterPaths paths,
@@ -235,6 +238,51 @@ public sealed class PostgresRuntime :
         finally
         {
             if (command is not null) await command.DisposeAsync().ConfigureAwait(false);
+            _gate.Release();
+        }
+    }
+
+    public async Task<bool> RepairConclusiveStalePidFileAsync(CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_state != RuntimeState.Stopped)
+            {
+                return false;
+            }
+
+            return PostmasterPidFileRepair.TryRepair(
+                _paths.PostmasterPidFile,
+                _paths.DataDirectory,
+                _port,
+                ProcessProbeForTests,
+                cancellationToken);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<bool> RepairExitedRetainedPidFileAsync(
+        PostgresInstanceIdentity identity,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(identity);
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (!identity.HasExited)
+            {
+                return false;
+            }
+
+            DeleteReconciledPidFile(identity);
+            return !File.Exists(_paths.PostmasterPidFile);
+        }
+        finally
+        {
             _gate.Release();
         }
     }
@@ -539,6 +587,33 @@ public sealed class PostgresRuntime :
             if (_identity is null || _identity.HasExited) TrimLogIfNeeded();
         }
         finally { _gate.Release(); _gate.Dispose(); }
+    }
+
+    public void ForceCloseAfterJobClose()
+    {
+        // Escalation has already closed the outer postmaster Job. Close any
+        // helper-command Jobs synchronously and release retained identities;
+        // never start an uncancellable asynchronous disposal after the budget.
+        ForceCloseCommand(_pendingStartCommand);
+        ForceCloseCommand(_pendingStopCommand);
+        _pendingStartCommand = null;
+        _pendingStopCommand = null;
+        _identity?.Dispose();
+        _identity = null;
+        _state = RuntimeState.Stopped;
+    }
+
+    private static void ForceCloseCommand(ISupervisedProcess? command)
+    {
+        switch (command)
+        {
+            case OwnedProcessGroupCommand owned:
+                owned.ForceCloseAfterJobClose();
+                break;
+            case WindowsSupervisedProcess windows:
+                windows.ForceCloseAfterJobClose();
+                break;
+        }
     }
 
     private async Task<PostgresSqlProbe> ProbeCoreAsync(PostgresInstanceIdentity identity, TimeSpan timeout, CancellationToken cancellationToken)
@@ -982,8 +1057,17 @@ public sealed class PostgresRuntime :
         public async ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-            try { await _inner.DisposeAsync().ConfigureAwait(false); }
-            finally { _job.Dispose(); }
+            _job.Dispose();
+            await _inner.DisposeAsync().ConfigureAwait(false);
+        }
+
+        internal void ForceCloseAfterJobClose()
+        {
+            _job.Dispose();
+            if (_inner is WindowsSupervisedProcess windows)
+            {
+                windows.ForceCloseAfterJobClose();
+            }
         }
     }
 

@@ -57,5 +57,37 @@ public sealed class WindowsJobObjectTests
         await process.Completion.WaitAsync(Deadline);
     }
 
+    [Fact]
+    public async Task DocumentedGrandchildAndHeldJobHandleModes_AreContainedByTheJob()
+    {
+        var job = WindowsJobObject.CreateKillOnClose();
+        await using var launched = await WindowsProcessLauncherTests.CreateLauncher().LaunchAsync(
+            WindowsProcessLauncherTests.CreateSpecification(["grandchild"]),
+            job,
+            CancellationToken.None);
+        var process = Assert.IsType<WindowsSupervisedProcess>(launched);
+
+        await process.StandardOutputLineAvailable.WaitAsync(Deadline);
+        var announcement = JsonSerializer.Deserialize<GrandchildAnnouncement>(
+            process.StandardOutput.Snapshot());
+        Assert.NotNull(announcement);
+        using var grandchild = Process.GetProcessById(announcement.ProcessId);
+        _ = grandchild.SafeHandle;
+        Assert.True(job.Contains(grandchild.SafeHandle));
+
+        job.Dispose();
+
+        await process.Completion.WaitAsync(Deadline);
+        await grandchild.WaitForExitAsync().WaitAsync(Deadline);
+
+        using var heldJob = WindowsJobObject.CreateKillOnClose();
+        await using var held = await WindowsProcessLauncherTests.CreateLauncher().LaunchAsync(
+            WindowsProcessLauncherTests.CreateSpecification(["hold-job-handle"]),
+            heldJob,
+            CancellationToken.None);
+        heldJob.Dispose();
+        await held.Completion.WaitAsync(Deadline);
+    }
+
     private sealed record GrandchildAnnouncement(int ProcessId);
 }

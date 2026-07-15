@@ -13,4 +13,11 @@
     <ProjectReference Include="..\HowardLab.EbayCrm.AppHost.Windows\HowardLab.EbayCrm.AppHost.Windows.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Content Include="..\..\runtime\migrations\0001_apphost_control.sql"
+             Link="migrations\0001_apphost_control.sql"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

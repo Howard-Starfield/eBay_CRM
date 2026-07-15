@@ -110,6 +110,27 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
         }
     }
 
+    internal void ForceCloseAfterJobClose()
+    {
+        lock (_disposeGate)
+        {
+            if (_disposeTask is not null)
+            {
+                return;
+            }
+
+            _completionCancellation.Cancel();
+            _drainCancellation.Cancel();
+            _standardOutputStream.Dispose();
+            _standardErrorStream.Dispose();
+            _standardInputStream?.Dispose();
+            ProcessHandle.Dispose();
+            _drainCancellation.Dispose();
+            _completionCancellation.Dispose();
+            _disposeTask = Task.CompletedTask;
+        }
+    }
+
     private async Task DisposeCoreAsync()
     {
         try
@@ -304,7 +325,21 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
         SafeProcessHandle processHandle,
         CancellationToken cancellationToken)
     {
-        var waitHandle = new ProcessWaitHandle(processHandle);
+        var currentProcess = NativeMethods.GetCurrentProcess();
+        if (!NativeMethods.DuplicateProcessHandle(
+            currentProcess,
+            processHandle,
+            currentProcess,
+            out var duplicatedValue,
+            desiredAccess: 0,
+            inheritHandle: false,
+            NativeMethods.DuplicateSameAccess))
+        {
+            throw new Win32Exception(Marshal.GetLastPInvokeError());
+        }
+
+        var duplicatedHandle = new SafeProcessHandle(duplicatedValue, ownsHandle: true);
+        var waitHandle = new ProcessWaitHandle(duplicatedHandle);
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var registration = ThreadPool.RegisterWaitForSingleObject(
             waitHandle,
@@ -318,14 +353,16 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
             completion.Task,
             registration,
             waitHandle,
-            cancellationRegistration);
+            cancellationRegistration,
+            duplicatedHandle);
     }
 
     private static async Task AwaitAndDisposeAsync(
         Task completion,
         RegisteredWaitHandle registration,
         WaitHandle waitHandle,
-        CancellationTokenRegistration cancellationRegistration)
+        CancellationTokenRegistration cancellationRegistration,
+        SafeProcessHandle duplicatedHandle)
     {
         try
         {
@@ -336,6 +373,7 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
             cancellationRegistration.Dispose();
             registration.Unregister(waitObject: null);
             waitHandle.Dispose();
+            duplicatedHandle.Dispose();
         }
     }
 

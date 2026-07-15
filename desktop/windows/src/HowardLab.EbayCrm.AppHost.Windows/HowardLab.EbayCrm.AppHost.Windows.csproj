@@ -8,6 +8,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\HowardLab.EbayCrm.AppHost.Core\HowardLab.EbayCrm.AppHost.Core.csproj" />
     <ProjectReference Include="..\HowardLab.EbayCrm.AppHost.Protocol\HowardLab.EbayCrm.AppHost.Protocol.csproj" />
   </ItemGroup>

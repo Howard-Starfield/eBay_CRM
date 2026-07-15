@@ -84,6 +84,24 @@ public sealed class NamedPipeControlClient : IAsyncDisposable
         }
     }
 
+    public async Task<ControlEnvelope> ReadCommandAsync(CancellationToken cancellationToken = default)
+    {
+        EnsureConnected();
+        try
+        {
+            return await _codec.ReadAsync(_transport.Stream, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            _state = ClientState.Faulted;
+            throw;
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_state == ClientState.Disposed)

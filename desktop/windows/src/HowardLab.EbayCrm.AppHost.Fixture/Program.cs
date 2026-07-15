@@ -9,10 +9,25 @@ using HowardLab.EbayCrm.AppHost.Core.Processes;
 using HowardLab.EbayCrm.AppHost.Protocol.Control;
 using HowardLab.EbayCrm.AppHost.Windows.Postgres;
 using HowardLab.EbayCrm.AppHost.Windows.Processes;
+using HowardLab.EbayCrm.AppHost.Fixture;
 
 if (args.Length == 0)
 {
     return 2;
+}
+
+if (FixtureModeParser.TryParse(args[0], out var fixtureMode) &&
+    fixtureMode is FixtureMode.Server or FixtureMode.Worker or FixtureMode.IgnoreShutdown or
+        FixtureMode.CrashAfterHello or FixtureMode.CrashBeforeHello or FixtureMode.HealthMismatch or
+        FixtureMode.PipeTimeout or FixtureMode.ControlDisconnect or FixtureMode.HealthDrop)
+{
+    return await FixtureControlLoop.RunAsync(fixtureMode, args[1..]);
+}
+
+if (FixtureModeParser.TryParse(args[0], out fixtureMode) &&
+    fixtureMode is FixtureMode.Grandchild or FixtureMode.EchoLaunch or FixtureMode.FloodOutput or FixtureMode.HoldJobHandle)
+{
+    return await FixtureStandaloneModes.RunAsync(fixtureMode, args[1..]);
 }
 
 switch (args[0])

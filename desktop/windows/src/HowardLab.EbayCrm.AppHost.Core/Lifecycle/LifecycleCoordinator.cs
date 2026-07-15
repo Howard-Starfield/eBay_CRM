@@ -72,6 +72,8 @@ public sealed class LifecycleCoordinator
             OperationTimedOut value => Timeout(previous, value),
             Reconciled value => Reconcile(previous, value),
             ShutdownCompleted value => ShutdownCompletedTransition(previous, value),
+            ShutdownFailed value => ShutdownFailedTransition(previous, value),
+            RecoveryFailed value => RecoveryFailedTransition(previous, value),
             _ => Ignored(previous, "UnexpectedEvent"),
         };
     }
@@ -374,7 +376,7 @@ public sealed class LifecycleCoordinator
                 previous,
                 [
                     Command(LifecycleCommandType.EscalateJob, @event.Value, @event.OperationId, LifecycleDeadlineKey.None),
-                    Command(LifecycleCommandType.EnterFault, @event.Value, @event.OperationId, LifecycleDeadlineKey.None),
+                    Command(LifecycleCommandType.EnterFault, @event.Value, @event.OperationId, LifecycleDeadlineKey.None, "database-stop-reconciliation-timed-out"),
                 ],
                 false,
                 "DatabaseStopReconciliationTimedOut");
@@ -395,7 +397,15 @@ public sealed class LifecycleCoordinator
 
             if (@event.State == ReconciledState.Stopped)
             {
-                return Fault(previous, @event.Value, "DatabaseStartReconciledStopped");
+                var operationId = Guid.NewGuid();
+                _currentOperationId = operationId;
+                var database = CreateGeneration(RuntimeRole.Database, operationId);
+                State = RuntimeState.StartingDatabase;
+                return Accepted(previous, Command(
+                    LifecycleCommandType.StartDatabase,
+                    database,
+                    operationId,
+                    LifecycleDeadlineKey.DatabaseStart));
             }
 
             return Accepted(previous);
@@ -433,6 +443,42 @@ public sealed class LifecycleCoordinator
         return Accepted(previous);
     }
 
+    private TransitionResult ShutdownFailedTransition(RuntimeState previous, ShutdownFailed @event)
+    {
+        if (@event.OperationId != _currentOperationId)
+        {
+            return Ignored(previous, "StaleOperation");
+        }
+
+        if (State is not (RuntimeState.Stopping or RuntimeState.ReconcilingDatabaseStop))
+        {
+            return Ignored(previous, "UnexpectedEvent");
+        }
+
+        State = RuntimeState.Faulted;
+        if (_faultEmitted)
+        {
+            return Ignored(previous, "FaultAlreadyEmitted");
+        }
+
+        _faultEmitted = true;
+        return Result(
+            previous,
+            [Command(LifecycleCommandType.EnterFault, null, @event.OperationId, LifecycleDeadlineKey.None, @event.ReasonCode)],
+            false,
+            @event.ReasonCode);
+    }
+
+    private TransitionResult RecoveryFailedTransition(RuntimeState previous, RecoveryFailed @event)
+    {
+        if (_stopAccepted || State is RuntimeState.Stopped or RuntimeState.Stopping or RuntimeState.Faulted)
+        {
+            return Ignored(previous, _stopAccepted ? "StopAlreadyAccepted" : "RecoveryNotAllowed");
+        }
+
+        return Fault(previous, null, @event.ReasonCode);
+    }
+
     private TransitionResult Fault(RuntimeState previous, ProcessGeneration? generation, string reasonCode)
     {
         State = RuntimeState.Faulted;
@@ -442,7 +488,7 @@ public sealed class LifecycleCoordinator
         }
 
         _faultEmitted = true;
-        return Result(previous, [Command(LifecycleCommandType.EnterFault, generation, _currentOperationId, LifecycleDeadlineKey.None)], false, reasonCode);
+        return Result(previous, [Command(LifecycleCommandType.EnterFault, generation, _currentOperationId, LifecycleDeadlineKey.None, reasonCode)], false, reasonCode);
     }
 
     private ProcessGeneration CreateGeneration(RuntimeRole role, Guid operationId)
@@ -486,9 +532,10 @@ public sealed class LifecycleCoordinator
         LifecycleCommandType type,
         ProcessGeneration? generation,
         Guid operationId,
-        LifecycleDeadlineKey deadlineKey)
+        LifecycleDeadlineKey deadlineKey,
+        string? reasonCode = null)
     {
-        return new LifecycleCommand(type, generation, operationId, deadlineKey);
+        return new LifecycleCommand(type, generation, operationId, deadlineKey, reasonCode);
     }
 
     private readonly record struct FailureKey(

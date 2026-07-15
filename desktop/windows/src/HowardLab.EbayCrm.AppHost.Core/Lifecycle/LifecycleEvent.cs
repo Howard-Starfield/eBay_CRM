@@ -30,6 +30,10 @@ public sealed record MigrationCompleted(Guid OperationId) : LifecycleEvent((Proc
 
 public sealed record ShutdownCompleted(Guid OperationId) : LifecycleEvent((ProcessGeneration?)null);
 
+public sealed record ShutdownFailed(Guid OperationId, string ReasonCode) : LifecycleEvent((ProcessGeneration?)null);
+
+public sealed record RecoveryFailed(string ReasonCode) : LifecycleEvent((ProcessGeneration?)null);
+
 public enum ReconciledState
 {
     Running,

@@ -201,6 +201,17 @@ internal static unsafe partial class NativeMethods
         [MarshalAs(UnmanagedType.Bool)] bool inheritHandle,
         uint options);
 
+    [LibraryImport("kernel32.dll", EntryPoint = "DuplicateHandle", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool DuplicateProcessHandle(
+        IntPtr sourceProcess,
+        SafeProcessHandle sourceHandle,
+        IntPtr targetProcess,
+        out IntPtr targetHandle,
+        uint desiredAccess,
+        [MarshalAs(UnmanagedType.Bool)] bool inheritHandle,
+        uint options);
+
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static partial bool GetProcessTimes(

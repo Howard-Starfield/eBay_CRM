@@ -272,6 +272,11 @@ public sealed class ControlSessionValidator
             return ControlValidationResult.Reject(ControlValidationReasonCode.BuildIdentityMismatch);
         }
 
+        if (!string.Equals(health.GenerationNonce, _expected.CapabilityNonce, StringComparison.Ordinal))
+        {
+            return ControlValidationResult.Reject(ControlValidationReasonCode.CapabilityNonceMismatch);
+        }
+
         return ControlValidationResult.Accepted;
     }
 
