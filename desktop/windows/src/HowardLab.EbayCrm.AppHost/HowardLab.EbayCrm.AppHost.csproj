@@ -11,6 +11,8 @@
     <ProjectReference Include="..\HowardLab.EbayCrm.AppHost.Core\HowardLab.EbayCrm.AppHost.Core.csproj" />
     <ProjectReference Include="..\HowardLab.EbayCrm.AppHost.Protocol\HowardLab.EbayCrm.AppHost.Protocol.csproj" />
     <ProjectReference Include="..\HowardLab.EbayCrm.AppHost.Windows\HowardLab.EbayCrm.AppHost.Windows.csproj" />
+    <ProjectReference Include="..\HowardLab.EbayCrm.AppHost.Fixture\HowardLab.EbayCrm.AppHost.Fixture.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 
   <ItemGroup>
@@ -19,5 +21,48 @@
              CopyToOutputDirectory="PreserveNewest"
              CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
+
+  <Target Name="GenerateTrustedFixtureArtifactManifest"
+          BeforeTargets="AssignTargetPaths"
+          DependsOnTargets="ResolveProjectReferences">
+    <PropertyGroup>
+      <_FixtureOutputDirectory>$(MSBuildProjectDirectory)\..\HowardLab.EbayCrm.AppHost.Fixture\bin\$(Configuration)\net10.0-windows\$(RuntimeIdentifier)</_FixtureOutputDirectory>
+      <_FixtureManifestPath>$(IntermediateOutputPath)trusted-fixture-artifacts.txt</_FixtureManifestPath>
+    </PropertyGroup>
+    <ItemGroup>
+      <_TrustedFixtureArtifact Include="$(_FixtureOutputDirectory)\*"
+                               Exclude="$(_FixtureOutputDirectory)\*.pdb" />
+    </ItemGroup>
+    <Error Condition="!Exists('%(_TrustedFixtureArtifact.Identity)')"
+           Text="Trusted fixture artifact is missing: %(_TrustedFixtureArtifact.Identity)" />
+    <GetFileHash Files="@(_TrustedFixtureArtifact)" Algorithm="SHA256">
+      <Output TaskParameter="Items" ItemName="_HashedTrustedFixtureArtifact" />
+    </GetFileHash>
+    <ItemGroup>
+      <_TrustedFixtureManifestLine Include="%(_HashedTrustedFixtureArtifact.Filename)%(_HashedTrustedFixtureArtifact.Extension)|%(_HashedTrustedFixtureArtifact.FileHash)" />
+      <EmbeddedResource Include="$(_FixtureManifestPath)"
+                        LogicalName="HowardLab.EbayCrm.AppHost.TrustedFixtureArtifacts" />
+    </ItemGroup>
+    <WriteLinesToFile File="$(_FixtureManifestPath)"
+                      Lines="@(_TrustedFixtureManifestLine)"
+                      Overwrite="true"
+                      WriteOnlyWhenDifferent="true" />
+  </Target>
+
+  <Target Name="CopyTrustedFixtureArtifacts"
+          AfterTargets="Build"
+          DependsOnTargets="GenerateTrustedFixtureArtifactManifest">
+    <Copy SourceFiles="@(_TrustedFixtureArtifact)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopyTrustedFixtureArtifactsToPublishDirectory"
+          AfterTargets="Publish"
+          DependsOnTargets="GenerateTrustedFixtureArtifactManifest">
+    <Copy SourceFiles="@(_TrustedFixtureArtifact)"
+          DestinationFolder="$(PublishDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
 
 </Project>

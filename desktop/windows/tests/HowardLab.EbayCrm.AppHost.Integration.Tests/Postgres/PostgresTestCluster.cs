@@ -428,6 +428,7 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
         internal string? LastStartLogFile { get; private set; }
         internal bool BlockNextStartLogPath { get; set; }
         internal ISupervisedProcess? LastMigrationProcess { get; private set; }
+        internal ISupervisedProcess? LastStopProcess { get; private set; }
         internal TaskCompletionSource MigrationLaunchObserved { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource StopLaunchObserved { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -491,7 +492,8 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
             if (LeaveNextStopPending)
             {
                 LeaveNextStopPending = false;
-                return InjectedProcess.Pending();
+                LastStopProcess = InjectedProcess.Pending();
+                return LastStopProcess;
             }
             return await inner.LaunchAsync(specification, processGroup, cancellationToken);
         }

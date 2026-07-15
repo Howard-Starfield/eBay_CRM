@@ -85,6 +85,11 @@ public sealed class AppHostRecoveryTests
     [PostgresTheory, Trait("Category", "AppHost")]
     [InlineData("control-disconnect")]
     [InlineData("health-drop")]
+    [InlineData("health-stale-build")]
+    [InlineData("health-stale-protocol")]
+    [InlineData("health-stale-generation")]
+    [InlineData("health-stale-nonce")]
+    [InlineData("health-unhealthy")]
     public async Task LiveWorkerSignalFailure_IsGenerationFencedIntoWorkerRecovery(string fixtureMode)
     {
         var profile = Path.Combine(Path.GetTempPath(), $"ebaycrm-task9-disconnect-{Guid.NewGuid():N}");

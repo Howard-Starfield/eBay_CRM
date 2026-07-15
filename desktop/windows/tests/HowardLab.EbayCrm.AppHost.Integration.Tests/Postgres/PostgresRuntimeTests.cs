@@ -342,6 +342,28 @@ public sealed class PostgresRuntimeTests
     }
 
     [PostgresFact, Trait("Category", "Postgres")]
+    public async Task StopCancellationAfterLaunch_IsMappedToIndeterminateAndReconciled()
+    {
+        await using var cluster = await PostgresTestCluster.CreateAsync();
+        var started = await cluster.Runtime.StartAsync();
+        var identity = Assert.IsType<PostgresInstanceIdentity>(started.Identity);
+        cluster.Identity = identity;
+        cluster.Launcher.LeaveNextStopPending = true;
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(250));
+
+        var outcome = await cluster.Runtime.StopFastAsync(identity, cancellation.Token);
+
+        Assert.Equal(PostgreSqlOperationOutcome.TimedOutIndeterminate, outcome);
+        await cluster.Launcher.StopLaunchObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await cluster.Launcher.LastStopProcess!.DisposeAsync();
+        Assert.Equal(PostgreSqlOperationOutcome.ReconciledRunning,
+            await cluster.Runtime.ReconcileStopAsync(identity));
+        Assert.Equal(PostgreSqlOperationOutcome.Completed, await cluster.Runtime.StopFastAsync(identity));
+        Assert.Equal(PostgreSqlOperationOutcome.ReconciledStopped,
+            await cluster.Runtime.ReconcileStopAsync(identity));
+    }
+
+    [PostgresFact, Trait("Category", "Postgres")]
     public async Task NonzeroCompletedStop_ReconcilesRunningAndAllowsRetry()
     {
         await using var cluster = await PostgresTestCluster.CreateAsync();

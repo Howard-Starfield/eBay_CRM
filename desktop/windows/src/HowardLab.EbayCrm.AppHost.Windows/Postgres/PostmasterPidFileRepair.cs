@@ -46,16 +46,30 @@ internal static class PostmasterPidFileRepair
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(processProbe);
-        if (!File.Exists(path) ||
-            (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+        using var handle = NativeMethods.CreateFile(
+            path,
+            NativeMethods.GenericRead | NativeMethods.Delete,
+            NativeMethods.FileShareRead,
+            IntPtr.Zero,
+            NativeMethods.OpenExisting,
+            NativeMethods.FileFlagOpenReparsePoint,
+            IntPtr.Zero);
+        if (handle.IsInvalid ||
+            !NativeMethods.GetFileInformationByHandleEx(
+                handle,
+                NativeMethods.FileAttributeTagInfo,
+                out var attributes,
+                checked((uint)Marshal.SizeOf<NativeMethods.FileAttributeTagInformation>())) ||
+            ((FileAttributes)attributes.FileAttributes & FileAttributes.ReparsePoint) != 0)
         {
             return false;
         }
 
+        using var stream = new FileStream(handle, FileAccess.Read, bufferSize: 4096, isAsync: false);
         PostmasterPidFile parsed;
         try
         {
-            parsed = PostmasterPidFile.Read(path, expectedDataDirectory);
+            parsed = PostmasterPidFile.Read(stream, expectedDataDirectory);
         }
         catch (PostmasterPidFileException)
         {
@@ -72,7 +86,8 @@ internal static class PostmasterPidFileRepair
         PostmasterPidFile confirmed;
         try
         {
-            confirmed = PostmasterPidFile.Read(path, expectedDataDirectory);
+            stream.Position = 0;
+            confirmed = PostmasterPidFile.Read(stream, expectedDataDirectory);
         }
         catch (PostmasterPidFileException)
         {
@@ -85,7 +100,11 @@ internal static class PostmasterPidFileRepair
             return false;
         }
 
-        File.Delete(path);
-        return true;
+        var disposition = new NativeMethods.FileDispositionInformation { DeleteFile = 1 };
+        return NativeMethods.SetFileInformationByHandle(
+            handle,
+            NativeMethods.FileDispositionInfo,
+            ref disposition,
+            checked((uint)Marshal.SizeOf<NativeMethods.FileDispositionInformation>()));
     }
 }

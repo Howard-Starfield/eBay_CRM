@@ -73,6 +73,34 @@ public sealed class WindowsJobObject : IProcessGroup, IProcessTreeTerminator
         return new SafeJobHandle(duplicate, ownsHandle: true);
     }
 
+    internal void DuplicateIntoProcessForTests(SafeProcessHandle targetProcess)
+    {
+        ArgumentNullException.ThrowIfNull(targetProcess);
+        var targetLease = false;
+        try
+        {
+            targetProcess.DangerousAddRef(ref targetLease);
+            if (!targetLease || !NativeMethods.DuplicateHandle(
+                NativeMethods.GetCurrentProcess(),
+                _handle,
+                targetProcess.DangerousGetHandle(),
+                out _,
+                desiredAccess: 0,
+                inheritHandle: false,
+                NativeMethods.DuplicateSameAccess))
+            {
+                throw new Win32Exception(Marshal.GetLastPInvokeError());
+            }
+        }
+        finally
+        {
+            if (targetLease)
+            {
+                targetProcess.DangerousRelease();
+            }
+        }
+    }
+
     NativeCallResult IProcessTreeTerminator.TerminateTree(uint exitCode) =>
         TerminateTree(exitCode);
 

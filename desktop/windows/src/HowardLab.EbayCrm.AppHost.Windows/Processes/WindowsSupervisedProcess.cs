@@ -26,6 +26,8 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
     private readonly IProcessTreeTerminator _job;
     private readonly object _disposeGate = new();
     private Task? _disposeTask;
+    private int _resourcesTerminalized;
+    private int _forceCloseStarted;
 
     internal WindowsSupervisedProcess(
         SupervisedProcessIdentity identity,
@@ -92,7 +94,13 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
     {
         get
         {
-            var result = NativeMethods.WaitForSingleObject(ProcessHandle, milliseconds: 0);
+            using var process = DuplicateRetainedProcessHandle();
+            if (process is null)
+            {
+                return true;
+            }
+
+            var result = NativeMethods.WaitForSingleObject(process, milliseconds: 0);
             return result switch
             {
                 NativeMethods.WaitObject0 => true,
@@ -111,23 +119,64 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
     }
 
     internal void ForceCloseAfterJobClose()
+        => ForceCloseAfterJobClose(CancellationToken.None);
+
+    internal void ForceCloseAfterJobClose(CancellationToken cancellationToken)
     {
+        if (Interlocked.Exchange(ref _forceCloseStarted, 1) != 0)
+        {
+            return;
+        }
+
         lock (_disposeGate)
         {
-            if (_disposeTask is not null)
-            {
-                return;
-            }
+            _disposeTask ??= Task.CompletedTask;
+        }
 
-            _completionCancellation.Cancel();
-            _drainCancellation.Cancel();
-            _standardOutputStream.Dispose();
-            _standardErrorStream.Dispose();
-            _standardInputStream?.Dispose();
-            ProcessHandle.Dispose();
-            _drainCancellation.Dispose();
-            _completionCancellation.Dispose();
-            _disposeTask = Task.CompletedTask;
+        TerminalizeResources();
+        try
+        {
+            Completion.WaitAsync(cancellationToken).GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+
+    internal void TerminateAndForceCloseAfterJobClose(CancellationToken cancellationToken)
+    {
+        using var process = DuplicateRetainedProcessHandle();
+        if (process is null)
+        {
+            ForceCloseAfterJobClose(cancellationToken);
+            return;
+        }
+
+        try
+        {
+            var wait = NativeMethods.WaitForSingleObject(process, milliseconds: 0);
+            if (wait == NativeMethods.WaitTimeout)
+            {
+                if (!NativeMethods.TerminateProcess(process, exitCode: 1) &&
+                    NativeMethods.WaitForSingleObject(process, milliseconds: 0) != NativeMethods.WaitObject0)
+                {
+                    throw new Win32Exception(Marshal.GetLastPInvokeError());
+                }
+
+                using var processWait = new ProcessWaitHandle(process);
+                _ = WaitHandle.WaitAny([processWait, cancellationToken.WaitHandle]);
+            }
+            else if (wait != NativeMethods.WaitObject0)
+            {
+                throw new Win32Exception(Marshal.GetLastPInvokeError());
+            }
+        }
+        finally
+        {
+            ForceCloseAfterJobClose(cancellationToken);
         }
     }
 
@@ -137,8 +186,14 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
         {
             if (!HasExited)
             {
+                using var cleanupHandle = DuplicateRetainedProcessHandle();
+                if (cleanupHandle is null)
+                {
+                    return;
+                }
+
                 var cleanup = await Task.Run(
-                    () => _cleanupPolicy.Cleanup(ProcessHandle, _job)).ConfigureAwait(false);
+                    () => _cleanupPolicy.Cleanup(cleanupHandle, _job)).ConfigureAwait(false);
                 if (!cleanup.Signaled)
                 {
                     throw new ProcessCleanupException(
@@ -150,19 +205,99 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
                 }
             }
 
-            await Completion.ConfigureAwait(false);
+            try
+            {
+                await Completion.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (Volatile.Read(ref _forceCloseStarted) != 0)
+            {
+            }
             await _standardInputWrite.ConfigureAwait(false);
         }
         finally
         {
-            _completionCancellation.Cancel();
-            _drainCancellation.Cancel();
-            _standardOutputStream.Dispose();
-            _standardErrorStream.Dispose();
-            _standardInputStream?.Dispose();
+            TerminalizeResources();
+        }
+    }
+
+    private void TerminalizeResources()
+    {
+        if (Interlocked.Exchange(ref _resourcesTerminalized, 1) != 0)
+        {
+            return;
+        }
+
+        _completionCancellation.Cancel();
+        _drainCancellation.Cancel();
+        _standardOutputStream.Dispose();
+        _standardErrorStream.Dispose();
+        _standardInputStream?.Dispose();
+        ProcessHandle.Dispose();
+        _ = DisposeCancellationSourcesWhenQuiescentAsync();
+    }
+
+    private async Task DisposeCancellationSourcesWhenQuiescentAsync()
+    {
+        try
+        {
+            await Task.WhenAll(
+                Completion,
+                _standardOutputDrain,
+                _standardErrorDrain,
+                _standardInputWrite).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Terminalization owns the task outcomes; cancellation and closed pipes are expected here.
+        }
+        finally
+        {
             _drainCancellation.Dispose();
             _completionCancellation.Dispose();
-            ProcessHandle.Dispose();
+        }
+    }
+
+    private SafeProcessHandle? DuplicateRetainedProcessHandle()
+    {
+        var lease = false;
+        try
+        {
+            ProcessHandle.DangerousAddRef(ref lease);
+            if (!lease || ProcessHandle.IsClosed || ProcessHandle.IsInvalid)
+            {
+                return null;
+            }
+
+            var currentProcess = NativeMethods.GetCurrentProcess();
+            if (!NativeMethods.DuplicateProcessHandle(
+                currentProcess,
+                ProcessHandle,
+                currentProcess,
+                out var duplicate,
+                desiredAccess: 0,
+                inheritHandle: false,
+                NativeMethods.DuplicateSameAccess))
+            {
+                if (Volatile.Read(ref _resourcesTerminalized) != 0)
+                {
+                    return null;
+                }
+
+                throw new Win32Exception(Marshal.GetLastPInvokeError());
+            }
+
+            return new SafeProcessHandle(duplicate, ownsHandle: true);
+        }
+        catch (ObjectDisposedException) when (Volatile.Read(ref _resourcesTerminalized) != 0)
+        {
+            return null;
+        }
+        finally
+        {
+            if (lease)
+            {
+                ProcessHandle.DangerousRelease();
+            }
         }
     }
 
@@ -193,8 +328,9 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
 
     private async Task<int> CompleteAsync(CancellationToken cancellationToken)
     {
-        await WaitForExitAsync(ProcessHandle, cancellationToken).ConfigureAwait(false);
-        if (!NativeMethods.GetExitCodeProcess(ProcessHandle, out var exitCode))
+        using var completionHandle = DuplicateProcessHandle(ProcessHandle);
+        await WaitForExitAsync(completionHandle, cancellationToken).ConfigureAwait(false);
+        if (!NativeMethods.GetExitCodeProcess(completionHandle, out var exitCode))
         {
             throw new Win32Exception(Marshal.GetLastPInvokeError());
         }
@@ -325,20 +461,7 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
         SafeProcessHandle processHandle,
         CancellationToken cancellationToken)
     {
-        var currentProcess = NativeMethods.GetCurrentProcess();
-        if (!NativeMethods.DuplicateProcessHandle(
-            currentProcess,
-            processHandle,
-            currentProcess,
-            out var duplicatedValue,
-            desiredAccess: 0,
-            inheritHandle: false,
-            NativeMethods.DuplicateSameAccess))
-        {
-            throw new Win32Exception(Marshal.GetLastPInvokeError());
-        }
-
-        var duplicatedHandle = new SafeProcessHandle(duplicatedValue, ownsHandle: true);
+        var duplicatedHandle = DuplicateProcessHandle(processHandle);
         var waitHandle = new ProcessWaitHandle(duplicatedHandle);
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var registration = ThreadPool.RegisterWaitForSingleObject(
@@ -355,6 +478,24 @@ public sealed class WindowsSupervisedProcess : ISupervisedProcess
             waitHandle,
             cancellationRegistration,
             duplicatedHandle);
+    }
+
+    private static SafeProcessHandle DuplicateProcessHandle(SafeProcessHandle processHandle)
+    {
+        var currentProcess = NativeMethods.GetCurrentProcess();
+        if (!NativeMethods.DuplicateProcessHandle(
+            currentProcess,
+            processHandle,
+            currentProcess,
+            out var duplicatedValue,
+            desiredAccess: 0,
+            inheritHandle: false,
+            NativeMethods.DuplicateSameAccess))
+        {
+            throw new Win32Exception(Marshal.GetLastPInvokeError());
+        }
+
+        return new SafeProcessHandle(duplicatedValue, ownsHandle: true);
     }
 
     private static async Task AwaitAndDisposeAsync(

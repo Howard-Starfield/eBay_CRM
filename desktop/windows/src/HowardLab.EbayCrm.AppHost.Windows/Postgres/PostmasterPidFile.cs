@@ -32,10 +32,32 @@ public sealed record PostmasterPidFile(
         }
     }
 
+    internal static PostmasterPidFile Read(Stream stream, string expectedDataDirectory)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        try
+        {
+            return Parse(ReadBounded(stream), expectedDataDirectory);
+        }
+        catch (PostmasterPidFileException)
+        {
+            throw;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            throw new PostmasterPidFileException("postmaster-pid-unavailable", error);
+        }
+    }
+
     private static string ReadBounded(string path)
     {
-        const int maxBytes = 16 * 1024;
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        return ReadBounded(stream);
+    }
+
+    private static string ReadBounded(Stream stream)
+    {
+        const int maxBytes = 16 * 1024;
         var buffer = new byte[maxBytes + 1];
         var total = 0;
         while (total < buffer.Length)

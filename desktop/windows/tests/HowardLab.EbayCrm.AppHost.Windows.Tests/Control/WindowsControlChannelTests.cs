@@ -49,6 +49,22 @@ public sealed class WindowsControlChannelTests
         Assert.Same(channel, accepted);
     }
 
+    [Fact]
+    public async Task ForceCloseAfterJobClose_SynchronouslyReleasesAuthenticatedPipeAndClientHandle()
+    {
+        await using var channel = CreateChannel();
+        using var job = WindowsJobObject.CreateKillOnClose();
+        await using var process = await LaunchControlClientAsync(channel, job, "valid");
+        await channel.AcceptAsync(process, job, CancellationToken.None).WaitAsync(Deadline);
+
+        job.Dispose();
+        channel.ForceCloseAfterJobClose();
+
+        Assert.True(channel.ResourcesClosedForTests);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            channel.SendAsync(CreateEmptyEnvelope(channel, ControlMessageType.Shutdown, Guid.NewGuid())));
+    }
+
     [Theory]
     [InlineData("wrong-nonce")]
     [InlineData("wrong-time")]

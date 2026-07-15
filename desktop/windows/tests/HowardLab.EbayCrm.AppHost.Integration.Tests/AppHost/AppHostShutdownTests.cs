@@ -33,6 +33,7 @@ public sealed class AppHostShutdownTests
         try
         {
             await runtime.Orchestrator.StartAsync().WaitAsync(TimeSpan.FromMinutes(2));
+            var started = runtime.Executor.SnapshotForTests();
             var stopwatch = Stopwatch.StartNew();
 
             await runtime.Orchestrator.StopAsync();
@@ -43,12 +44,62 @@ public sealed class AppHostShutdownTests
             Assert.False(File.Exists(Path.Combine(profile, "postgres-data", "postmaster.pid")));
             var fault = await File.ReadAllTextAsync(Path.Combine(profile, "runtime", "apphost-fault-v1.json"));
             Assert.Contains("shutdown-budget-exhausted", fault, StringComparison.Ordinal);
+            AssertProcessExited(started.ServerProcessId);
+            AssertProcessExited(started.WorkerProcessId);
         }
         finally
         {
             await runtime.Orchestrator.DisposeAsync();
             Directory.Delete(profile, recursive: true);
         }
+    }
+
+    [PostgresFact, Trait("Category", "AppHost")]
+    public async Task RemotelyHeldWorkerJobHandle_UsesRealEscalationWithinTheSharedBudget()
+    {
+        var profile = Path.Combine(Path.GetTempPath(), $"ebaycrm-task9-held-job-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(profile);
+        var runtime = AppHostComposition.CreateForTests(
+            new AppHostOptions(
+                profile,
+                Environment.GetEnvironmentVariable("EBAYCRM_POSTGRES_BIN")!,
+                Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe"),
+                ReserveLoopbackPort(),
+                AppHostMode.Run),
+            new ShutdownBudget(
+                TimeSpan.FromMilliseconds(300),
+                TimeSpan.FromMilliseconds(120),
+                TimeSpan.FromMilliseconds(60),
+                TimeSpan.FromMilliseconds(120)));
+        runtime.Executor.WorkerFixtureModeForTests = "ignore-shutdown";
+        runtime.Executor.RoleLaunchedForTests =
+            LifecycleCommandExecutor.RetainWorkerJobHandleInRoleForTests;
+        try
+        {
+            await runtime.Orchestrator.StartAsync().WaitAsync(TimeSpan.FromMinutes(2));
+            var started = runtime.Executor.SnapshotForTests();
+            var stopwatch = Stopwatch.StartNew();
+
+            await runtime.Orchestrator.StopAsync();
+
+            stopwatch.Stop();
+            Assert.Equal(RuntimeState.Faulted, runtime.Orchestrator.State);
+            Assert.InRange(stopwatch.Elapsed, TimeSpan.FromMilliseconds(280), TimeSpan.FromSeconds(2));
+            AssertProcessExited(started.ServerProcessId);
+            AssertProcessExited(started.WorkerProcessId);
+            Assert.False(File.Exists(Path.Combine(profile, "postgres-data", "postmaster.pid")));
+        }
+        finally
+        {
+            await runtime.Orchestrator.DisposeAsync();
+            Directory.Delete(profile, recursive: true);
+        }
+    }
+
+    private static void AssertProcessExited(int? processId)
+    {
+        Assert.NotNull(processId);
+        Assert.Throws<ArgumentException>(() => Process.GetProcessById(processId.Value));
     }
 
     [Fact, Trait("Category", "AppHost")]

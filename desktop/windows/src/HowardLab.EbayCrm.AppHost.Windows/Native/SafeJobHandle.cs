@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using Microsoft.Win32.SafeHandles;
 
 [assembly: InternalsVisibleTo("HowardLab.EbayCrm.AppHost.Windows.Tests")]
+[assembly: InternalsVisibleTo("HowardLab.EbayCrm.AppHost")]
 
 namespace HowardLab.EbayCrm.AppHost.Windows.Native;
 

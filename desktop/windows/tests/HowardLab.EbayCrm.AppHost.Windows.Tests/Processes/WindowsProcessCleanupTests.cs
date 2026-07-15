@@ -115,6 +115,34 @@ public sealed class WindowsProcessCleanupTests
     }
 
     [Fact]
+    public async Task ConcurrentDisposeAndForceClose_UsesSharedBoundAndFinalizesExactlyOnce()
+    {
+        var inner = new BoundedProcessCleanup(NativeProcessCleanup.Instance, TestCleanupDeadline);
+        var gated = new GatedCleanupPolicy(inner);
+        using var job = WindowsJobObject.CreateKillOnClose();
+        var launcher = CreateLauncher(gated, WindowsProcessIdentityVerifier.Instance);
+        var launched = await launcher.LaunchAsync(
+            WindowsProcessLauncherTests.CreateSpecification(["hold"]),
+            job,
+            CancellationToken.None);
+        var process = Assert.IsType<WindowsSupervisedProcess>(launched);
+        var disposal = process.DisposeAsync().AsTask();
+        await gated.Entered.Task.WaitAsync(TestDeadline);
+        using var forceBoundary = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
+        var stopwatch = Stopwatch.StartNew();
+
+        process.ForceCloseAfterJobClose(forceBoundary.Token);
+
+        stopwatch.Stop();
+        Assert.True(stopwatch.Elapsed < TimeSpan.FromMilliseconds(500));
+        Assert.True(process.ProcessHandle.IsClosed);
+        gated.Release.TrySetResult();
+        await disposal.WaitAsync(TestDeadline);
+        process.ForceCloseAfterJobClose(forceBoundary.Token);
+        Assert.Equal(1, gated.CallCount);
+    }
+
+    [Fact]
     public async Task DisposeAsync_WhenEscalationCannotSignal_ReleasesHandleAndPreservesJobContainment()
     {
         var native = new NonTerminatingCleanupNative();

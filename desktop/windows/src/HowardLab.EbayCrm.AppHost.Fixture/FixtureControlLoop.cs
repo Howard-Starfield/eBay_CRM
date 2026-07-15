@@ -89,6 +89,24 @@ public static class FixtureControlLoop
             await health.SuccessfulRequest.WaitAsync(cancellationToken).ConfigureAwait(false);
             await health.DisposeAsync().ConfigureAwait(false);
         }
+        if (mode is FixtureMode.HealthStaleBuild or
+            FixtureMode.HealthStaleProtocol or
+            FixtureMode.HealthStaleGeneration or
+            FixtureMode.HealthStaleNonce or
+            FixtureMode.HealthUnhealthy)
+        {
+            await health.SuccessfulRequest.WaitAsync(cancellationToken).ConfigureAwait(false);
+            health.UpdatePayload(healthPayload with
+            {
+                ProtocolVersion = mode == FixtureMode.HealthStaleProtocol
+                    ? ControlProtocolConstants.CurrentVersion - 1
+                    : ControlProtocolConstants.CurrentVersion,
+                BuildIdentity = mode == FixtureMode.HealthStaleBuild ? build + "-stale" : build,
+                Generation = mode == FixtureMode.HealthStaleGeneration ? generation - 1 : generation,
+                GenerationNonce = mode == FixtureMode.HealthStaleNonce ? nonce + "-stale" : nonce,
+                Status = mode == FixtureMode.HealthUnhealthy ? "unhealthy" : "ready",
+            });
+        }
 
         var drainReplies = new Dictionary<Guid, ControlEnvelope[]>();
         while (true)

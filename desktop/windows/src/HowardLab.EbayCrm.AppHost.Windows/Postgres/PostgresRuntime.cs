@@ -493,7 +493,11 @@ public sealed class PostgresRuntime :
             launchCompleted = true;
             remaining = Remaining(_stopDeadline, stopStarted);
             var exitCode = remaining > TimeSpan.Zero
-                ? await WaitBoundedAsync(command, remaining, cancellationToken).ConfigureAwait(false)
+                ? await WaitBoundedAsync(
+                    command,
+                    remaining,
+                    cancellationToken,
+                    mapCancellationToTimeout: true).ConfigureAwait(false)
                 : null;
             if (exitCode is null)
             {
@@ -873,10 +877,15 @@ public sealed class PostgresRuntime :
         }
     }
 
-    private static async Task<int?> WaitBoundedAsync(ISupervisedProcess command, TimeSpan timeout, CancellationToken cancellationToken)
+    private static async Task<int?> WaitBoundedAsync(
+        ISupervisedProcess command,
+        TimeSpan timeout,
+        CancellationToken cancellationToken,
+        bool mapCancellationToTimeout = false)
     {
         try { return await command.Completion.WaitAsync(timeout, cancellationToken).ConfigureAwait(false); }
         catch (TimeoutException) { return null; }
+        catch (OperationCanceledException) when (mapCancellationToTimeout && cancellationToken.IsCancellationRequested) { return null; }
     }
 
     private static TimeSpan Remaining(TimeSpan timeout, long startedTimestamp) =>

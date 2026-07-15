@@ -11,7 +11,7 @@ public sealed class FixtureHealthServer : IAsyncDisposable
 {
     private const int MaximumRequestBytes = 8 * 1024;
     private readonly TcpListener _listener;
-    private readonly byte[] _payload;
+    private byte[] _payload;
     private readonly HealthPayload _identity;
     private readonly CancellationTokenSource _stopping = new();
     private readonly Task _acceptLoop;
@@ -39,6 +39,14 @@ public sealed class FixtureHealthServer : IAsyncDisposable
     public string Endpoint => $"http://127.0.0.1:{((IPEndPoint)_listener.LocalEndpoint).Port}/health";
 
     internal Task SuccessfulRequest => _successfulRequest.Task;
+
+    internal void UpdatePayload(HealthPayload payload)
+    {
+        ArgumentNullException.ThrowIfNull(payload);
+        Volatile.Write(ref _payload, JsonSerializer.SerializeToUtf8Bytes(
+            payload,
+            ControlFrameCodec.SerializerOptions));
+    }
 
     private async Task AcceptLoopAsync()
     {
@@ -132,7 +140,7 @@ public sealed class FixtureHealthServer : IAsyncDisposable
             HasHeader(text, "X-AppHost-Build", _identity.BuildIdentity) &&
             HasHeader(text, "X-AppHost-Generation", _identity.Generation.ToString(System.Globalization.CultureInfo.InvariantCulture)) &&
             HasHeader(text, "X-AppHost-Nonce", _identity.GenerationNonce);
-        var body = accepted ? _payload : "not found"u8.ToArray();
+        var body = accepted ? Volatile.Read(ref _payload) : "not found"u8.ToArray();
         var status = accepted ? "200 OK" : "404 Not Found";
         var headers = Encoding.ASCII.GetBytes(
             $"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n");

@@ -1,11 +1,13 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
 using HowardLab.EbayCrm.AppHost.Core.Time;
 using HowardLab.EbayCrm.AppHost.Protocol.Control;
 using HowardLab.EbayCrm.AppHost.Windows.Instance;
+using HowardLab.EbayCrm.AppHost.Windows.Native;
 using HowardLab.EbayCrm.AppHost.Windows.Postgres;
 
 namespace HowardLab.EbayCrm.AppHost.Composition;
@@ -14,8 +16,13 @@ public sealed record AppHostProbeResult(bool IsValid, string ReasonCode);
 
 public static class AppHostComposition
 {
-    private const string TrustedFixtureExecutableSha256 =
-        "2170D3E0E5734D94F29D1EDE353EECC70E80D3A307B5AA01E84F8DA56A177ECB";
+    private const string TrustedFixtureManifestResource =
+        "HowardLab.EbayCrm.AppHost.TrustedFixtureArtifacts";
+    private static readonly IReadOnlyDictionary<string, string> TrustedFixtureArtifacts =
+        ReadTrustedFixtureArtifactManifest();
+
+    internal static IReadOnlyCollection<string> TrustedFixtureArtifactNames =>
+        TrustedFixtureArtifacts.Keys.ToArray();
 
     public static RuntimeOrchestrator Create(AppHostOptions options)
     {
@@ -140,26 +147,106 @@ public static class AppHostComposition
 
     internal static void ValidateTrustedFixtureExecutable(string path)
     {
-        using var lease = OpenTrustedFixtureExecutable(path);
+        using var lease = OpenTrustedFixtureArtifacts(path);
     }
 
-    internal static FileStream OpenTrustedFixtureExecutable(string path)
+    internal static IDisposable OpenTrustedFixtureArtifacts(string path)
     {
-        var lease = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            bufferSize: 4096,
-            FileOptions.SequentialScan);
-        var actual = Convert.ToHexString(SHA256.HashData(lease));
-        if (!StringComparer.Ordinal.Equals(actual, TrustedFixtureExecutableSha256))
+        var directory = Path.GetDirectoryName(Path.GetFullPath(path))!;
+        var expectedExecutable = Path.Combine(directory, "HowardLab.EbayCrm.AppHost.Fixture.exe");
+        if (!StringComparer.OrdinalIgnoreCase.Equals(Path.GetFullPath(path), expectedExecutable))
         {
-            lease.Dispose();
             throw new AppHostOptionsException("fixture-build-mismatch");
         }
 
-        return lease;
+        var leases = new List<FileStream>(TrustedFixtureArtifacts.Count);
+        try
+        {
+            foreach (var artifact in TrustedFixtureArtifacts)
+            {
+                var handle = NativeMethods.CreateFile(
+                    Path.Combine(directory, artifact.Key),
+                    NativeMethods.GenericRead,
+                    NativeMethods.FileShareRead,
+                    IntPtr.Zero,
+                    NativeMethods.OpenExisting,
+                    NativeMethods.FileFlagOpenReparsePoint,
+                    IntPtr.Zero);
+                if (handle.IsInvalid ||
+                    !NativeMethods.GetFileInformationByHandleEx(
+                        handle,
+                        NativeMethods.FileAttributeTagInfo,
+                        out var attributes,
+                        checked((uint)Marshal.SizeOf<NativeMethods.FileAttributeTagInformation>())) ||
+                    ((FileAttributes)attributes.FileAttributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    handle.Dispose();
+                    throw new AppHostOptionsException("fixture-build-mismatch");
+                }
+
+                var lease = new FileStream(handle, FileAccess.Read, bufferSize: 4096, isAsync: false);
+                leases.Add(lease);
+                var actual = Convert.ToHexString(SHA256.HashData(lease));
+                if (!StringComparer.Ordinal.Equals(actual, artifact.Value))
+                {
+                    throw new AppHostOptionsException("fixture-build-mismatch");
+                }
+            }
+
+            return new FixtureArtifactLease(leases);
+        }
+        catch (AppHostOptionsException)
+        {
+            DisposeLeases(leases);
+            throw;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            DisposeLeases(leases);
+            throw new AppHostOptionsException("fixture-build-mismatch", error);
+        }
+    }
+
+    private static IReadOnlyDictionary<string, string> ReadTrustedFixtureArtifactManifest()
+    {
+        using var manifest = typeof(AppHostComposition).Assembly.GetManifestResourceStream(
+            TrustedFixtureManifestResource) ??
+            throw new InvalidOperationException("Trusted fixture artifact manifest is missing.");
+        using var reader = new StreamReader(manifest);
+        var artifacts = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        while (reader.ReadLine() is { } line)
+        {
+            var separator = line.IndexOf('|');
+            var relativePath = separator > 0 ? line[..separator] : string.Empty;
+            if (separator <= 0 || separator == line.Length - 1 ||
+                Path.IsPathFullyQualified(relativePath) ||
+                relativePath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                    .Any(segment => segment is "" or "." or "..") ||
+                !artifacts.TryAdd(relativePath, line[(separator + 1)..]))
+            {
+                throw new InvalidOperationException("Trusted fixture artifact manifest is invalid.");
+            }
+        }
+
+        if (artifacts.Count == 0)
+        {
+            throw new InvalidOperationException("Trusted fixture artifact manifest is empty.");
+        }
+
+        return artifacts;
+    }
+
+    private static void DisposeLeases(IEnumerable<FileStream> leases)
+    {
+        foreach (var lease in leases)
+        {
+            lease.Dispose();
+        }
+    }
+
+    private sealed class FixtureArtifactLease(IReadOnlyList<FileStream> leases) : IDisposable
+    {
+        public void Dispose() => DisposeLeases(leases);
     }
 
     private static void EnsurePortAvailable(int port)

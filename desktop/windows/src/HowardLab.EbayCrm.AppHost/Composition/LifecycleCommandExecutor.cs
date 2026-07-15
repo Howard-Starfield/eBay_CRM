@@ -72,6 +72,19 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         set => _workerFixtureModeForTests = value;
     }
 
+    internal Action<RuntimeRole, WindowsJobObject, WindowsSupervisedProcess>? RoleLaunchedForTests { get; set; }
+
+    internal static void RetainWorkerJobHandleInRoleForTests(
+        RuntimeRole role,
+        WindowsJobObject job,
+        WindowsSupervisedProcess process)
+    {
+        if (role == RuntimeRole.Worker)
+        {
+            job.DuplicateIntoProcessForTests(process.ProcessHandle);
+        }
+    }
+
     internal AppHostRuntimeSnapshot SnapshotForTests() => new(
         _databaseIdentity?.ProcessId,
         _databaseIdentity?.Generation,
@@ -365,8 +378,14 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
                 environment,
                 child.SecretEnvironment,
                 TimeSpan.FromMilliseconds(100));
-            using var fixtureLease = AppHostComposition.OpenTrustedFixtureExecutable(_options.FixturePath);
+            using var fixtureLease = AppHostComposition.OpenTrustedFixtureArtifacts(_options.FixturePath);
             process = await _launcher.LaunchAsync(specification, job, cancellationToken).ConfigureAwait(false);
+            if (process is not WindowsSupervisedProcess windowsProcess)
+            {
+                throw new AppHostExecutionException("fixture-process-type-invalid");
+            }
+
+            RoleLaunchedForTests?.Invoke(generation.Role, job, windowsProcess);
             var resource = new RoleResource(
                 generation,
                 command.OperationId,
@@ -407,6 +426,17 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         using var http = new HttpClient { Timeout = ControlDeadline };
         using var request = CreateHealthRequest(resource);
         using var response = await http.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        await ValidateHealthResponseAsync(resource, response, cancellationToken).ConfigureAwait(false);
+
+        MonitorRole(resource);
+        return new RoleReady(generation);
+    }
+
+    private static async Task ValidateHealthResponseAsync(
+        RoleResource resource,
+        HttpResponseMessage response,
+        CancellationToken cancellationToken)
+    {
         response.EnsureSuccessStatusCode();
         var health = await response.Content.ReadFromJsonAsync<HealthPayload>(
             ControlFrameCodec.SerializerOptions,
@@ -415,15 +445,12 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         var endpoint = resource.Channel.EndpointIdentity;
         if (health.ProtocolVersion != ControlProtocolConstants.CurrentVersion ||
             health.BuildIdentity != endpoint.ExpectedBuildIdentity ||
-            health.Generation != generation.Value ||
+            health.Generation != resource.Generation.Value ||
             health.GenerationNonce != endpoint.CapabilityNonce ||
             health.Status != "ready")
         {
             throw new AppHostExecutionException("fixture-health-identity-mismatch");
         }
-
-        MonitorRole(resource);
-        return new RoleReady(generation);
     }
 
     private static HttpRequestMessage CreateHealthRequest(RoleResource resource)
@@ -662,27 +689,38 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         foreach (var resource in new[] { worker, server }.Where(value => value is not null).Cast<RoleResource>())
         {
             resource.MonitorCancellation.Cancel();
+            var termination = resource.Job.TerminateTree(exitCode: 1);
+            if (!termination.Succeeded)
+            {
+                errors.Add(new AppHostExecutionException(
+                    $"fixture-job-termination-failed-{termination.ErrorCode.ToString(CultureInfo.InvariantCulture)}"));
+            }
+        }
+        foreach (var resource in new[] { worker, server }.Where(value => value is not null).Cast<RoleResource>())
+        {
             try { resource.Job.Dispose(); } catch (Exception error) { errors.Add(error); }
         }
         try { _databaseJob?.Dispose(); } catch (Exception error) { errors.Add(error); }
 
         foreach (var resource in new[] { worker, server }.Where(value => value is not null).Cast<RoleResource>())
         {
-            await CaptureCleanupAsync(
-                () => Task.WhenAll(
-                    resource.ControlMonitor ?? Task.CompletedTask,
-                    resource.HealthMonitor ?? Task.CompletedTask).WaitAsync(cancellationToken),
-                errors).ConfigureAwait(false);
-            await CaptureCleanupAsync(
-                () => resource.Process.Completion.WaitAsync(cancellationToken),
-                errors).ConfigureAwait(false);
-            await CaptureCleanupAsync(
-                () => resource.Channel.DisposeAsync().AsTask().WaitAsync(cancellationToken),
-                errors).ConfigureAwait(false);
-            await CaptureCleanupAsync(
-                () => resource.Process.DisposeAsync().AsTask().WaitAsync(cancellationToken),
-                errors).ConfigureAwait(false);
-            resource.MonitorCancellation.Dispose();
+            try { resource.Channel.ForceCloseAfterJobClose(); } catch (Exception error) { errors.Add(error); }
+            try
+            {
+                if (resource.Process is WindowsSupervisedProcess process)
+                {
+                    process.TerminateAndForceCloseAfterJobClose(cancellationToken);
+                }
+                else
+                {
+                    throw new AppHostExecutionException("fixture-process-type-invalid");
+                }
+            }
+            catch (Exception error)
+            {
+                errors.Add(error);
+            }
+            resource.DisposeMonitorCancellationWhenQuiescent();
         }
 
         if (_databaseIdentity is { } identity && _databaseRuntime is { } runtime)
@@ -753,24 +791,25 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
 
     private void MonitorRole(RoleResource resource)
     {
+        var monitorToken = resource.MonitorCancellation.Token;
         _ = ObserveAsync(resource.Process.Completion, resource.Generation);
-        resource.ControlMonitor = ObserveControlAsync(resource);
-        resource.HealthMonitor = ObserveHealthAsync(resource);
+        resource.ControlMonitor = ObserveControlAsync(resource, monitorToken);
+        resource.HealthMonitor = ObserveHealthAsync(resource, monitorToken);
     }
 
-    private async Task ObserveControlAsync(RoleResource resource)
+    private async Task ObserveControlAsync(RoleResource resource, CancellationToken monitorToken)
     {
         try
         {
             while (true)
             {
-                await resource.Channel.WaitForDisconnectAsync(resource.MonitorCancellation.Token).ConfigureAwait(false);
+                await resource.Channel.WaitForDisconnectAsync(monitorToken).ConfigureAwait(false);
             }
         }
-        catch (OperationCanceledException) when (resource.MonitorCancellation.IsCancellationRequested)
+        catch (OperationCanceledException) when (monitorToken.IsCancellationRequested)
         {
         }
-        catch (Exception) when (!resource.MonitorCancellation.IsCancellationRequested)
+        catch (Exception) when (!monitorToken.IsCancellationRequested)
         {
             if (EventSink is { } sink)
             {
@@ -779,26 +818,26 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
     }
 
-    private async Task ObserveHealthAsync(RoleResource resource)
+    private async Task ObserveHealthAsync(RoleResource resource, CancellationToken monitorToken)
     {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
         try
         {
-            while (await timer.WaitForNextTickAsync(resource.MonitorCancellation.Token).ConfigureAwait(false))
+            while (await timer.WaitForNextTickAsync(monitorToken).ConfigureAwait(false))
             {
                 using var http = new HttpClient { Timeout = ControlDeadline };
                 using var request = CreateHealthRequest(resource);
-                using var response = await http.SendAsync(request, resource.MonitorCancellation.Token).ConfigureAwait(false);
-                if (!response.IsSuccessStatusCode)
-                {
-                    throw new HttpRequestException("fixture-health-monitor-rejected");
-                }
+                using var response = await http.SendAsync(request, monitorToken).ConfigureAwait(false);
+                await ValidateHealthResponseAsync(
+                    resource,
+                    response,
+                    monitorToken).ConfigureAwait(false);
             }
         }
-        catch (OperationCanceledException) when (resource.MonitorCancellation.IsCancellationRequested)
+        catch (OperationCanceledException) when (monitorToken.IsCancellationRequested)
         {
         }
-        catch (Exception) when (!resource.MonitorCancellation.IsCancellationRequested)
+        catch (Exception) when (!monitorToken.IsCancellationRequested)
         {
             if (EventSink is { } sink)
             {
@@ -879,7 +918,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         {
             errors.Add(error);
         }
-        resource.MonitorCancellation.Dispose();
+        resource.DisposeMonitorCancellationWhenQuiescent();
         ThrowCleanupErrors(errors);
     }
 
@@ -1039,6 +1078,8 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         WindowsControlChannel Channel,
         WindowsJobObject Job)
     {
+        private int _monitorCancellationDisposalStarted;
+
         internal CancellationTokenSource MonitorCancellation { get; } = new();
 
         internal Task? ControlMonitor { get; set; }
@@ -1048,6 +1089,35 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         internal bool Drained { get; set; }
 
         internal Guid? DrainOperationId { get; set; }
+
+        internal void DisposeMonitorCancellationWhenQuiescent()
+        {
+            if (Interlocked.Exchange(ref _monitorCancellationDisposalStarted, 1) != 0)
+            {
+                return;
+            }
+
+            _ = DisposeMonitorCancellationWhenQuiescentAsync();
+        }
+
+        private async Task DisposeMonitorCancellationWhenQuiescentAsync()
+        {
+            try
+            {
+                await Task.WhenAll(
+                    new[] { ControlMonitor, HealthMonitor }
+                        .Where(task => task is not null)
+                        .Cast<Task>()).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Monitor faults are translated into lifecycle events by the monitor methods.
+            }
+            finally
+            {
+                MonitorCancellation.Dispose();
+            }
+        }
     }
 
     private sealed class NoopDiagnosticSink : IDiagnosticSink

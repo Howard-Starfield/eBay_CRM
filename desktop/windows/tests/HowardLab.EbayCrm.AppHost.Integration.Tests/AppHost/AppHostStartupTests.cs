@@ -567,38 +567,78 @@ public sealed class AppHostStartupTests
     }
 
     [Fact, Trait("Category", "AppHost")]
-    public void FixtureBinaryPreflight_RejectsReplacedBytesBeforeAnyChildLaunch()
-    {
-        var replaced = Path.Combine(
-            Path.GetTempPath(),
-            $"HowardLab.EbayCrm.AppHost.Fixture-{Guid.NewGuid():N}.exe");
-        try
-        {
-            File.WriteAllBytes(replaced, "replaced-fixture"u8.ToArray());
-
-            var error = Assert.Throws<AppHostOptionsException>(() =>
-                AppHostComposition.ValidateTrustedFixtureExecutable(replaced));
-
-            Assert.Equal("fixture-build-mismatch", error.ReasonCode);
-        }
-        finally
-        {
-            File.Delete(replaced);
-        }
-    }
-
-    [Fact, Trait("Category", "AppHost")]
     public void TrustedFixtureLease_PreventsWriteOrReplacementThroughProcessCreationWindow()
     {
         var fixture = Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe");
 
-        using var lease = AppHostComposition.OpenTrustedFixtureExecutable(fixture);
+        using var lease = AppHostComposition.OpenTrustedFixtureArtifacts(fixture);
 
         Assert.Throws<IOException>(() => new FileStream(
             fixture,
             FileMode.Open,
             FileAccess.Write,
             FileShare.ReadWrite | FileShare.Delete));
+
+        var managedPayload = Path.ChangeExtension(fixture, ".dll");
+        Assert.Throws<IOException>(() => new FileStream(
+            managedPayload,
+            FileMode.Open,
+            FileAccess.Write,
+            FileShare.ReadWrite | FileShare.Delete));
+    }
+
+    public static TheoryData<string> TrustedRuntimeArtifactSubstitutionCases
+    {
+        get
+        {
+            var cases = new TheoryData<string>
+            {
+                "HowardLab.EbayCrm.AppHost.Fixture.exe",
+                "HowardLab.EbayCrm.AppHost.Fixture.dll",
+                "HowardLab.EbayCrm.AppHost.Protocol.dll",
+                "System.Security.Cryptography.ProtectedData.dll",
+            };
+            if (AppHostComposition.TrustedFixtureArtifactNames.Contains(
+                "hostfxr.dll",
+                StringComparer.OrdinalIgnoreCase))
+            {
+                cases.Add("hostfxr.dll");
+            }
+
+            return cases;
+        }
+    }
+
+    [Theory, Trait("Category", "AppHost")]
+    [MemberData(nameof(TrustedRuntimeArtifactSubstitutionCases))]
+    public void FixtureArtifactPreflight_RejectsReplacedRuntimeArtifact(string replacedArtifact)
+    {
+        var fixture = Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe");
+        var sourceDirectory = Path.GetDirectoryName(fixture)!;
+        var copiedDirectory = Path.Combine(Path.GetTempPath(), $"fixture-artifacts-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(copiedDirectory);
+        try
+        {
+            foreach (var artifact in AppHostComposition.TrustedFixtureArtifactNames)
+            {
+                var destination = Path.Combine(copiedDirectory, artifact);
+                Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                File.Copy(Path.Combine(sourceDirectory, artifact), destination);
+            }
+
+            File.WriteAllBytes(Path.Combine(copiedDirectory, replacedArtifact), "replaced-managed-artifact"u8.ToArray());
+
+            var error = Assert.Throws<AppHostOptionsException>(() =>
+                AppHostComposition.ValidateTrustedFixtureExecutable(Path.Combine(
+                    copiedDirectory,
+                    "HowardLab.EbayCrm.AppHost.Fixture.exe")));
+
+            Assert.Equal("fixture-build-mismatch", error.ReasonCode);
+        }
+        finally
+        {
+            Directory.Delete(copiedDirectory, recursive: true);
+        }
     }
 
     [Fact, Trait("Category", "AppHost")]

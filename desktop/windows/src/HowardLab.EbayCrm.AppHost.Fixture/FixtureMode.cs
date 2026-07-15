@@ -14,6 +14,11 @@ public enum FixtureMode
     PipeTimeout,
     ControlDisconnect,
     HealthDrop,
+    HealthStaleBuild,
+    HealthStaleProtocol,
+    HealthStaleGeneration,
+    HealthStaleNonce,
+    HealthUnhealthy,
     HoldJobHandle,
     MigrationHost,
 }
@@ -36,6 +41,11 @@ public static class FixtureModeParser
             "pipe-timeout" => FixtureMode.PipeTimeout,
             "control-disconnect" => FixtureMode.ControlDisconnect,
             "health-drop" => FixtureMode.HealthDrop,
+            "health-stale-build" => FixtureMode.HealthStaleBuild,
+            "health-stale-protocol" => FixtureMode.HealthStaleProtocol,
+            "health-stale-generation" => FixtureMode.HealthStaleGeneration,
+            "health-stale-nonce" => FixtureMode.HealthStaleNonce,
+            "health-unhealthy" => FixtureMode.HealthUnhealthy,
             "hold-job-handle" => FixtureMode.HoldJobHandle,
             "migration-host" => FixtureMode.MigrationHost,
             _ => default,
@@ -53,6 +63,11 @@ public static class FixtureModeParser
             "pipe-timeout" or
             "control-disconnect" or
             "health-drop" or
+            "health-stale-build" or
+            "health-stale-protocol" or
+            "health-stale-generation" or
+            "health-stale-nonce" or
+            "health-unhealthy" or
             "hold-job-handle" or
             "migration-host";
     }

@@ -37,8 +37,23 @@ public sealed class PostmasterPidFileRepairTests
         var repaired = fixture.Repair(probe);
 
         Assert.False(repaired);
+        Assert.True(probe.ReplacementWasBlocked);
         Assert.True(File.Exists(fixture.PidPath));
-        Assert.Contains("2147483646", File.ReadAllText(fixture.PidPath), StringComparison.Ordinal);
+        Assert.Contains("2147483647", File.ReadAllText(fixture.PidPath), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ReplacementAfterSecondProof_IsNeverDeletedThroughThePath()
+    {
+        using var fixture = RepairFixture.Create();
+        var probe = new ReplacingAfterSecondProofProbe(fixture);
+
+        var repaired = fixture.Repair(probe);
+
+        Assert.False(repaired);
+        Assert.True(File.Exists(fixture.PidPath));
+        Assert.True(probe.ReplacementWasBlocked);
+        Assert.Contains("2147483647", File.ReadAllText(fixture.PidPath), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -64,9 +79,44 @@ public sealed class PostmasterPidFileRepairTests
 
     private sealed class ReplacingProbe(RepairFixture fixture) : IPostmasterProcessProbe
     {
+        internal bool ReplacementWasBlocked { get; private set; }
+
         public PostmasterProcessState Probe(int processId)
         {
-            fixture.Write(processId: 2_147_483_646);
+            try
+            {
+                fixture.Write(processId: 2_147_483_646);
+                return PostmasterProcessState.Missing;
+            }
+            catch (IOException)
+            {
+                ReplacementWasBlocked = true;
+                return PostmasterProcessState.PresentOrAmbiguous;
+            }
+        }
+    }
+
+    private sealed class ReplacingAfterSecondProofProbe(RepairFixture fixture) : IPostmasterProcessProbe
+    {
+        private int _proof;
+
+        internal bool ReplacementWasBlocked { get; private set; }
+
+        public PostmasterProcessState Probe(int processId)
+        {
+            if (Interlocked.Increment(ref _proof) == 2)
+            {
+                try
+                {
+                    fixture.Write(processId: 2_147_483_646);
+                }
+                catch (IOException)
+                {
+                    ReplacementWasBlocked = true;
+                    return PostmasterProcessState.PresentOrAmbiguous;
+                }
+            }
+
             return PostmasterProcessState.Missing;
         }
     }

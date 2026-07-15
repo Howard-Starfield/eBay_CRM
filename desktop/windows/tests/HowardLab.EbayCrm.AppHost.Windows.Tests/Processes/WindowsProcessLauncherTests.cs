@@ -153,6 +153,24 @@ public sealed class WindowsProcessLauncherTests
     }
 
     [Fact]
+    public async Task ForceCloseAfterJobClose_IsIdempotent()
+    {
+        using var job = WindowsJobObject.CreateKillOnClose();
+        var launched = await CreateLauncher().LaunchAsync(
+            CreateSpecification(["hold"]),
+            job,
+            CancellationToken.None);
+        var process = Assert.IsType<WindowsSupervisedProcess>(launched);
+
+        job.Dispose();
+        process.ForceCloseAfterJobClose();
+        process.ForceCloseAfterJobClose();
+
+        Assert.True(process.ProcessHandle.IsClosed);
+        await process.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromMilliseconds(100));
+    }
+
+    [Fact]
     public async Task LaunchAsync_RedactsSecretEnvironmentFromBothOutputStreams()
     {
         const string secret = "task-5-stream-secret";

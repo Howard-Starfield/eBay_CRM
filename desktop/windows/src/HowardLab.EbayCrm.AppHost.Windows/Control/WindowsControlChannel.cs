@@ -30,6 +30,7 @@ public sealed class WindowsControlChannel : IControlChannel
     private Task? _disposeTask;
     private int _frameCount;
     private int _state;
+    private int _resourcesClosed;
 
     private WindowsControlChannel(
         ControlEndpointIdentity endpointIdentity,
@@ -44,6 +45,8 @@ public sealed class WindowsControlChannel : IControlChannel
     public ControlEndpointIdentity EndpointIdentity { get; }
 
     internal Func<CancellationToken, Task>? AuthenticationPublishHook { get; set; }
+
+    internal bool ResourcesClosedForTests => Volatile.Read(ref _resourcesClosed) != 0;
 
     public static WindowsControlChannel CreateBeforeLaunch(
         RuntimeRole role,
@@ -272,11 +275,40 @@ public sealed class WindowsControlChannel : IControlChannel
         }
     }
 
+    internal void ForceCloseAfterJobClose()
+    {
+        Task disposal;
+        lock (_disposeGate)
+        {
+            Interlocked.Exchange(ref _state, 4);
+            Interlocked.Exchange(ref _clientProcess, null)?.Dispose();
+            _pipe.Dispose();
+            Interlocked.Exchange(ref _resourcesClosed, 1);
+            disposal = _disposeTask ??= Task.CompletedTask;
+        }
+
+        try
+        {
+            disposal.GetAwaiter().GetResult();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The synchronous close is authoritative during escalation.
+        }
+    }
+
     private async Task DisposeCoreAsync()
     {
-        Interlocked.Exchange(ref _state, 4);
-        Interlocked.Exchange(ref _clientProcess, null)?.Dispose();
-        await _pipe.DisposeAsync().ConfigureAwait(false);
+        try
+        {
+            Interlocked.Exchange(ref _state, 4);
+            Interlocked.Exchange(ref _clientProcess, null)?.Dispose();
+            await _pipe.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _resourcesClosed, 1);
+        }
     }
 
     private CancellationTokenSource CreateBoundedCancellation(CancellationToken cancellationToken)

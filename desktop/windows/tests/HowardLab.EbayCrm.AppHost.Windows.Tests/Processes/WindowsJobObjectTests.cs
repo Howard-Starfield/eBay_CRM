@@ -85,8 +85,18 @@ public sealed class WindowsJobObjectTests
             WindowsProcessLauncherTests.CreateSpecification(["hold-job-handle"]),
             heldJob,
             CancellationToken.None);
+        var heldProcess = Assert.IsType<WindowsSupervisedProcess>(held);
+        heldJob.DuplicateIntoProcessForTests(heldProcess.ProcessHandle);
         heldJob.Dispose();
-        await held.Completion.WaitAsync(Deadline);
+
+        await Assert.ThrowsAsync<TimeoutException>(async () =>
+            await held.Completion.WaitAsync(TimeSpan.FromMilliseconds(250)));
+        Assert.False(heldProcess.HasExited);
+
+        using var holder = Process.GetProcessById(heldProcess.Identity.ProcessId);
+        using var forceDeadline = new CancellationTokenSource(Deadline);
+        heldProcess.TerminateAndForceCloseAfterJobClose(forceDeadline.Token);
+        Assert.True(holder.HasExited);
     }
 
     private sealed record GrandchildAnnouncement(int ProcessId);
