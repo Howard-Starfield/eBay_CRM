@@ -100,43 +100,63 @@ Escalated
 ```
 
 Add role-generic reconciliation commands for server and worker start and stop.
-Every command carries role, generation, and operation ID. The coordinator
-accepts a reconciliation result only when all three match the currently
-retained operation. Stale and duplicate results are ignored.
+Every command carries role, generation value, and operation ID. Process
+generation identity is immutable after launch: role plus generation value
+identifies the retained process, while the startup or shutdown operation ID
+identifies the action being reconciled. The coordinator currently retargets
+its generation record to the shutdown operation; the retained `RoleResource`
+does not. Start reconciliation therefore matches the complete launch
+generation. Stop reconciliation matches role plus generation value and
+separately requires the active shutdown operation ID. A result event uses the
+coordinator's current generation record so its operation fence remains valid.
+Stale and duplicate results are ignored.
 
 ### Late start
 
 Once a child has been atomically assigned to the Job and its retained process
 identity exists, cancellation or deadline expiry cannot dispose that identity
-and claim that start failed. The executor records the operation as
-indeterminate and returns control to the coordinator. Reconciliation then:
+and claim that start failed. The executor starts one `AcceptAsync` task using a
+role-lifetime token that is independent of the command/caller token. The
+command awaits that task through its own deadline. If the command deadline
+expires, the authenticated accept continues against the retained process and
+pipe; it is never canceled and restarted. The executor records the operation
+as indeterminate and returns control to the coordinator. The orchestrator
+dispatches that timeout with `CancellationToken.None`, then gives only the
+resulting reconciliation command a fresh bounded role-reconciliation token.
+It does not run startup rollback while a retained role operation is
+indeterminate. Reconciliation then:
 
 1. inspects the retained process handle;
-2. completes or resumes the authenticated control-channel handshake;
+2. awaits the original, single authenticated control-channel accept task;
 3. verifies generation-bound readiness; and
 4. reports exactly one running or stopped outcome.
 
 No second generation may launch while the prior start is indeterminate. If the
 retained child exited, reconciliation disposes its role resources once and
-reports stopped. If it authenticated and became ready, reconciliation reports
-running and startup continues from that same generation.
+reports stopped; the coordinator may create one replacement generation only
+through the existing bounded restart policy after stop is conclusive. If it
+authenticated and became ready, reconciliation reports running and startup
+continues from that same generation. Recovery paths must use the same
+`Start -> RoleStarted -> Wait` sequence as initial startup; they may not queue a
+wait command before start completion is known.
 
 ### Late stop
 
-After shutdown is accepted or sent, cancellation or deadline expiry preserves
-the retained role resource. Reconciliation inspects the retained handle and
-the generation-bound control state. A signaled handle reports stopped and
-performs idempotent cleanup. A live handle reports running/indeterminate so the
-existing shutdown budget may retry or perform its one final escalation.
+After shutdown is accepted, cancellation or deadline expiry preserves the
+retained role resource. `RoleResource` stores the immutable launch generation
+and the separate shutdown operation ID. Reconciliation inspects the retained
+handle and those two fences. A signaled handle reports stopped and performs
+idempotent cleanup. A live handle reports running/indeterminate so the existing
+shutdown budget may perform its one final escalation.
 
 No late timeout or acknowledgement may stop a newer generation.
 
 ### Deterministic acceptance seam
 
-Add an internal-only lifecycle test seam with exact pause points:
+Add internal-only lifecycle test support with exact pause points:
 
-- after atomic Job assignment and retained identity creation, before start
-  completion is returned; and
+- after atomic Job assignment and retained identity creation while the one
+  independent `AcceptAsync` task is genuinely pending; and
 - after shutdown acceptance, before process-exit observation is returned.
 
 The seam is injected only through internal composition constructors visible to
@@ -144,8 +164,10 @@ the integration-test assembly. It is not selectable through CLI arguments,
 environment variables, profile files, or production configuration. Production
 uses a no-op implementation.
 
-Acceptance tests publish and run the real AppHost/Fixture composition, pause at
-each boundary, force the operation deadline, release the boundary, and assert:
+Acceptance tests publish and run the real AppHost/Fixture composition, delay
+the Fixture handshake or exit at each boundary, force the caller/command
+deadline while the independent operation remains live, release the boundary,
+and assert:
 
 - one retained process generation for the affected role;
 - no duplicate process or control identity;
@@ -166,10 +188,14 @@ Production diagnostics live under:
 <canonical-profile>\\logs\\apphost-3.jsonl
 ```
 
-The directory and files must:
+The diagnostic writer remains inactive until `AcquireInstanceAsync` has
+successfully acquired both profile-ownership boundaries. A losing contender
+must dispose an unopened sink and create, truncate, or modify no log artifact.
+
+After activation, the directory and files must:
 
 - reject reparse points in their resolved path;
-- grant access only to the current user and required Windows system identity;
+- grant access only to the current user SID;
 - use fixed application-controlled names;
 - truncate a slot before reuse rather than append without bound;
 - cap each segment at 1 MiB and retain at most four segments; and
@@ -178,9 +204,13 @@ The directory and files must:
 ### Data contract
 
 Only typed, allowlisted lifecycle fields and stable reason codes may enter the
-sink. The production composition registers runtime-generated secrets and
-capability canaries before any event could contain them. Field values are
-redacted and truncated by the existing sink.
+sink. A thread-safe secret registry is shared with the sink. The executor
+registers the PostgreSQL password immediately after profile identity creation
+and every control capability immediately after creation, before either value is
+used or any related event can be emitted. Field values are redacted against an
+immutable registry snapshot and truncated by the existing sink. Acceptance
+scans for the actual generated password and capability nonces in addition to
+static test canaries.
 
 The following are prohibited from diagnostic fields and filenames:
 
@@ -202,10 +232,11 @@ Full queues, access denial, disk-full simulation, malformed segment state, and
 writer failure increment non-secret counters and do not prevent startup,
 shutdown, containment, or ownership release.
 
-`AppHostComposition` owns one production sink and injects it into the lifecycle
-executor and every `WindowsProcessLauncher`. Disposal happens only after role
-monitors and process-output drains have settled, and remains bounded by final
-host teardown. No component creates its own uncoordinated production sink.
+`AppHostComposition` owns one gated production sink and injects it into the
+lifecycle executor and every `WindowsProcessLauncher`. The executor activates
+it only after profile acquisition. Disposal happens only after role monitors
+and process-output drains have settled, and remains bounded by final host
+teardown. No component creates its own uncoordinated production sink.
 
 ### Acceptance evidence
 
@@ -227,10 +258,14 @@ it owns a disposable canonical profile. It then registers a one-shot Task
 Scheduler task under the current user's SID with `TASK_LOGON_S4U`. The task
 launches a small acceptance broker on a non-interactive desktop.
 
-The broker records its SID and Windows session ID, starts the same published
-AppHost against the owned profile, captures exact exit code/stdout/stderr, and
-writes a nonce-bound result atomically to a current-user-only local temporary
-directory. It never receives or stores a password.
+The broker records its SID and Windows session ID and atomically launches the
+same published AppHost inside a broker-owned Job Object against the owned
+profile. It captures exact exit code/stdout/stderr and the Job's cumulative
+process accounting, then writes a nonce-bound result atomically to a
+current-user-only local temporary directory. It never receives or stores a
+password. Cumulative Job accounting is the race-free child-creation ledger: a
+total process count of one proves the contender never created even a transient
+database, migration, server, or worker child.
 
 ### Required assertions
 
@@ -240,8 +275,9 @@ The test accepts evidence only when:
 - the broker/contender session ID differs from the interactive owner's session
   ID;
 - the contender exits with code 2 and exactly `profile-already-owned`;
-- no PostgreSQL, migration, server, or worker child is launched by the
-  contender;
+- the broker Job's cumulative total process count is exactly one, proving no
+  PostgreSQL, migration, server, or worker child was launched by the contender;
+- the losing contender creates, truncates, or modifies no diagnostic file;
 - the original owner remains healthy and retains the profile; and
 - the task, task folder, broker result, and disposable profile are removed in
   `finally` blocks.
@@ -262,7 +298,7 @@ must pass; a skip cannot produce `ADOPT_DOTNET_APPHOST_FOUNDATION`.
 
 | Failure | Required result |
 |---|---|
-| Role start deadline after retained identity exists | Enter role-start reconciliation; block duplicate launch. |
+| Role start deadline after retained identity exists | Preserve the original accept task, use a fresh bounded reconciliation token, and block duplicate launch. |
 | Role stop deadline after shutdown accepted | Preserve identity; reconcile before retry or escalation. |
 | Stale role result | Ignore by role/generation/operation fencing. |
 | Diagnostic path rejected or unwritable | Continue lifecycle; increment bounded failure counter. |
@@ -270,7 +306,8 @@ must pass; a skip cannot produce `ADOPT_DOTNET_APPHOST_FOUNDATION`.
 | Canary registration or redaction invariant fails | Fail acceptance; never publish adoption token. |
 | S4U task cannot register in developer run | Explicit environment skip with cleanup. |
 | S4U acceptance skipped in release run | `REVISE_APPHOST_FOUNDATION`. |
-| Contender reaches profile/database preparation | Fail closed; `REVISE_APPHOST_FOUNDATION`. |
+| Contender touches diagnostics or reaches profile/database preparation | Fail closed; `REVISE_APPHOST_FOUNDATION`. |
+| Broker Job cumulative process count exceeds one | Fail closed; `REVISE_APPHOST_FOUNDATION`. |
 | Harness cleanup fails | Fail test and record the exact non-secret cleanup reason. |
 
 ## Necessary test strategy
@@ -299,12 +336,14 @@ Phase 1B passes only when:
    generation;
 4. real late worker stop reconciles or escalates once without touching a newer
    generation;
-5. production composition emits bounded current-user-only JSONL segments;
+5. production composition activates diagnostics only after ownership and emits
+   bounded current-user-only JSONL segments;
 6. registered canaries do not appear in JSONL, support ZIPs, manifests,
    filenames, stdout, or stderr;
 7. diagnostic failure cannot block or change lifecycle cleanup;
 8. a same-SID contender in a different Windows session loses ownership before
-   any database or role child starts;
+   touching diagnostics or starting any database or role child, proven by a
+   broker Job cumulative process count of one;
 9. all temporary scheduled-task and acceptance artifacts are removed; and
 10. existing Phase 1A containment, PostgreSQL, protocol, migration, and restart
     tests remain green.
