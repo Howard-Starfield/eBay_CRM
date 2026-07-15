@@ -176,6 +176,38 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
         return await Runtime.StartAsync();
     }
 
+    internal async Task<PostgreSqlOperationResult<PostgresInstanceIdentity>> CrashJobAndRestartWithRetainedBootstrapLogAsync()
+    {
+        var previousIdentity = Identity ?? throw new InvalidOperationException("The cluster is not running.");
+        var previousLog = Launcher.LastStartLogFile
+            ?? throw new InvalidOperationException("The PostgreSQL start log was not captured.");
+        Job.Dispose();
+        await previousIdentity.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal(PostgreSqlOperationOutcome.ReconciledStopped,
+            await Runtime.ReconcileStopAsync(previousIdentity));
+        await Runtime.DisposeAsync();
+        Identity = null;
+        using var retainedLog = await OpenExclusiveWhenAvailableAsync(previousLog, TimeSpan.FromSeconds(30));
+
+        Job = WindowsJobObject.CreateKillOnClose();
+        var launcher = new FaultInjectingLauncher(
+            new WindowsProcessLauncher(NoopDiagnosticSink.Instance, maxOutputBytes: 256 * 1024));
+        Launcher = launcher;
+        Runtime = new PostgresRuntime(
+            Layout,
+            Paths,
+            new ProcessGeneration(RuntimeRole.Database, 2, Guid.NewGuid()),
+            Port,
+            Password,
+            launcher,
+            Job,
+            TimeSpan.FromSeconds(60),
+            TimeSpan.FromSeconds(30),
+            TimeSpan.FromSeconds(30));
+        Assert.Equal(PostgreSqlOperationOutcome.Completed, await Runtime.InitializeAsync());
+        return await Runtime.StartAsync();
+    }
+
     internal async Task ReplaceRuntimePasswordAsync(SecretValue password, TimeSpan? reconciliationDeadline = null)
     {
         if (Identity is not null) throw new InvalidOperationException("The cluster is already running.");
@@ -264,6 +296,22 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
         }
     }
 
+    private static async Task<FileStream> OpenExclusiveWhenAvailableAsync(string path, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (true)
+        {
+            try
+            {
+                return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None);
+            }
+            catch (IOException) when (DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(10);
+            }
+        }
+    }
+
     internal static async Task WaitForFileAsync(string path, TimeSpan timeout)
     {
         if (File.Exists(path)) return;
@@ -299,6 +347,8 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
         internal TimeSpan DelayNextStopLaunch { get; set; }
         internal bool LeaveNextStopPending { get; set; }
         internal int? LastStopTimeoutSeconds { get; private set; }
+        internal string? LastStartLogFile { get; private set; }
+        internal bool BlockNextStartLogPath { get; set; }
         internal TaskCompletionSource StopLaunchObserved { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public async ValueTask<ISupervisedProcess> LaunchAsync(
@@ -309,7 +359,23 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
             var isStop = Path.GetFileName(specification.ApplicationPath)
                 .Equals("pg_ctl.exe", StringComparison.OrdinalIgnoreCase) &&
                 specification.Arguments.Count > 0 && specification.Arguments[0] == "stop";
-            if (!isStop) return await inner.LaunchAsync(specification, processGroup, cancellationToken);
+            if (!isStop)
+            {
+                var isStart = Path.GetFileName(specification.ApplicationPath)
+                    .Equals("pg_ctl.exe", StringComparison.OrdinalIgnoreCase) &&
+                    specification.Arguments.Count > 0 && specification.Arguments[0] == "start";
+                if (isStart)
+                {
+                    var logIndex = specification.Arguments.ToList().IndexOf("-l");
+                    LastStartLogFile = specification.Arguments[logIndex + 1];
+                    if (BlockNextStartLogPath)
+                    {
+                        BlockNextStartLogPath = false;
+                        Directory.CreateDirectory(LastStartLogFile);
+                    }
+                }
+                return await inner.LaunchAsync(specification, processGroup, cancellationToken);
+            }
 
             StopLaunchObserved.TrySetResult();
             var timeoutIndex = specification.Arguments.ToList().IndexOf("-t");

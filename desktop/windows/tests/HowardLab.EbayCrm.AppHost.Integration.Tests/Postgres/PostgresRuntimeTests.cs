@@ -111,7 +111,7 @@ public sealed class PostgresRuntimeTests
     public async Task UnavailableLogPath_FailsWithoutLeavingPostmaster()
     {
         await using var cluster = await PostgresTestCluster.CreateAsync();
-        Directory.CreateDirectory(cluster.Paths.LogFile);
+        cluster.Launcher.BlockNextStartLogPath = true;
 
         var started = await cluster.Runtime.StartAsync();
 
@@ -205,16 +205,77 @@ public sealed class PostgresRuntimeTests
         var firstStart = await cluster.Runtime.StartAsync();
         using var firstIdentity = Assert.IsType<PostgresInstanceIdentity>(firstStart.Identity);
         cluster.Identity = firstIdentity;
+        var firstBootstrapLog = Assert.IsType<string>(cluster.Launcher.LastStartLogFile);
 
-        var recovered = await cluster.CrashJobAndRestartAsync();
+        var recovered = await cluster.CrashJobAndRestartWithRetainedBootstrapLogAsync();
         var recoveredIdentity = Assert.IsType<PostgresInstanceIdentity>(recovered.Identity);
         cluster.Identity = recoveredIdentity;
 
         Assert.True(firstIdentity.HasExited);
         Assert.Equal(PostgreSqlOperationOutcome.Completed, recovered.Outcome);
         Assert.NotEqual(firstIdentity.ProcessId, recoveredIdentity.ProcessId);
+        Assert.NotEqual(firstBootstrapLog, cluster.Launcher.LastStartLogFile, StringComparer.OrdinalIgnoreCase);
         Assert.Equal(cluster.Paths.DataDirectory, (await cluster.Runtime.ProbeAsync(recoveredIdentity)).ReportedDataDirectory,
             StringComparer.OrdinalIgnoreCase);
+    }
+
+    [PostgresFact, Trait("Category", "Postgres")]
+    public async Task StopFast_RejectsSubstitutedPidFileWithoutSignalingOtherPostgres()
+    {
+        await using var owner = await PostgresTestCluster.CreateAsync(stopDeadline: TimeSpan.FromSeconds(2));
+        await using var other = await PostgresTestCluster.CreateAsync();
+        var ownerIdentity = Assert.IsType<PostgresInstanceIdentity>((await owner.Runtime.StartAsync()).Identity);
+        var otherIdentity = Assert.IsType<PostgresInstanceIdentity>((await other.Runtime.StartAsync()).Identity);
+        owner.Identity = ownerIdentity;
+        other.Identity = otherIdentity;
+        var originalPidFile = await File.ReadAllTextAsync(owner.Paths.PostmasterPidFile);
+        await SubstitutePidFileAsync(owner, other);
+
+        try
+        {
+            var error = await Assert.ThrowsAsync<PostmasterPidFileException>(async () =>
+                await owner.Runtime.StopFastAsync(ownerIdentity));
+
+            Assert.Equal("postmaster-pid-identity-mismatch", error.ReasonCode);
+            Assert.False(ownerIdentity.HasExited);
+            Assert.False(otherIdentity.HasExited);
+        }
+        finally
+        {
+            await File.WriteAllTextAsync(owner.Paths.PostmasterPidFile, originalPidFile);
+        }
+    }
+
+    [PostgresFact, Trait("Category", "Postgres")]
+    public async Task ReconcileRunning_RejectsSubstitutedPidFileWithoutSignalingOtherPostgres()
+    {
+        await using var owner = await PostgresTestCluster.CreateAsync();
+        await using var other = await PostgresTestCluster.CreateAsync();
+        var ownerIdentity = Assert.IsType<PostgresInstanceIdentity>((await owner.Runtime.StartAsync()).Identity);
+        var otherIdentity = Assert.IsType<PostgresInstanceIdentity>((await other.Runtime.StartAsync()).Identity);
+        owner.Identity = ownerIdentity;
+        other.Identity = otherIdentity;
+        owner.Launcher.CompleteNextStopWithExitCode = 1;
+        Assert.Equal(PostgreSqlOperationOutcome.TimedOutIndeterminate,
+            await owner.Runtime.StopFastAsync(ownerIdentity));
+        var originalPidFile = await File.ReadAllTextAsync(owner.Paths.PostmasterPidFile);
+        await SubstitutePidFileAsync(owner, other);
+
+        PostgreSqlOperationOutcome reconciled;
+        try
+        {
+            reconciled = await owner.Runtime.ReconcileStopAsync(ownerIdentity);
+            Assert.False(ownerIdentity.HasExited);
+            Assert.False(otherIdentity.HasExited);
+        }
+        finally
+        {
+            await File.WriteAllTextAsync(owner.Paths.PostmasterPidFile, originalPidFile);
+        }
+
+        Assert.Equal(PostgreSqlOperationOutcome.TimedOutIndeterminate, reconciled);
+        Assert.Equal(PostgreSqlOperationOutcome.ReconciledRunning,
+            await owner.Runtime.ReconcileStopAsync(ownerIdentity));
     }
 
     [PostgresFact, Trait("Category", "Postgres")]
@@ -393,6 +454,9 @@ public sealed class PostgresRuntimeTests
             var oldLog = Path.Combine(cluster.Paths.ServerLogDirectory, $"postgres-old-{index:D2}.log");
             await File.WriteAllBytesAsync(oldLog, new byte[(2 * 1024 * 1024) + index]);
             File.SetLastWriteTimeUtc(oldLog, DateTime.UtcNow.AddMinutes(-index - 1));
+            var oldBootstrapLog = Path.Combine(cluster.Paths.RuntimeDirectory, $"postgres-bootstrap-old-{index:D2}.log");
+            await File.WriteAllBytesAsync(oldBootstrapLog, new byte[(2 * 1024 * 1024) + index]);
+            File.SetLastWriteTimeUtc(oldBootstrapLog, DateTime.UtcNow.AddMinutes(-index - 1));
         }
         var started = await cluster.Runtime.StartAsync();
         var firstIdentity = Assert.IsType<PostgresInstanceIdentity>(started.Identity);
@@ -407,6 +471,7 @@ public sealed class PostgresRuntimeTests
         var boundedLogs = Directory.GetFiles(cluster.Paths.ServerLogDirectory, "postgres-*.log");
         Assert.InRange(boundedLogs.Length, 1, 8);
         Assert.All(boundedLogs, path => Assert.InRange(new FileInfo(path).Length, 0, 1024 * 1024));
+        AssertLifecycleBootstrapLogBounds(cluster.Paths.RuntimeDirectory);
 
         await cluster.ExecuteSqlAsync("DO $$ BEGIN FOR i IN 1..4096 LOOP RAISE LOG '%', repeat('x', 1024); END LOOP; END $$;");
         await WaitUntilAsync(
@@ -420,6 +485,7 @@ public sealed class PostgresRuntimeTests
         firstIdentity.Dispose();
         cluster.Identity = null;
         AssertLifecycleLogBounds(cluster.Paths.ServerLogDirectory);
+        AssertLifecycleBootstrapLogBounds(cluster.Paths.RuntimeDirectory);
 
         var restarted = await cluster.Runtime.StartAsync();
         var secondIdentity = Assert.IsType<PostgresInstanceIdentity>(restarted.Identity);
@@ -434,6 +500,7 @@ public sealed class PostgresRuntimeTests
         await secondIdentity.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
         await cluster.DisposeRuntimeAsync();
         AssertLifecycleLogBounds(cluster.Paths.ServerLogDirectory);
+        AssertLifecycleBootstrapLogBounds(cluster.Paths.RuntimeDirectory);
     }
 
     private static void AssertLifecycleLogBounds(string serverLogDirectory)
@@ -441,6 +508,22 @@ public sealed class PostgresRuntimeTests
         var logs = Directory.GetFiles(serverLogDirectory, "postgres-*.log");
         Assert.InRange(logs.Length, 1, 8);
         Assert.All(logs, path => Assert.InRange(new FileInfo(path).Length, 0, 1024 * 1024));
+    }
+
+    private static void AssertLifecycleBootstrapLogBounds(string runtimeDirectory)
+    {
+        var logs = Directory.GetFiles(runtimeDirectory, "postgres-bootstrap-*.log");
+        Assert.InRange(logs.Length, 1, 8);
+        Assert.All(logs, path => Assert.InRange(new FileInfo(path).Length, 0, 1024 * 1024));
+    }
+
+    private static async Task SubstitutePidFileAsync(PostgresTestCluster owner, PostgresTestCluster other)
+    {
+        var lines = (await File.ReadAllTextAsync(other.Paths.PostmasterPidFile))
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Split('\n');
+        lines[1] = owner.Paths.DataDirectory;
+        await File.WriteAllTextAsync(owner.Paths.PostmasterPidFile, string.Join(Environment.NewLine, lines));
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)

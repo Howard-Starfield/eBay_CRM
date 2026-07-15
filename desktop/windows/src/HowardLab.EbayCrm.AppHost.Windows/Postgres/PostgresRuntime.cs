@@ -29,6 +29,7 @@ public sealed class PostgresRuntime :
     private readonly TimeSpan _startDeadline;
     private readonly TimeSpan _stopDeadline;
     private readonly TimeSpan _reconciliationDeadline;
+    private readonly string _bootstrapLogFile;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private ISupervisedProcess? _pendingStartCommand;
     private ISupervisedProcess? _pendingStopCommand;
@@ -68,6 +69,9 @@ public sealed class PostgresRuntime :
         _startDeadline = startDeadline;
         _stopDeadline = stopDeadline;
         _reconciliationDeadline = reconciliationDeadline ?? TimeSpan.FromMinutes(5);
+        _bootstrapLogFile = Path.Combine(
+            paths.RuntimeDirectory,
+            $"postgres-bootstrap-{generation.Value.ToString(CultureInfo.InvariantCulture)}-{generation.OperationId:N}.log");
     }
 
     public async Task<PostgreSqlOperationOutcome> InitializeAsync(CancellationToken cancellationToken = default)
@@ -165,7 +169,7 @@ public sealed class PostgresRuntime :
                 "-c log_truncate_on_rotation=on";
             command = await LaunchCommandAsync(
                 _layout.PgCtlExe,
-                ["start", "-D", _paths.DataDirectory, "-l", _paths.LogFile, "-w", "-t", "60", "-o", serverOptions],
+                ["start", "-D", _paths.DataDirectory, "-l", _bootstrapLogFile, "-w", "-t", "60", "-o", serverOptions],
                 secretEnvironment: null,
                 cancellationToken,
                 launchesPostmaster: true).ConfigureAwait(false);
@@ -245,12 +249,13 @@ public sealed class PostgresRuntime :
                 try
                 {
                     _ = await ProbeCoreAsync(runningIdentity, _reconciliationDeadline, cancellationToken).ConfigureAwait(false);
+                    ValidateCurrentPidFile(runningIdentity);
                     return new(PostgreSqlOperationOutcome.ReconciledRunning, runningIdentity);
                 }
-                catch (PostgresProbeException)
+                catch (Exception error) when (error is PostgresProbeException or PostmasterPidFileException)
                 {
                     _state = RuntimeState.StartIndeterminate;
-                    return new(PostgreSqlOperationOutcome.TimedOutIndeterminate, runningIdentity, "postgres-start-not-ready");
+                    return new(PostgreSqlOperationOutcome.TimedOutIndeterminate, runningIdentity, ReconciliationReason(error));
                 }
             }
             if (_state == RuntimeState.Running && _identity is { } exitedRunningIdentity && exitedRunningIdentity.HasExited)
@@ -293,12 +298,13 @@ public sealed class PostgresRuntime :
                 try
                 {
                     _ = await ProbeCoreAsync(_identity, _reconciliationDeadline, cancellationToken).ConfigureAwait(false);
+                    ValidateCurrentPidFile(_identity);
                     _state = RuntimeState.Running;
                     return new(PostgreSqlOperationOutcome.ReconciledRunning, _identity);
                 }
-                catch (PostgresProbeException)
+                catch (Exception error) when (error is PostgresProbeException or PostmasterPidFileException)
                 {
-                    return new(PostgreSqlOperationOutcome.TimedOutIndeterminate, _identity, "postgres-start-not-ready");
+                    return new(PostgreSqlOperationOutcome.TimedOutIndeterminate, _identity, ReconciliationReason(error));
                 }
             }
 
@@ -312,13 +318,14 @@ public sealed class PostgresRuntime :
                         try
                         {
                             _ = await ProbeCoreAsync(_identity, _reconciliationDeadline, cancellationToken).ConfigureAwait(false);
+                            ValidateCurrentPidFile(_identity);
                             _state = RuntimeState.Running;
                             _requiresStartQuietReconciliation = false;
                             return new(PostgreSqlOperationOutcome.ReconciledRunning, _identity);
                         }
-                        catch (PostgresProbeException)
+                        catch (Exception error) when (error is PostgresProbeException or PostmasterPidFileException)
                         {
-                            return new(PostgreSqlOperationOutcome.TimedOutIndeterminate, _identity, "postgres-start-not-ready");
+                            return new(PostgreSqlOperationOutcome.TimedOutIndeterminate, _identity, ReconciliationReason(error));
                         }
                     }
 
@@ -378,6 +385,7 @@ public sealed class PostgresRuntime :
             _state = RuntimeState.Stopping;
             var remaining = Remaining(_stopDeadline, stopStarted);
             var seconds = Math.Max(1, (int)Math.Ceiling(remaining.TotalSeconds));
+            ValidateCurrentPidFile(identity);
             command = await LaunchCommandAsync(
                 _layout.PgCtlExe,
                 ["stop", "-D", _paths.DataDirectory, "-m", "fast", "-w", "-t", seconds.ToString(CultureInfo.InvariantCulture)],
@@ -448,10 +456,11 @@ public sealed class PostgresRuntime :
                 try
                 {
                     _ = await ProbeCoreAsync(identity, _reconciliationDeadline, cancellationToken).ConfigureAwait(false);
+                    ValidateCurrentPidFile(identity);
                     _state = RuntimeState.Running;
                     return PostgreSqlOperationOutcome.ReconciledRunning;
                 }
-                catch (PostgresProbeException)
+                catch (Exception error) when (error is PostgresProbeException or PostmasterPidFileException)
                 {
                     return PostgreSqlOperationOutcome.TimedOutIndeterminate;
                 }
@@ -584,6 +593,20 @@ public sealed class PostgresRuntime :
             return;
         File.Delete(_paths.PostmasterPidFile);
     }
+
+    private void ValidateCurrentPidFile(PostgresInstanceIdentity identity)
+    {
+        var pidFile = PostmasterPidFile.Read(_paths.PostmasterPidFile, identity.CanonicalDataDirectory);
+        if (pidFile.ProcessId != identity.ProcessId ||
+            pidFile.Port != identity.LoopbackPort ||
+            Math.Abs((pidFile.StartTimeUtc - identity.CreationTimeUtc).TotalSeconds) > 5)
+        {
+            throw new PostmasterPidFileException("postmaster-pid-identity-mismatch");
+        }
+    }
+
+    private static string ReconciliationReason(Exception error) =>
+        error is PostmasterPidFileException pidError ? pidError.ReasonCode : "postgres-start-not-ready";
 
     private string ClassifyExistingPidFile()
     {
@@ -721,21 +744,56 @@ public sealed class PostgresRuntime :
     {
         Directory.CreateDirectory(_paths.RuntimeDirectory);
         Directory.CreateDirectory(_paths.ServerLogDirectory);
+        PruneBootstrapLogs(maxFiles: 7);
         PruneServerLogs(maxFiles: 7);
-        if (File.Exists(_paths.LogFile)) File.WriteAllBytes(_paths.LogFile, []);
+        if (File.Exists(_bootstrapLogFile)) File.WriteAllBytes(_bootstrapLogFile, []);
     }
 
     private void TrimLogIfNeeded()
     {
+        PruneBootstrapLogs(maxFiles: 8);
         PruneServerLogs(maxFiles: 8);
-        if (!File.Exists(_paths.LogFile) || new FileInfo(_paths.LogFile).Length <= MaxLogBytes) return;
-        using var stream = new FileStream(_paths.LogFile, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        if (!File.Exists(_bootstrapLogFile) || new FileInfo(_bootstrapLogFile).Length <= MaxLogBytes) return;
+        using var stream = new FileStream(_bootstrapLogFile, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
         stream.Seek(-MaxLogBytes, SeekOrigin.End);
         var tail = new byte[MaxLogBytes];
         stream.ReadExactly(tail);
         stream.Position = 0;
         stream.Write(tail);
         stream.SetLength(MaxLogBytes);
+    }
+
+    private void PruneBootstrapLogs(int maxFiles)
+    {
+        if (!Directory.Exists(_paths.RuntimeDirectory)) return;
+        var files = new DirectoryInfo(_paths.RuntimeDirectory)
+            .EnumerateFiles("postgres-bootstrap-*.log", SearchOption.TopDirectoryOnly)
+            .OrderByDescending(file => file.LastWriteTimeUtc)
+            .ThenByDescending(file => file.Name, StringComparer.Ordinal)
+            .ToArray();
+        foreach (var file in files)
+        {
+            if (file.Length <= MaxLogBytes) continue;
+            try
+            {
+                using var stream = new FileStream(file.FullName, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+                stream.Seek(-MaxLogBytes, SeekOrigin.End);
+                var tail = new byte[MaxLogBytes];
+                stream.ReadExactly(tail);
+                stream.Position = 0;
+                stream.Write(tail);
+                stream.SetLength(MaxLogBytes);
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+
+        foreach (var file in files.Skip(maxFiles))
+        {
+            try { file.Delete(); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
     }
 
     private void PruneServerLogs(int maxFiles)
