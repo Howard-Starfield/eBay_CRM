@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
 using HowardLab.EbayCrm.AppHost.Integration.Tests.AppHost;
 using HowardLab.EbayCrm.AppHost.Integration.Tests.Postgres;
@@ -83,6 +84,7 @@ public sealed class CrossSessionOwnershipAcceptanceTests
         var error = await Assert.ThrowsAsync<S4uResultValidationException>(() => harness.RunAsync());
 
         Assert.Equal(reasonCode, error.ReasonCode);
+        harness.AssertRunnerOwnedArtifactsClean();
         harness.AssertClean();
     }
 
@@ -99,6 +101,7 @@ public sealed class CrossSessionOwnershipAcceptanceTests
         var error = await Assert.ThrowsAsync<S4uExecutionException>(() => harness.RunAsync());
 
         Assert.Equal(reasonCode, error.ReasonCode);
+        harness.AssertRunnerOwnedArtifactsClean();
         harness.AssertClean();
     }
 
@@ -111,7 +114,29 @@ public sealed class CrossSessionOwnershipAcceptanceTests
 
         Assert.Equal("task-cleanup-failed", error.ReasonCode);
         harness.AssertCleanupAttempted();
+        harness.AssertRunnerOwnedArtifactsClean();
         harness.AssertClean();
+    }
+
+    [Theory]
+    [InlineData(true, 1)]
+    [InlineData(false, 0)]
+    public void RegistrationPolicyFailure_RemovesOnlyFolderCreatedByThisAttempt(
+        bool folderCreated,
+        int expectedDeleteCount)
+    {
+        var deleteCount = 0;
+
+        var error = Assert.Throws<COMException>(() =>
+            RealS4uTaskSession.RegisterWithCreatedFolderCleanup(
+                () => throw new COMException(
+                    "policy-blocked",
+                    unchecked((int)0x80070005)),
+                folderCreated,
+                () => deleteCount++));
+
+        Assert.Equal(unchecked((int)0x80070005), error.HResult);
+        Assert.Equal(expectedDeleteCount, deleteCount);
     }
 
     private static Process StartOwner(string appHostPath, string fixturePath, TestLayout layout)

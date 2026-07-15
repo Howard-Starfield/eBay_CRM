@@ -51,19 +51,25 @@ internal static class TaskSchedulerS4uRunner
     internal static Task<S4uBrokerResult> RunAsync(
         S4uRunRequest request,
         CancellationToken cancellationToken) =>
-        RunCoreAsync(request, Deadline, RealS4uTaskSession.Create, cancellationToken);
+        RunCoreAsync(
+            request,
+            Deadline,
+            RealS4uTaskSession.Create,
+            CreateRunnerRootPath,
+            cancellationToken);
 
     internal static async Task<S4uBrokerResult> RunCoreAsync(
         S4uRunRequest request,
         TimeSpan deadline,
         Func<string, string, string, IS4uTaskSession> sessionFactory,
+        Func<string> runnerRootPathFactory,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(deadline, TimeSpan.Zero);
         ValidateInput(request);
         var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
-        var root = Path.Combine(Path.GetTempPath(), $"ebaycrm-s4u-{Guid.NewGuid():N}");
+        var root = runnerRootPathFactory();
         var requestPath = Path.Combine(root, "request.json");
         var resultPath = Path.Combine(root, "result.json");
         var taskName = "eBayCRM-Acceptance-" + Guid.NewGuid().ToString("N");
@@ -128,6 +134,9 @@ internal static class TaskSchedulerS4uRunner
                 throw new S4uCleanupException("task-cleanup-failed", cleanupErrors);
         }
     }
+
+    private static string CreateRunnerRootPath() =>
+        Path.Combine(Path.GetTempPath(), $"ebaycrm-s4u-{Guid.NewGuid():N}");
 
     private static void ValidateInput(S4uRunRequest request)
     {
@@ -328,6 +337,7 @@ internal sealed class RealS4uTaskSession : IS4uTaskSession
         dynamic? action = null;
         dynamic? registered = null;
         var transferred = false;
+        var folderCreated = false;
         try
         {
             var serviceType = Type.GetTypeFromProgID("Schedule.Service", throwOnError: true)
@@ -346,6 +356,7 @@ internal sealed class RealS4uTaskSession : IS4uTaskSession
             catch (Exception error) when (error.HResult == unchecked((int)0x80070002))
             {
                 folder = root.CreateFolder("HowardLab", taskSddl);
+                folderCreated = true;
             }
 
             definition = service.NewTask(0);
@@ -369,14 +380,23 @@ internal sealed class RealS4uTaskSession : IS4uTaskSession
             action.Path = brokerPath;
             action.Arguments = "--request \"" + requestPath.Replace("\"", "\"\"") + "\"";
             action.WorkingDirectory = Path.GetDirectoryName(brokerPath)!;
-            registered = folder.RegisterTaskDefinition(
-                taskName,
-                definition,
-                TaskCreate,
-                WindowsIdentity.GetCurrent().Name,
-                null,
-                TaskLogonS4u,
-                taskSddl);
+            registered = RegisterWithCreatedFolderCleanup(
+                () => folder.RegisterTaskDefinition(
+                    taskName,
+                    definition,
+                    TaskCreate,
+                    WindowsIdentity.GetCurrent().Name,
+                    null,
+                    TaskLogonS4u,
+                    taskSddl),
+                folderCreated,
+                () =>
+                {
+                    ReleaseCom(folder);
+                    folder = null;
+                    root.DeleteFolder("\\HowardLab", 0);
+                    folderCreated = false;
+                });
             var session = new RealS4uTaskSession(root, folder, registered);
             transferred = true;
             return session;
@@ -393,6 +413,22 @@ internal sealed class RealS4uTaskSession : IS4uTaskSession
                 ReleaseCom(folder);
                 ReleaseCom(root);
             }
+        }
+    }
+
+    internal static object RegisterWithCreatedFolderCleanup(
+        Func<object> register,
+        bool folderCreated,
+        Action deleteCreatedFolder)
+    {
+        try
+        {
+            return register();
+        }
+        catch
+        {
+            if (folderCreated) deleteCreatedFolder();
+            throw;
         }
     }
 
@@ -572,12 +608,18 @@ internal enum ResultFault
 internal sealed class S4uRunnerHarness : IAsyncDisposable
 {
     private readonly string _root;
+    private readonly string _runnerRoot;
     private readonly FakeS4uTaskSession _session;
     private readonly S4uRunRequest _request;
 
-    private S4uRunnerHarness(string root, FakeS4uTaskSession session, S4uRunRequest request)
+    private S4uRunnerHarness(
+        string root,
+        string runnerRoot,
+        FakeS4uTaskSession session,
+        S4uRunRequest request)
     {
         _root = root;
+        _runnerRoot = runnerRoot;
         _session = session;
         _request = request;
     }
@@ -599,8 +641,10 @@ internal sealed class S4uRunnerHarness : IAsyncDisposable
             ?? throw new InvalidOperationException("current-user-sid-unavailable");
         var ownerSession = Process.GetCurrentProcess().SessionId;
         var session = new FakeS4uTaskSession(fault, sid, ownerSession);
+        var runnerRoot = Path.Combine(Path.GetTempPath(), $"ebaycrm-s4u-harness-{Guid.NewGuid():N}");
         return Task.FromResult(new S4uRunnerHarness(
             root,
+            runnerRoot,
             session,
             new S4uRunRequest(
                 broker, appHost, root, profile, bin, fixture, 15432, sid, ownerSession)));
@@ -614,12 +658,21 @@ internal sealed class S4uRunnerHarness : IAsyncDisposable
                 _request,
                 TimeSpan.FromMilliseconds(150),
                 (_, _, requestPath) => _session.Attach(requestPath),
+                () => _runnerRoot,
                 CancellationToken.None);
         }
         finally
         {
             if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
         }
+    }
+
+    internal void AssertRunnerOwnedArtifactsClean()
+    {
+        Assert.False(File.Exists(Path.Combine(_runnerRoot, "request.json")));
+        Assert.False(File.Exists(Path.Combine(_runnerRoot, "result.json")));
+        Assert.False(File.Exists(_session.TemporaryResultPath));
+        Assert.False(Directory.Exists(_runnerRoot));
     }
 
     internal void AssertClean()
@@ -650,6 +703,7 @@ internal sealed class FakeS4uTaskSession(
     int ownerSession) : IS4uTaskSession
 {
     private string? _requestPath;
+    internal string? TemporaryResultPath { get; private set; }
     internal bool TaskExists { get; private set; }
     internal bool BrokerAlive { get; private set; }
     internal bool ContenderAlive { get; private set; }
@@ -667,6 +721,11 @@ internal sealed class FakeS4uTaskSession(
     public void Start()
     {
         BrokerAlive = true;
+        var request = JsonDocument.Parse(File.ReadAllBytes(_requestPath!)).RootElement;
+        var nonce = request.GetProperty("Nonce").GetString()!;
+        var resultPath = request.GetProperty("ResultPath").GetString()!;
+        TemporaryResultPath = resultPath + "." + nonce + ".tmp";
+        File.WriteAllText(TemporaryResultPath, "incomplete-result");
         if (fault == ResultFault.Timeout) return;
         if (fault == ResultFault.BrokerCrash)
         {
@@ -674,9 +733,6 @@ internal sealed class FakeS4uTaskSession(
             return;
         }
 
-        var request = JsonDocument.Parse(File.ReadAllBytes(_requestPath!)).RootElement;
-        var nonce = request.GetProperty("Nonce").GetString()!;
-        var resultPath = request.GetProperty("ResultPath").GetString()!;
         var now = DateTimeOffset.UtcNow;
         if (fault == ResultFault.MalformedJson)
         {
