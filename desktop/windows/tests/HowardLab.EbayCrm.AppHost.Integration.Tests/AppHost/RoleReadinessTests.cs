@@ -158,24 +158,39 @@ public sealed class RoleReadinessTests
         Assert.Equal(1, handler.CallCount);
     }
 
-    [Theory]
-    [InlineData("control-disconnect", "role-control-disconnected-before-ready")]
-    public async Task RetainedProcessOrControlLossStopsReadinessImmediately(
-        string fixtureMode,
-        string expectedReason)
+    [Fact]
+    public async Task RetainedProcessOrControlLossStopsReadinessImmediately()
     {
         var handler = new SequencedHealthHandler("not-ready");
+        var requestEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseResponse = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        handler.BeforeResponse = async () =>
+        {
+            requestEntered.TrySetResult();
+            await releaseResponse.Task;
+        };
         await using var harness = RoleExecutorHarness.Create(
             NoopRoleOperationBoundary.Instance,
             Deadlines(),
             () => handler);
-        harness.FixtureRoleLaunchPlanProvider.WorkerModeForTests = fixtureMode;
         var generation = await StartWorkerAsync(harness);
+        var readiness = harness.Executor.ExecuteAsync(WaitWorker(generation));
+        await requestEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
 
-        var error = await Assert.ThrowsAsync<AppHostExecutionException>(() =>
-            harness.Executor.ExecuteAsync(WaitWorker(generation)));
+        try
+        {
+            await harness.Executor.DisconnectRoleControlForTestsAsync(RuntimeRole.Worker);
+        }
+        finally
+        {
+            releaseResponse.TrySetResult();
+        }
 
-        Assert.Equal(expectedReason, error.ReasonCode);
+        var error = await Assert.ThrowsAsync<AppHostExecutionException>(() => readiness);
+
+        Assert.Equal("role-control-disconnected-before-ready", error.ReasonCode);
     }
 
     [Fact]

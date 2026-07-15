@@ -81,6 +81,9 @@ public static class FixtureControlLoop
 
         if (mode == FixtureMode.ControlDisconnect)
         {
+            await health.WaitForSuccessfulRequestCountAsync(
+                requiredCount: 2,
+                cancellationToken).ConfigureAwait(false);
             await client.DisposeAsync().ConfigureAwait(false);
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
             return 0;

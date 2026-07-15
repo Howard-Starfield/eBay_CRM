@@ -20,6 +20,9 @@ public sealed class FixtureHealthServer : IAsyncDisposable
     private int _clientId;
     private int _disposed;
     private readonly TaskCompletionSource _successfulRequest = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly object _successfulRequestGate = new();
+    private readonly List<SuccessfulRequestWaiter> _successfulRequestWaiters = [];
+    private int _successfulRequestCount;
 
     public FixtureHealthServer(int port, HealthPayload payload)
     {
@@ -39,6 +42,28 @@ public sealed class FixtureHealthServer : IAsyncDisposable
     public string Endpoint => $"http://127.0.0.1:{((IPEndPoint)_listener.LocalEndpoint).Port}/health";
 
     internal Task SuccessfulRequest => _successfulRequest.Task;
+
+    public Task WaitForSuccessfulRequestCountAsync(
+        int requiredCount,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(requiredCount);
+        Task milestone;
+        lock (_successfulRequestGate)
+        {
+            if (_successfulRequestCount >= requiredCount)
+            {
+                return Task.CompletedTask;
+            }
+
+            var completion = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            _successfulRequestWaiters.Add(new SuccessfulRequestWaiter(requiredCount, completion));
+            milestone = completion.Task;
+        }
+
+        return milestone.WaitAsync(cancellationToken);
+    }
 
     internal void UpdatePayload(HealthPayload payload)
     {
@@ -149,7 +174,37 @@ public sealed class FixtureHealthServer : IAsyncDisposable
         await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
         if (accepted)
         {
-            _successfulRequest.TrySetResult();
+            RecordSuccessfulRequest();
+        }
+    }
+
+    private void RecordSuccessfulRequest()
+    {
+        List<TaskCompletionSource>? reached = null;
+        lock (_successfulRequestGate)
+        {
+            _successfulRequestCount++;
+            for (var index = _successfulRequestWaiters.Count - 1; index >= 0; index--)
+            {
+                var waiter = _successfulRequestWaiters[index];
+                if (waiter.RequiredCount > _successfulRequestCount)
+                {
+                    continue;
+                }
+
+                reached ??= [];
+                reached.Add(waiter.Completion);
+                _successfulRequestWaiters.RemoveAt(index);
+            }
+        }
+
+        _successfulRequest.TrySetResult();
+        if (reached is not null)
+        {
+            foreach (var completion in reached)
+            {
+                completion.TrySetResult();
+            }
         }
     }
 
@@ -177,4 +232,8 @@ public sealed class FixtureHealthServer : IAsyncDisposable
             _stopping.Dispose();
         }
     }
+
+    private sealed record SuccessfulRequestWaiter(
+        int RequiredCount,
+        TaskCompletionSource Completion);
 }
