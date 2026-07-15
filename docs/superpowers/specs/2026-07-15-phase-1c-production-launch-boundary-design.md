@@ -69,9 +69,11 @@ unsafe partial implementation.
   fixture executable.
 - Preserve AppHost as the sole lifecycle owner for PostgreSQL, server, worker,
   and future sidecars in Option A foreground mode.
-- Prove the existing named-pipe framing, authentication, generation fencing,
-  drain, shutdown, identity-bound HTTP readiness, and bounded-output behavior
-  with Node children.
+- Preserve the existing named-pipe framing and payload identities while adding
+  a versioned challenge-first handshake that lets Node echo AppHost's exact
+  Windows process identity without approximation. Prove authentication,
+  generation fencing, drain, shutdown, identity-bound HTTP readiness, and
+  bounded-output behavior with Node children.
 - Keep application paths, working directories, arguments, ordinary environment,
   secret environment, build identity, readiness strategy, and artifact trust
   explicit and testable.
@@ -145,26 +147,69 @@ contract is installed.
 ### Node control shim
 
 Add a dependency-light TypeScript module under a desktop-specific package. It
-implements only the current control protocol:
+implements the versioned Phase 1C control protocol:
 
 1. read AppHost-issued control values from the secret environment;
 2. connect to the Windows named pipe;
-3. send the authenticated hello with role, generation, operation, build
-   identity, process identity, capability nonce, and loopback endpoint using
-   the current unversioned payload shape;
-4. start an identity-bound loopback HTTP health endpoint whose response includes
+3. receive one bounded `IdentityChallenge` only after AppHost has verified the
+   pipe client's PID, creation time, and Job membership through Windows APIs;
+4. bind the identity-bound loopback HTTP listener before sending Hello;
+5. echo the challenged process ID, exact creation-time ticks, and challenge ID
+   in the version-2 Hello payload together with role, generation, operation,
+   build identity, capability nonce, and loopback endpoint;
+6. initialize the role while the bound health endpoint reports a bounded
+   not-ready response, then report the current identity-bound Health payload
+   only after the role readiness callback succeeds;
+7. serve the identity-bound loopback HTTP health response with
    the current build identity, protocol version, generation, and nonce using
    the current `HealthPayload` shape; role association remains owned by the
    retained AppHost role resource;
-5. enter draining exactly once;
-6. invoke a bounded application drain callback;
-7. acknowledge shutdown and terminate normally; and
-8. reject malformed, stale, oversized, or out-of-order frames while applying
+8. enter draining exactly once;
+9. invoke a bounded application drain callback;
+10. acknowledge shutdown and terminate normally; and
+11. reject malformed, stale, oversized, or out-of-order frames while applying
    the exact duplicate-operation replay rules defined below.
 
 The module must not log environment values, control frames, customer data, or
 exception text. It returns typed reason codes to the controlled probe and lets
 AppHost own external diagnostics.
+
+### Versioned identity challenge
+
+JavaScript cannot reliably derive the exact Windows `FILETIME` creation ticks
+that AppHost currently validates. Phase 1C therefore increments the control
+protocol version and adds one AppHost-to-child `IdentityChallenge` message
+before Hello. The challenge payload contains the expected process ID, exact
+creation-time UTC ticks as a canonical decimal string, and a cryptographically
+random per-endpoint challenge ID. The tick string has bounded length and allows
+ASCII digits only, with no sign, whitespace, decimal separator, exponent, or
+noncanonical leading zeros. .NET parses it with invariant `long` rules; Node
+keeps it as a string/`bigint` and never converts it to a JSON number. The
+challenge contains no pipe name, capability nonce, database secret, or
+application secret.
+
+Before sending the challenge, `WindowsControlChannel` uses the existing native
+pipe-client verifier to prove that the connected client is the retained process
+and belongs to the expected Job Object. The child must echo the challenged PID,
+ticks, and challenge ID in Hello; the existing nonce, role, generation,
+operation, build, endpoint, and process checks still apply. Version 2 adds only
+the challenge ID to the existing Hello data fields and represents its echoed
+creation ticks with the same canonical string. Comparison is exact after
+bounded invariant parsing. A mismatched, duplicate, stale, or missing challenge
+fails closed.
+
+Version 2 has no downgrade path. Exactly one challenge is sent after native
+PID/creation/Job verification. Hello before challenge, a v1 Hello, duplicate or
+conflicting challenge/Hello, wrong PID/ticks/challenge, cross-generation replay,
+timeout, cancellation, and invalid direction all fault the endpoint. Challenge
+frames count toward the existing frame and size budgets. Authentication state
+and `AuthenticationPublishHook` are published only after a valid HelloV2.
+
+The .NET fixture is updated to the same versioned sequence so fresh runs of
+every Phase 1B lifecycle partition re-establish the protocol evidence. The
+historical Phase 1B report remains explicitly v1 evidence. No approximation
+based on `process.uptime`, WMI, PowerShell, or wall-clock subtraction is
+permitted.
 
 ### Controlled Node probes
 
@@ -246,6 +291,20 @@ Control authentication proves process identity, not application readiness.
   required processor registration; merely starting the Node process is
   insufficient. The end-to-end BullMQ canary runs only after both roles are
   ready and performs deterministic cleanup.
+
+After valid HelloV2, the executor polls the bound loopback endpoint until the
+existing role-readiness deadline. Requests never overlap, use a bounded
+cancellation-aware delay, and stop immediately when the role process exits or
+the authenticated control channel is lost. The only retryable result is an HTTP
+success response containing a well-formed, identity-matching `HealthPayload`
+whose status is exactly `not-ready`. Status `ready` completes readiness.
+Nonce, build, generation, or protocol mismatch; malformed payload; unexpected
+HTTP status; any other health status; process exit; or control loss fails
+immediately. When the deadline expires while the role remains authenticated and
+identity-matching but not ready, the executor records stable reason
+`role-readiness-timeout` and enters the existing indeterminate-operation
+reconciliation path rather than starting a second generation. Focused tests
+cover readiness within the deadline and not-ready beyond it.
 
 Drain preserves the reviewed exchange exactly. For one shutdown operation the
 child sends `DrainAccepted`, stops admission, sends
