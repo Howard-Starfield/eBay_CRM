@@ -12,6 +12,7 @@ internal static unsafe partial class NativeMethods
     internal const uint Delete = 0x00010000;
     internal const uint FileShareRead = 0x00000001;
     internal const uint FileShareWrite = 0x00000002;
+    internal const uint FileShareDelete = 0x00000004;
     internal const uint CreateNew = 1;
     internal const uint OpenExisting = 3;
     internal const uint FileAttributeNormal = 0x00000080;
@@ -69,6 +70,13 @@ internal static unsafe partial class NativeMethods
         int informationClass,
         out FileAttributeTagInformation information,
         uint bufferSize);
+
+    [LibraryImport("kernel32.dll", EntryPoint = "GetFinalPathNameByHandleW", SetLastError = true)]
+    internal static partial uint GetFinalPathNameByHandle(
+        SafeFileHandle file,
+        char* filePath,
+        uint filePathLength,
+        uint flags);
 
     [LibraryImport("advapi32.dll", EntryPoint = "GetKernelObjectSecurity", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
