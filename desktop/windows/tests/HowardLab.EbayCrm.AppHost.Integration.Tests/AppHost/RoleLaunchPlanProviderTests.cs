@@ -4,6 +4,7 @@ using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
 using HowardLab.EbayCrm.AppHost.Core.Processes;
 using HowardLab.EbayCrm.AppHost.Core.Time;
 using HowardLab.EbayCrm.AppHost.Fixture;
+using HowardLab.EbayCrm.AppHost.Integration.Tests.Acceptance;
 using HowardLab.EbayCrm.AppHost.Integration.Tests.Postgres;
 using HowardLab.EbayCrm.AppHost.Protocol.Control;
 using HowardLab.EbayCrm.AppHost.Windows.Instance;
@@ -971,6 +972,61 @@ public sealed class RoleLaunchPlanProviderTests
     }
 
     [Fact]
+    public async Task StopServer_OneMillisecondStopBudgetStartsAfterAcceptedAndReconciles()
+    {
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var operationId = Guid.NewGuid();
+        var stopGeneration = generation with { OperationId = operationId };
+        var verificationCount = 0;
+        var boundary = new BlockingRoleOperationBoundary(
+            RuntimeRole.Server,
+            RoleOperationBoundaryPoint.StopAccepted);
+        var deadlines = new RoleOperationDeadlines(
+            TimeSpan.FromSeconds(10),
+            TimeSpan.FromMilliseconds(1),
+            TimeSpan.FromSeconds(5),
+            TimeSpan.FromSeconds(30),
+            TimeSpan.FromMilliseconds(100));
+        await using var harness = CreateRealWindowsHarness(
+            generation,
+            () => Interlocked.Increment(ref verificationCount),
+            roleOperationDeadlines: deadlines,
+            roleOperationBoundary: boundary);
+        harness.Executor.RoleLaunchedForTests = boundary.RecordLaunched;
+        Assert.IsType<RoleStarted>(await harness.Executor.ExecuteAsync(StartCommand(generation)));
+
+        try
+        {
+            var stop = harness.Executor.ExecuteAsync(new LifecycleCommand(
+                LifecycleCommandType.StopServer,
+                stopGeneration,
+                operationId,
+                LifecycleDeadlineKey.ServerStop));
+            await boundary.WaitUntilBlockedAsync(TimeSpan.FromSeconds(5));
+            var timedOut = Assert.IsType<OperationTimedOut>(
+                await stop.WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.Equal(operationId, timedOut.OperationId);
+
+            var reconciliation = harness.Executor.ExecuteAsync(new LifecycleCommand(
+                LifecycleCommandType.ReconcileRoleStop,
+                stopGeneration,
+                operationId,
+                LifecycleDeadlineKey.RoleReconciliation));
+            boundary.Release();
+            var reconciled = Assert.IsType<Reconciled>(
+                await reconciliation.WaitAsync(TimeSpan.FromSeconds(5)));
+
+            Assert.Equal(ReconciledState.Stopped, reconciled.State);
+            Assert.Null(harness.Executor.SnapshotForTests().ServerProcessId);
+            Assert.Equal(1, Volatile.Read(ref verificationCount));
+        }
+        finally
+        {
+            boundary.Release();
+        }
+    }
+
+    [Fact]
     public async Task ReconcileRoleStop_CallerCancellationPropagatesAndRetainsIndeterminateRole()
     {
         var generation = new ProcessGeneration(RuntimeRole.Worker, 1, Guid.NewGuid());
@@ -1510,7 +1566,8 @@ public sealed class RoleLaunchPlanProviderTests
     private static ExecutorHarness CreateHarness(
         IRoleLaunchPlanProvider provider,
         IProcessLauncher? launcher,
-        RoleOperationDeadlines? roleOperationDeadlines = null)
+        RoleOperationDeadlines? roleOperationDeadlines = null,
+        IRoleOperationBoundary? roleOperationBoundary = null)
     {
         var profileRoot = Path.Combine(Path.GetTempPath(), $"role-plan-{Guid.NewGuid():N}");
         Directory.CreateDirectory(profileRoot);
@@ -1546,7 +1603,7 @@ public sealed class RoleLaunchPlanProviderTests
             options,
             payload,
             identityStore: null,
-            NoopRoleOperationBoundary.Instance,
+            roleOperationBoundary ?? NoopRoleOperationBoundary.Instance,
             roleOperationDeadlines ?? RoleOperationDeadlines.Production,
             gatedSink,
             secrets,
@@ -1560,7 +1617,8 @@ public sealed class RoleLaunchPlanProviderTests
         ProcessGeneration generation,
         Action verifyPayloadClosureAfterShutdown,
         string? fixtureMode = null,
-        RoleOperationDeadlines? roleOperationDeadlines = null)
+        RoleOperationDeadlines? roleOperationDeadlines = null,
+        IRoleOperationBoundary? roleOperationBoundary = null)
     {
         var healthPort = ReserveLoopbackPort();
         var fixturePath = Path.ChangeExtension(typeof(FixtureMode).Assembly.Location, ".exe");
@@ -1581,7 +1639,8 @@ public sealed class RoleLaunchPlanProviderTests
                 healthPort: healthPort,
                 verifyPayloadClosureAfterShutdown: verifyPayloadClosureAfterShutdown)),
             launcher: null,
-            roleOperationDeadlines);
+            roleOperationDeadlines,
+            roleOperationBoundary);
     }
 
     private static int ReserveLoopbackPort()

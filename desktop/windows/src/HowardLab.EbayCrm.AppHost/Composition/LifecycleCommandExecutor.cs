@@ -1325,19 +1325,6 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         LifecycleCommand command,
         CancellationToken cancellationToken)
     {
-        using var commandDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        commandDeadline.CancelAfter(_roleOperationDeadlines.StopCommand);
-        return await DrainWorkerAsync(
-            command,
-            cancellationToken,
-            commandDeadline.Token).ConfigureAwait(false);
-    }
-
-    private async Task<LifecycleEvent?> DrainWorkerAsync(
-        LifecycleCommand command,
-        CancellationToken callerCancellation,
-        CancellationToken commandCancellation)
-    {
         if (_worker is null)
         {
             return null;
@@ -1354,7 +1341,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         {
             await _worker.Channel.SendAsync(
                 Empty(ControlMessageType.Drain, command.OperationId, _worker.Generation),
-                commandCancellation).ConfigureAwait(false);
+                cancellationToken).ConfigureAwait(false);
             var expected = new[]
             {
                 ControlMessageType.DrainAccepted,
@@ -1364,7 +1351,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             };
             foreach (var type in expected)
             {
-                var reply = await _worker.Channel.ReadAsync(commandCancellation).ConfigureAwait(false);
+                var reply = await _worker.Channel.ReadAsync(cancellationToken).ConfigureAwait(false);
                 if (reply.Type != type || reply.OperationId != command.OperationId)
                 {
                     throw new AppHostExecutionException("worker-drain-sequence-invalid");
@@ -1373,22 +1360,14 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
         catch (Exception error) when (IsRoleTransportFailure(error))
         {
-            return await AwaitAuthoritativeRoleExitAfterTransportFailureAsync(
+            return await AwaitAuthoritativeRoleExitAfterTransportFailureWithFreshDeadlineAsync(
                 _worker,
                 command,
-                callerCancellation,
-                commandCancellation).ConfigureAwait(false);
+                cancellationToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (callerCancellation.IsCancellationRequested)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
-        }
-        catch (OperationCanceledException) when (commandCancellation.IsCancellationRequested)
-        {
-            MarkRoleStopIndeterminate(_worker, command.OperationId);
-            return new OperationTimedOut(
-                RequireGeneration(command, RuntimeRole.Worker),
-                command.OperationId);
         }
 
         _worker.Drained = true;
@@ -1415,9 +1394,6 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             throw new AppHostExecutionException("role-retained-identity-mismatch");
         }
 
-        using var commandDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        commandDeadline.CancelAfter(_roleOperationDeadlines.StopCommand);
-
         await StopMonitoringAsync(resource).ConfigureAwait(false);
 
         if (resource.Process.HasExited)
@@ -1428,10 +1404,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
 
         if (role == RuntimeRole.Worker && !resource.Drained)
         {
-            var drainResult = await DrainWorkerAsync(
-                command,
-                cancellationToken,
-                commandDeadline.Token).ConfigureAwait(false);
+            var drainResult = await DrainWorkerAsync(command, cancellationToken).ConfigureAwait(false);
             if (drainResult is not null)
             {
                 return drainResult;
@@ -1448,8 +1421,8 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         {
             await resource.Channel.SendAsync(
                 Empty(ControlMessageType.Shutdown, command.OperationId, resource.Generation),
-                commandDeadline.Token).ConfigureAwait(false);
-            var accepted = await resource.Channel.ReadAsync(commandDeadline.Token).ConfigureAwait(false);
+                cancellationToken).ConfigureAwait(false);
+            var accepted = await resource.Channel.ReadAsync(cancellationToken).ConfigureAwait(false);
             if (accepted.Type != ControlMessageType.ShutdownAccepted || accepted.OperationId != command.OperationId)
             {
                 throw new AppHostExecutionException("role-shutdown-sequence-invalid");
@@ -1457,24 +1430,20 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
         catch (Exception error) when (IsRoleTransportFailure(error))
         {
-            return await AwaitAuthoritativeRoleExitAfterTransportFailureAsync(
+            return await AwaitAuthoritativeRoleExitAfterTransportFailureWithFreshDeadlineAsync(
                 resource,
                 command,
-                cancellationToken,
-                commandDeadline.Token).ConfigureAwait(false);
+                cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
-        catch (OperationCanceledException) when (commandDeadline.IsCancellationRequested)
-        {
-            MarkRoleStopIndeterminate(resource, command.OperationId);
-            return new OperationTimedOut(commandGeneration, command.OperationId);
-        }
 
         resource.ShutdownOperationId = command.OperationId;
         resource.StopCompletionTask = CompleteRoleStopAsync(resource, command.OperationId);
+        using var commandDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        commandDeadline.CancelAfter(_roleOperationDeadlines.StopCommand);
         try
         {
             await resource.StopCompletionTask.WaitAsync(commandDeadline.Token).ConfigureAwait(false);
@@ -1500,6 +1469,20 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
 
         await DisposeRoleAsync(resource).ConfigureAwait(false);
         return null;
+    }
+
+    private async Task<LifecycleEvent?> AwaitAuthoritativeRoleExitAfterTransportFailureWithFreshDeadlineAsync(
+        RoleResource resource,
+        LifecycleCommand command,
+        CancellationToken callerCancellation)
+    {
+        using var commandDeadline = CancellationTokenSource.CreateLinkedTokenSource(callerCancellation);
+        commandDeadline.CancelAfter(_roleOperationDeadlines.StopCommand);
+        return await AwaitAuthoritativeRoleExitAfterTransportFailureAsync(
+            resource,
+            command,
+            callerCancellation,
+            commandDeadline.Token).ConfigureAwait(false);
     }
 
     private async Task<LifecycleEvent?> AwaitAuthoritativeRoleExitAfterTransportFailureAsync(
