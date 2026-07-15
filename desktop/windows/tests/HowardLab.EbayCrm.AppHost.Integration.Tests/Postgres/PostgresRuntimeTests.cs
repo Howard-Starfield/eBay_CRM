@@ -497,7 +497,10 @@ public sealed class PostgresRuntimeTests
         Assert.Contains("../runtime/postgres-logs/postgres-", current, StringComparison.OrdinalIgnoreCase);
         Assert.True(Directory.Exists(cluster.Paths.ServerLogDirectory));
         var boundedLogs = Directory.GetFiles(cluster.Paths.ServerLogDirectory, "postgres-*.log");
-        Assert.InRange(boundedLogs.Length, 1, 8);
+        // Seven retained logs plus the live collector's initial file and one minute rotation.
+        Assert.InRange(boundedLogs.Length, 8, 9);
+        var retainedOldLogs = Directory.GetFiles(cluster.Paths.ServerLogDirectory, "postgres-old-*.log");
+        Assert.Equal(7, retainedOldLogs.Length);
         Assert.All(boundedLogs, path => Assert.InRange(new FileInfo(path).Length, 0, 1024 * 1024));
         AssertLifecycleBootstrapLogBounds(cluster.Paths.RuntimeDirectory);
 
