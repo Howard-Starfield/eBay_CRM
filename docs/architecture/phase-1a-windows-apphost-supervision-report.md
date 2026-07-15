@@ -216,3 +216,159 @@ for the same user. Phase 1A does not decide the later Redis/PostgreSQL product
 policy.
 
 REVISE_APPHOST_FOUNDATION
+
+---
+
+# Phase 1B Windows AppHost hardening evidence addendum
+
+Date: 2026-07-15 (America/Los_Angeles)
+
+Branch: `codex/phase-1b-apphost-hardening`
+
+Tested implementation commit: `f432ece2a41601e48fec36528a80d3b0587d7064`.
+Tested implementation tree: `6a7cbe59c95508ead2b1265d7caec6c2322da3d5`.
+The later documentation-only evidence commit does not change the tested
+implementation. Scope remains the Windows AppHost foundation. No Redis-free
+Twenty boot, full Twenty server, eBay UI, tray, installer, updater, backup, or
+local-model runtime was launched or claimed.
+
+## Environment and clean build
+
+- Microsoft Windows 11 Home 10.0.26200, build 26200, 64-bit.
+- .NET SDK 10.0.302, MSBuild 18.6.11, host/runtime 10.0.10, `win-x64`.
+- Pinned PostgreSQL `postgres (PostgreSQL) 16.14` from
+  `C:\Users\sdokd\Downloads\eBayCRM\.worktrees\phase-1a-apphost\.tools\postgresql\16\bin`.
+- `EBAYCRM_POSTGRES_BIN` was set to that exact directory for every PostgreSQL
+  gate. `EBAYCRM_RELEASE_ACCEPTANCE=1` made S4U policy unavailability a failure,
+  not a skip.
+
+The final post-fix sequence ran:
+
+```powershell
+dotnet restore desktop\windows\EbayCrm.Desktop.sln --locked-mode
+dotnet build desktop\windows\EbayCrm.Desktop.sln --configuration Release --no-restore --nologo
+Remove-Item -Recurse -Force desktop\windows\artifacts\win-x64 -ErrorAction SilentlyContinue
+dotnet publish desktop\windows\src\HowardLab.EbayCrm.AppHost\HowardLab.EbayCrm.AppHost.csproj --configuration Release --runtime win-x64 --self-contained true --output desktop\windows\artifacts\win-x64 --no-restore --nologo -p:PublishSingleFile=false -p:PublishTrimmed=false -p:PublishAot=false
+```
+
+Locked restore and publish exited zero. The Release build reported 0 warnings
+and 0 errors. The clean self-contained publish contained 204 files totaling
+81,266,106 bytes, including AppHost, Fixture, `hostfxr.dll`, `coreclr.dll`, and
+`System.Private.CoreLib.dll`.
+
+## Focused Phase 1B gates
+
+The exact aggregate gate was:
+
+```powershell
+dotnet test desktop\windows\tests\HowardLab.EbayCrm.AppHost.Integration.Tests\HowardLab.EbayCrm.AppHost.Integration.Tests.csproj --configuration Release --no-restore --filter "FullyQualifiedName~TimeoutReconciliationAcceptanceTests|FullyQualifiedName~DiagnosticCanaryAcceptanceTests|FullyQualifiedName~CrossSessionOwnershipAcceptanceTests" --logger "console;verbosity=detailed" --nologo
+```
+
+It passed 28 of 28 tests with 0 failures and 0 skips. Because that literal
+filter does not select the late-stop tests in `AppHostShutdownTests`, the four
+role boundaries were also run with this required supplement:
+
+```powershell
+dotnet test desktop\windows\tests\HowardLab.EbayCrm.AppHost.Integration.Tests\HowardLab.EbayCrm.AppHost.Integration.Tests.csproj --configuration Release --no-restore --no-build --filter "FullyQualifiedName~TimeoutReconciliationAcceptanceTests|FullyQualifiedName~AppHostShutdownTests" --logger "console;verbosity=detailed" --nologo
+```
+
+The supplement passed 15 of 15 tests with 0 failures and 0 skips. Its detailed
+output included late start and late stop for both Server and Worker. A separate
+six-test output-only evidence replay passed 6 of 6; its temporary serialization
+statements were reverted and are not part of the tested or committed tree.
+
+### Retained role identity evidence
+
+Each row was captured while its injected boundary held the original retained
+operation. Each test asserted one role launch, one launch for the exact
+generation, one live exact Fixture identity before release, and no duplicate.
+
+| Boundary | Role | Generation | Operation ID | PID | UTC creation time |
+|---|---|---:|---|---:|---|
+| `StartIdentityRetained` | Server | 1 | `75503489-a731-4d4d-ad23-3948fdbdfa29` | 38520 | `2026-07-15T11:57:23.2200753Z` |
+| `StartIdentityRetained` | Worker | 1 | `1cef24fd-f922-4d4a-ac04-ec47c99c5e6f` | 33392 | `2026-07-15T11:57:35.6132792Z` |
+| `StopAccepted` | Server | 1 | `de08626f-b1a2-4a71-90d0-09a729a509ed` | 6120 | `2026-07-15T11:57:35.8019767Z` |
+| `StopAccepted` | Worker | 1 | `742ab65d-7d69-49f2-98e1-be7ff10ed530` | 13224 | `2026-07-15T11:57:23.1251886Z` |
+
+Both start cases reconciled to `Ready` with the same generation and identity.
+Both stop cases reconciled to `Stopped`, left zero live exact Fixture identities,
+released profile ownership exactly once, and left the retained database identity
+signaled.
+
+### Production diagnostic evidence
+
+`ProductionCompositionRedactsGeneratedSecretsBoundsSegmentsAndLoserTouchesNothing`
+recorded 4 retained JSONL segments totaling 3,406,726 bytes. Six distinct
+registered canaries were exercised. The subsequent artifact scan examined 7
+artifacts (four JSONL segments, manifest, ZIP, and ZIP entry) and returned 0
+findings. The retained text contained `[REDACTED]`, contained no raw canary, and
+the losing composition made zero segment-factory calls and did not alter the
+owner's segment snapshots.
+
+### Same-user S4U evidence
+
+The real release-mode S4U gate recorded:
+
+- User SID `S-1-5-21-3841990347-2960067561-1741789597-1001`.
+- Owner PID 20632 in interactive session 3.
+- Broker PID 14044 in S4U session 0.
+- Contender PID 19800 in the same S4U session 0, created at
+  `2026-07-15T11:57:50.8517446Z`.
+- Cumulative broker Job process count 1; contender exit code 2 with exact
+  `profile-already-owned` stderr.
+
+The owner remained healthy, the contender could not mutate the owned profile,
+and the focused gate reported no S4U skip.
+
+## Full documented partitions
+
+The final post-fix partition commands and observed counts were:
+
+| Partition | Command discriminator | Passed | Failed | Skipped |
+|---|---|---:|---:|---:|
+| Core | Core test project | 150 | 0 | 0 |
+| Windows | Windows test project | 142 | 0 | 0 |
+| Non-destructive integration | `Category!=DestructiveContainment` | 137 | 0 | 0 |
+| Destructive containment | `Category=DestructiveContainment` with `RunConfiguration.DisableAppDomain=true` | 3 | 0 | 0 |
+
+Total across the non-overlapping partitions: 432 passed, 0 failed, 0 skipped.
+The destructive partition's pre/post inventory remained 204 files and
+81,266,106 bytes with zero relative-path, length, or SHA-256 differences.
+
+## Destructive cleanup regression found during adoption
+
+The first Task 5 destructive run passed 2 tests and failed
+`TwentyPublishedContenders_ProduceOneOwnerAndStableLosers` during profile
+deletion because `apphost-0.jsonl` was still non-delete-shareable. The isolated
+test reproduced the failure. Diagnostic RED evidence identified winning AppHost
+PID 24700, created `2026-07-15T11:38:30.6617056Z`; all 20 retained AppHost
+identities had signaled, but external termination/Job/file teardown had not yet
+made the diagnostic file exclusive before deletion began.
+
+Commit `f432ece2a41601e48fec36528a80d3b0587d7064` added the same bounded
+condition-based exclusive-file wait already used by the cross-session test.
+The isolated test then passed 1 of 1, and two complete destructive replays each
+passed 3 of 3. The final replay is the count recorded above. The initial failure
+is retained here rather than hidden.
+
+## Exact-scope cleanup audit and limitation
+
+The final audit queried eight exact executable paths: the published AppHost and
+Fixture, Release Fixture and acceptance broker, and pinned `postgres.exe`,
+`pg_ctl.exe`, `initdb.exe`, and `psql.exe`. It found 0 surviving exact
+identities. It did not enumerate, inspect, or kill unrelated user processes by
+image name.
+
+Task Scheduler's `\HowardLab` folder was absent, so there were 0
+`eBayCRM-Acceptance-*` tasks. Sixteen exact disposable-prefix patterns covering
+Phase 1B role, diagnostic, S4U, PostgreSQL, and containment roots found 0 roots.
+An earlier audit found two older `ebaycrm-pg-*` roots created before Task 5;
+after confirming zero exact pinned PostgreSQL survivors and exclusive access,
+only those resolved disposable roots were removed. The final audit was then
+repeated and returned zero for all three categories.
+
+The remaining limitation is deliberate scope: these gates use the attested
+Fixture plus real PostgreSQL and do not prove a Redis-free or full Twenty boot.
+They support adoption of the hardened .NET AppHost foundation only.
+
+ADOPT_DOTNET_APPHOST_FOUNDATION
