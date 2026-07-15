@@ -18,7 +18,8 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
         int port,
         SecretValue password,
         WindowsJobObject job,
-        PostgresRuntime runtime)
+        PostgresRuntime runtime,
+        FaultInjectingLauncher launcher)
     {
         Root = root;
         Layout = layout;
@@ -27,6 +28,7 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
         Password = password;
         Job = job;
         Runtime = runtime;
+        Launcher = launcher;
     }
 
     internal string Root { get; }
@@ -36,8 +38,8 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
     internal SecretValue Password { get; }
     internal WindowsJobObject Job { get; private set; }
     internal PostgresRuntime Runtime { get; private set; }
+    internal FaultInjectingLauncher Launcher { get; private set; }
     internal PostgresInstanceIdentity? Identity { get; set; }
-    private DelayedStartLauncher? DelayedStart { get; set; }
     private bool RuntimeDisposed { get; set; }
 
     internal static async Task<PostgresTestCluster> CreateAsync(
@@ -65,7 +67,8 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
         var paths = PostgresClusterPaths.Create(root);
         var port = requestedPort ?? AllocateLoopbackPort();
         var job = WindowsJobObject.CreateKillOnClose();
-        var launcher = new WindowsProcessLauncher(NoopDiagnosticSink.Instance, maxOutputBytes: 256 * 1024);
+        var launcher = new FaultInjectingLauncher(
+            new WindowsProcessLauncher(NoopDiagnosticSink.Instance, maxOutputBytes: 256 * 1024));
         var generation = new ProcessGeneration(RuntimeRole.Database, 1, Guid.NewGuid());
         var password = new SecretValue($"task7-{Guid.NewGuid():N}-Aa1!");
         var runtime = new PostgresRuntime(
@@ -81,7 +84,7 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
             reconciliationDeadline ?? TimeSpan.FromSeconds(30));
         try
         {
-            var cluster = new PostgresTestCluster(root, layout, paths, port, password, job, runtime);
+            var cluster = new PostgresTestCluster(root, layout, paths, port, password, job, runtime, launcher);
             if (initialize)
             {
                 Assert.Equal(PostgreSqlOperationOutcome.Completed, await runtime.InitializeAsync());
@@ -112,8 +115,15 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
         {
             if (Identity is { } identity && !identity.HasExited)
             {
-                _ = await Runtime.StopFastAsync(identity);
-                _ = await Runtime.ReconcileStopAsync(identity);
+                try
+                {
+                    _ = await Runtime.StopFastAsync(identity);
+                    _ = await Runtime.ReconcileStopAsync(identity);
+                }
+                catch (InvalidOperationException)
+                {
+                    // Fault tests can intentionally leave the runtime fenced; Job closure below is authoritative cleanup.
+                }
             }
         }
         finally
@@ -147,7 +157,9 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
         Identity = null;
 
         Job = WindowsJobObject.CreateKillOnClose();
-        var launcher = new WindowsProcessLauncher(NoopDiagnosticSink.Instance, maxOutputBytes: 256 * 1024);
+        var launcher = new FaultInjectingLauncher(
+            new WindowsProcessLauncher(NoopDiagnosticSink.Instance, maxOutputBytes: 256 * 1024));
+        Launcher = launcher;
         var generation = new ProcessGeneration(RuntimeRole.Database, 2, Guid.NewGuid());
         Runtime = new PostgresRuntime(
             Layout,
@@ -168,7 +180,9 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
     {
         if (Identity is not null) throw new InvalidOperationException("The cluster is already running.");
         await Runtime.DisposeAsync();
-        var launcher = new WindowsProcessLauncher(NoopDiagnosticSink.Instance, maxOutputBytes: 256 * 1024);
+        var launcher = new FaultInjectingLauncher(
+            new WindowsProcessLauncher(NoopDiagnosticSink.Instance, maxOutputBytes: 256 * 1024));
+        Launcher = launcher;
         Runtime = new PostgresRuntime(
             Layout,
             Paths,
@@ -182,46 +196,23 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
             reconciliationDeadline ?? TimeSpan.FromSeconds(2));
     }
 
-    internal async Task<PostgreSqlOperationResult<PostgresInstanceIdentity>> CrashJobAndBeginIndeterminateRestartAsync()
-    {
-        var previousIdentity = Identity ?? throw new InvalidOperationException("The cluster is not running.");
-        Job.Dispose();
-        await previousIdentity.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
-        Assert.Equal(PostgreSqlOperationOutcome.ReconciledStopped,
-            await Runtime.ReconcileStopAsync(previousIdentity));
-        await Runtime.DisposeAsync();
-        Identity = null;
-
-        Job = WindowsJobObject.CreateKillOnClose();
-        var launcher = new DelayedStartLauncher(
-            new WindowsProcessLauncher(NoopDiagnosticSink.Instance, maxOutputBytes: 256 * 1024));
-        DelayedStart = launcher;
-        Runtime = new PostgresRuntime(
-            Layout,
-            Paths,
-            new ProcessGeneration(RuntimeRole.Database, 2, Guid.NewGuid()),
-            Port,
-            new SecretValue($"injected-recovery-gate-{Guid.NewGuid():N}-Aa1!"),
-            launcher,
-            Job,
-            TimeSpan.FromMilliseconds(1),
-            TimeSpan.FromSeconds(30),
-            TimeSpan.FromSeconds(2));
-        Assert.Equal(PostgreSqlOperationOutcome.Completed, await Runtime.InitializeAsync());
-        var start = await Runtime.StartAsync();
-        Assert.Equal(PostgreSqlOperationOutcome.TimedOutIndeterminate, start.Outcome);
-        await WaitForFileAsync(Paths.PostmasterPidFile, TimeSpan.FromSeconds(30));
-        return await Runtime.ReconcileStartAsync();
-    }
-
-    internal void ReleaseDelayedStartCommand()
-    {
-        var delayed = DelayedStart ?? throw new InvalidOperationException("No delayed start command exists.");
-        Assert.False(delayed.Released.Task.IsCompleted);
-        delayed.Released.TrySetResult();
-    }
-
     internal async Task ExecuteSqlAsync(string sql)
+    {
+        _ = await ExecuteSqlCoreAsync(sql);
+    }
+
+    internal Task<string> ExecuteSqlScalarAsync(string sql) => ExecuteSqlCoreAsync(sql);
+
+    internal void ConfigureAsDisconnectedStandby()
+    {
+        File.WriteAllBytes(Path.Combine(Paths.DataDirectory, "standby.signal"), []);
+        File.AppendAllText(
+            Path.Combine(Paths.DataDirectory, "postgresql.auto.conf"),
+            $"{Environment.NewLine}hot_standby = on{Environment.NewLine}" +
+            "primary_conninfo = 'host=127.0.0.1 port=1 user=ebaycrm connect_timeout=1'" + Environment.NewLine);
+    }
+
+    private async Task<string> ExecuteSqlCoreAsync(string sql)
     {
         var systemRoot = Environment.GetEnvironmentVariable("SystemRoot")
             ?? throw new InvalidOperationException("SystemRoot is unavailable.");
@@ -249,6 +240,7 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
         var exitCode = await command.Completion.WaitAsync(TimeSpan.FromSeconds(30));
         if (exitCode != 0)
             throw new InvalidOperationException($"psql failed ({exitCode}): {command.StandardError.Snapshot()}");
+        return command.StandardOutput.Snapshot().Trim();
     }
 
     internal async Task DisposeRuntimeAsync()
@@ -300,51 +292,90 @@ internal sealed class PostgresTestCluster : IAsyncDisposable
             ValueTask.CompletedTask;
     }
 
-    private sealed class DelayedStartLauncher(IProcessLauncher inner) : IProcessLauncher
+    internal sealed class FaultInjectingLauncher(IProcessLauncher inner) : IProcessLauncher
     {
-        internal TaskCompletionSource Released { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal bool FailNextStopLaunch { get; set; }
+        internal int? CompleteNextStopWithExitCode { get; set; }
+        internal TimeSpan DelayNextStopLaunch { get; set; }
+        internal bool LeaveNextStopPending { get; set; }
+        internal int? LastStopTimeoutSeconds { get; private set; }
+        internal TaskCompletionSource StopLaunchObserved { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public async ValueTask<ISupervisedProcess> LaunchAsync(
             LaunchSpecification specification,
             IProcessGroup processGroup,
             CancellationToken cancellationToken)
         {
-            var process = await inner.LaunchAsync(specification, processGroup, cancellationToken);
-            return Path.GetFileName(specification.ApplicationPath).Equals("pg_ctl.exe", StringComparison.OrdinalIgnoreCase) &&
-                specification.Arguments.Count > 0 && specification.Arguments[0] == "start"
-                ? new DelayedCompletionProcess(process, Released)
-                : process;
+            var isStop = Path.GetFileName(specification.ApplicationPath)
+                .Equals("pg_ctl.exe", StringComparison.OrdinalIgnoreCase) &&
+                specification.Arguments.Count > 0 && specification.Arguments[0] == "stop";
+            if (!isStop) return await inner.LaunchAsync(specification, processGroup, cancellationToken);
+
+            StopLaunchObserved.TrySetResult();
+            var timeoutIndex = specification.Arguments.ToList().IndexOf("-t");
+            LastStopTimeoutSeconds = int.Parse(specification.Arguments[timeoutIndex + 1]);
+            if (DelayNextStopLaunch > TimeSpan.Zero)
+            {
+                var delay = DelayNextStopLaunch;
+                DelayNextStopLaunch = TimeSpan.Zero;
+                await Task.Delay(delay, cancellationToken);
+            }
+            if (FailNextStopLaunch)
+            {
+                FailNextStopLaunch = false;
+                throw new InvalidOperationException("injected-stop-launch-failure");
+            }
+            if (CompleteNextStopWithExitCode is { } exitCode)
+            {
+                CompleteNextStopWithExitCode = null;
+                return InjectedProcess.Completed(exitCode);
+            }
+            if (LeaveNextStopPending)
+            {
+                LeaveNextStopPending = false;
+                return InjectedProcess.Pending();
+            }
+            return await inner.LaunchAsync(specification, processGroup, cancellationToken);
         }
     }
 
-    private sealed class DelayedCompletionProcess : ISupervisedProcess
+    private sealed class InjectedProcess : ISupervisedProcess
     {
-        private readonly ISupervisedProcess _inner;
-        private readonly TaskCompletionSource _release;
+        private readonly TaskCompletionSource<int>? _pending;
 
-        internal DelayedCompletionProcess(ISupervisedProcess inner, TaskCompletionSource release)
+        private InjectedProcess(Task<int> completion, TaskCompletionSource<int>? pending)
         {
-            _inner = inner;
-            _release = release;
-            Completion = CompleteAsync();
+            Completion = completion;
+            _pending = pending;
+            StandardOutput = new BoundedTextCollector(4096, 1024);
+            StandardError = new BoundedTextCollector(4096, 1024);
+            StandardOutput.Complete();
+            StandardError.Complete();
+            Identity = new SupervisedProcessIdentity(
+                RuntimeRole.Database,
+                new ProcessGeneration(RuntimeRole.Database, 99, Guid.NewGuid()),
+                Environment.ProcessId,
+                DateTimeOffset.UtcNow,
+                Environment.ProcessPath!);
         }
 
-        public SupervisedProcessIdentity Identity => _inner.Identity;
+        internal static InjectedProcess Completed(int exitCode) => new(Task.FromResult(exitCode), null);
+
+        internal static InjectedProcess Pending()
+        {
+            var pending = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            return new InjectedProcess(pending.Task, pending);
+        }
+
+        public SupervisedProcessIdentity Identity { get; }
         public Task<int> Completion { get; }
-        public BoundedTextCollector StandardOutput => _inner.StandardOutput;
-        public BoundedTextCollector StandardError => _inner.StandardError;
+        public BoundedTextCollector StandardOutput { get; }
+        public BoundedTextCollector StandardError { get; }
 
-        public async ValueTask DisposeAsync()
+        public ValueTask DisposeAsync()
         {
-            _release.TrySetResult();
-            await _inner.DisposeAsync();
-        }
-
-        private async Task<int> CompleteAsync()
-        {
-            var exitCode = await _inner.Completion;
-            await _release.Task;
-            return exitCode;
+            _pending?.TrySetResult(1);
+            return ValueTask.CompletedTask;
         }
     }
 }

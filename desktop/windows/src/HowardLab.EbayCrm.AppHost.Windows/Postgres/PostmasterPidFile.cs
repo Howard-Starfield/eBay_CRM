@@ -61,7 +61,7 @@ public sealed record PostmasterPidFile(
         var lines = contents.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
         if (lines.Length < 8 ||
             !int.TryParse(lines[0], NumberStyles.None, CultureInfo.InvariantCulture, out var pid) || pid <= 0 ||
-            string.IsNullOrWhiteSpace(lines[1]) || !Path.IsPathFullyQualified(lines[1]) ||
+            string.IsNullOrWhiteSpace(lines[1]) ||
             !long.TryParse(lines[2], NumberStyles.None, CultureInfo.InvariantCulture, out var seconds) || seconds <= 0 ||
             !int.TryParse(lines[3], NumberStyles.None, CultureInfo.InvariantCulture, out var port) || port is <= 0 or > 65535 ||
             string.IsNullOrWhiteSpace(lines[7]))
@@ -69,7 +69,21 @@ public sealed record PostmasterPidFile(
             throw new PostmasterPidFileException("postmaster-pid-malformed");
         }
 
-        var actualDirectory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(lines[1]));
+        string actualDirectory;
+        try
+        {
+            if (!Path.IsPathFullyQualified(lines[1]))
+                throw new PostmasterPidFileException("postmaster-pid-malformed");
+            actualDirectory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(lines[1]));
+        }
+        catch (PostmasterPidFileException)
+        {
+            throw;
+        }
+        catch (Exception error) when (error is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            throw new PostmasterPidFileException("postmaster-pid-malformed", error);
+        }
         var expectedDirectory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(expectedDataDirectory));
         if (!StringComparer.OrdinalIgnoreCase.Equals(actualDirectory, expectedDirectory))
         {

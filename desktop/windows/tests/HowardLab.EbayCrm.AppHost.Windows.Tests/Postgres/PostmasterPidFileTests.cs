@@ -152,6 +152,17 @@ public sealed class PostmasterPidFileTests
         }
     }
 
+    [Fact]
+    public void Parse_NormalizesMalformedDataDirectoryPath()
+    {
+        var contents = "4321\nC:\\invalid\0path\n1712345678\n55432\n\n127.0.0.1\n123 456\nready\n";
+
+        var error = Assert.Throws<PostmasterPidFileException>(() =>
+            PostmasterPidFile.Parse(contents, DataDirectory));
+
+        Assert.Equal("postmaster-pid-malformed", error.ReasonCode);
+    }
+
     public static TheoryData<string> InvalidContents() => new()
     {
         "",

@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -354,6 +355,8 @@ public sealed class PostgresRuntime :
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         ISupervisedProcess? command = null;
         var launchCompleted = false;
+        RuntimeState? stateBeforeStop = null;
+        var stopStarted = Stopwatch.GetTimestamp();
         try
         {
             if (_state is RuntimeState.Stopping or RuntimeState.StopIndeterminate)
@@ -371,15 +374,20 @@ public sealed class PostgresRuntime :
                 _identity = null;
                 return PostgreSqlOperationOutcome.ReconciledStopped;
             }
+            stateBeforeStop = _state;
             _state = RuntimeState.Stopping;
-            var seconds = Math.Max(1, (int)Math.Ceiling(_stopDeadline.TotalSeconds));
+            var remaining = Remaining(_stopDeadline, stopStarted);
+            var seconds = Math.Max(1, (int)Math.Ceiling(remaining.TotalSeconds));
             command = await LaunchCommandAsync(
                 _layout.PgCtlExe,
                 ["stop", "-D", _paths.DataDirectory, "-m", "fast", "-w", "-t", seconds.ToString(CultureInfo.InvariantCulture)],
                 secretEnvironment: null,
                 cancellationToken).ConfigureAwait(false);
             launchCompleted = true;
-            var exitCode = await WaitBoundedAsync(command, _stopDeadline, cancellationToken).ConfigureAwait(false);
+            remaining = Remaining(_stopDeadline, stopStarted);
+            var exitCode = remaining > TimeSpan.Zero
+                ? await WaitBoundedAsync(command, remaining, cancellationToken).ConfigureAwait(false)
+                : null;
             if (exitCode is null)
             {
                 _pendingStopCommand = command;
@@ -412,6 +420,10 @@ public sealed class PostgresRuntime :
                 command = null;
                 _state = RuntimeState.StopIndeterminate;
             }
+            else if (stateBeforeStop is { } retryableState && _state == RuntimeState.Stopping)
+            {
+                _state = retryableState;
+            }
             throw;
         }
         finally
@@ -429,7 +441,21 @@ public sealed class PostgresRuntime :
             identity = ValidateCurrentIdentity(identity);
             if (!await DrainPendingControlCommandsAsync(_reconciliationDeadline, cancellationToken).ConfigureAwait(false))
                 return PostgreSqlOperationOutcome.TimedOutIndeterminate;
-            if (!identity.HasExited) return PostgreSqlOperationOutcome.TimedOutIndeterminate;
+            if (!identity.HasExited)
+            {
+                if (_state != RuntimeState.StopIndeterminate)
+                    return PostgreSqlOperationOutcome.TimedOutIndeterminate;
+                try
+                {
+                    _ = await ProbeCoreAsync(identity, _reconciliationDeadline, cancellationToken).ConfigureAwait(false);
+                    _state = RuntimeState.Running;
+                    return PostgreSqlOperationOutcome.ReconciledRunning;
+                }
+                catch (PostgresProbeException)
+                {
+                    return PostgreSqlOperationOutcome.TimedOutIndeterminate;
+                }
+            }
             _state = RuntimeState.Stopped;
             DeleteReconciledPidFile(identity);
             TrimLogIfNeeded();
@@ -502,14 +528,22 @@ public sealed class PostgresRuntime :
 
     private void RefreshIdentity()
     {
-        var needsCapture = _identity is null;
-        if (!needsCapture)
+        if (_identity is null)
         {
-            try { needsCapture = _identity!.HasExited; }
-            catch (ObjectDisposedException) { needsCapture = true; }
+            _identity = TryCaptureIdentity();
+            return;
         }
 
-        if (needsCapture) _identity = TryCaptureIdentity();
+        try
+        {
+            if (!_identity.HasExited) return;
+            var replacement = TryCaptureIdentity();
+            if (replacement is not null) _identity = replacement;
+        }
+        catch (ObjectDisposedException)
+        {
+            _identity = TryCaptureIdentity();
+        }
     }
 
     private PostgresInstanceIdentity ValidateCurrentIdentity(PostgresInstanceIdentity identity)
@@ -622,6 +656,9 @@ public sealed class PostgresRuntime :
         try { return await command.Completion.WaitAsync(timeout, cancellationToken).ConfigureAwait(false); }
         catch (TimeoutException) { return null; }
     }
+
+    private static TimeSpan Remaining(TimeSpan timeout, long startedTimestamp) =>
+        timeout - Stopwatch.GetElapsedTime(startedTimestamp);
 
     private async Task<bool> DrainPendingControlCommandsAsync(TimeSpan timeout, CancellationToken cancellationToken)
     {

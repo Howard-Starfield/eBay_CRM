@@ -236,24 +236,119 @@ public sealed class PostgresRuntimeTests
     }
 
     [PostgresFact, Trait("Category", "Postgres")]
-    public async Task FastShutdown_DuringCrashRecoveryReconciliation_UsesRetainedIdentity()
+    public async Task StopLaunchFailure_PreservesOwnedRunningIdentityForRetry()
     {
         await using var cluster = await PostgresTestCluster.CreateAsync();
-        var first = await cluster.Runtime.StartAsync();
-        using var crashedIdentity = Assert.IsType<PostgresInstanceIdentity>(first.Identity);
-        cluster.Identity = crashedIdentity;
+        var started = await cluster.Runtime.StartAsync();
+        var identity = Assert.IsType<PostgresInstanceIdentity>(started.Identity);
+        cluster.Identity = identity;
+        cluster.Launcher.FailNextStopLaunch = true;
 
-        var recovering = await cluster.CrashJobAndBeginIndeterminateRestartAsync();
-        var recoveryIdentity = Assert.IsType<PostgresInstanceIdentity>(recovering.Identity);
-        cluster.Identity = recoveryIdentity;
-        Assert.Equal(PostgreSqlOperationOutcome.TimedOutIndeterminate, recovering.Outcome);
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await cluster.Runtime.StopFastAsync(identity));
 
-        var stop = await cluster.Runtime.StopFastAsync(recoveryIdentity);
-        cluster.ReleaseDelayedStartCommand();
-        if (stop == PostgreSqlOperationOutcome.TimedOutIndeterminate)
-            await recoveryIdentity.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal("1", (await cluster.Runtime.ProbeAsync(identity)).SelectOne);
+        Assert.Equal(PostgreSqlOperationOutcome.Completed, await cluster.Runtime.StopFastAsync(identity));
         Assert.Equal(PostgreSqlOperationOutcome.ReconciledStopped,
-            await cluster.Runtime.ReconcileStopAsync(recoveryIdentity));
+            await cluster.Runtime.ReconcileStopAsync(identity));
+    }
+
+    [PostgresFact, Trait("Category", "Postgres")]
+    public async Task StopCancellationBeforeLaunch_PreservesOwnedRunningIdentityForRetry()
+    {
+        await using var cluster = await PostgresTestCluster.CreateAsync();
+        var started = await cluster.Runtime.StartAsync();
+        var identity = Assert.IsType<PostgresInstanceIdentity>(started.Identity);
+        cluster.Identity = identity;
+        cluster.Launcher.DelayNextStopLaunch = TimeSpan.FromSeconds(30);
+        using var cancellation = new CancellationTokenSource();
+
+        var stopping = cluster.Runtime.StopFastAsync(identity, cancellation.Token);
+        await cluster.Launcher.StopLaunchObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await stopping);
+
+        Assert.Equal("1", (await cluster.Runtime.ProbeAsync(identity)).SelectOne);
+        Assert.Equal(PostgreSqlOperationOutcome.Completed, await cluster.Runtime.StopFastAsync(identity));
+        Assert.Equal(PostgreSqlOperationOutcome.ReconciledStopped,
+            await cluster.Runtime.ReconcileStopAsync(identity));
+    }
+
+    [PostgresFact, Trait("Category", "Postgres")]
+    public async Task NonzeroCompletedStop_ReconcilesRunningAndAllowsRetry()
+    {
+        await using var cluster = await PostgresTestCluster.CreateAsync();
+        var started = await cluster.Runtime.StartAsync();
+        var identity = Assert.IsType<PostgresInstanceIdentity>(started.Identity);
+        cluster.Identity = identity;
+        cluster.Launcher.CompleteNextStopWithExitCode = 1;
+
+        Assert.Equal(PostgreSqlOperationOutcome.TimedOutIndeterminate,
+            await cluster.Runtime.StopFastAsync(identity));
+        Assert.Equal(PostgreSqlOperationOutcome.ReconciledRunning,
+            await cluster.Runtime.ReconcileStopAsync(identity));
+
+        Assert.Equal(PostgreSqlOperationOutcome.Completed, await cluster.Runtime.StopFastAsync(identity));
+        Assert.Equal(PostgreSqlOperationOutcome.ReconciledStopped,
+            await cluster.Runtime.ReconcileStopAsync(identity));
+    }
+
+    [PostgresFact, Trait("Category", "Postgres")]
+    public async Task StopDeadline_IsSharedAcrossLaunchAndCompletionWait()
+    {
+        await using var cluster = await PostgresTestCluster.CreateAsync(stopDeadline: TimeSpan.FromSeconds(2));
+        var started = await cluster.Runtime.StartAsync();
+        var identity = Assert.IsType<PostgresInstanceIdentity>(started.Identity);
+        cluster.Identity = identity;
+        cluster.Launcher.DelayNextStopLaunch = TimeSpan.FromMilliseconds(1100);
+        cluster.Launcher.LeaveNextStopPending = true;
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+
+        Assert.Equal(PostgreSqlOperationOutcome.TimedOutIndeterminate,
+            await cluster.Runtime.StopFastAsync(identity));
+
+        timer.Stop();
+        Assert.InRange(timer.Elapsed, TimeSpan.FromSeconds(1.8), TimeSpan.FromMilliseconds(2700));
+        Assert.Equal(2, cluster.Launcher.LastStopTimeoutSeconds);
+    }
+
+    [PostgresFact, Trait("Category", "Postgres")]
+    public async Task ReconcileIndeterminateExitedIdentity_CleansItsVerifiedStalePidFile()
+    {
+        await using var cluster = await PostgresTestCluster.CreateAsync();
+        await cluster.ReplaceRuntimePasswordAsync(new HowardLab.EbayCrm.AppHost.Core.Diagnostics.SecretValue(
+            $"wrong-{Guid.NewGuid():N}-Aa1!"));
+        var started = await cluster.Runtime.StartAsync();
+        var identity = Assert.IsType<PostgresInstanceIdentity>(started.Identity);
+        cluster.Identity = identity;
+        Assert.Equal(PostgreSqlOperationOutcome.TimedOutIndeterminate, started.Outcome);
+
+        cluster.Job.Dispose();
+        await identity.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.True(File.Exists(cluster.Paths.PostmasterPidFile));
+
+        var reconciled = await cluster.Runtime.ReconcileStartAsync();
+
+        Assert.Equal(PostgreSqlOperationOutcome.ReconciledStopped, reconciled.Outcome);
+        Assert.False(File.Exists(cluster.Paths.PostmasterPidFile));
+        cluster.Identity = null;
+    }
+
+    [PostgresFact, Trait("Category", "Postgres")]
+    public async Task FastShutdown_WhileRealStandbyRecoveryIsActive()
+    {
+        await using var cluster = await PostgresTestCluster.CreateAsync();
+        cluster.ConfigureAsDisconnectedStandby();
+
+        var started = await cluster.Runtime.StartAsync();
+        var identity = Assert.IsType<PostgresInstanceIdentity>(started.Identity);
+        cluster.Identity = identity;
+
+        Assert.Equal(PostgreSqlOperationOutcome.Completed, started.Outcome);
+        Assert.Equal("t", await cluster.ExecuteSqlScalarAsync("SELECT pg_is_in_recovery();"));
+        Assert.Equal(PostgreSqlOperationOutcome.Completed, await cluster.Runtime.StopFastAsync(identity));
+        Assert.Equal(PostgreSqlOperationOutcome.ReconciledStopped,
+            await cluster.Runtime.ReconcileStopAsync(identity));
     }
 
     [PostgresFact, Trait("Category", "Postgres")]
