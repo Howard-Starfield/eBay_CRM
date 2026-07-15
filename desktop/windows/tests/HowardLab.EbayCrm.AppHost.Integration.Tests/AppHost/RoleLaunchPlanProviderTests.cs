@@ -3,6 +3,7 @@ using HowardLab.EbayCrm.AppHost.Core.Diagnostics;
 using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
 using HowardLab.EbayCrm.AppHost.Core.Processes;
 using HowardLab.EbayCrm.AppHost.Core.Time;
+using HowardLab.EbayCrm.AppHost.Integration.Tests.Postgres;
 using HowardLab.EbayCrm.AppHost.Protocol.Control;
 using HowardLab.EbayCrm.AppHost.Windows.Instance;
 using HowardLab.EbayCrm.AppHost.Windows.Postgres;
@@ -11,6 +12,32 @@ namespace HowardLab.EbayCrm.AppHost.Integration.Tests.AppHost;
 
 public sealed class RoleLaunchPlanProviderTests
 {
+    [PostgresFact]
+    public async Task CreateForTests_DefaultsToFixtureProviderAndAcceptsAnExplicitProvider()
+    {
+        using var layout = TestLayout.CreateReal("ebaycrm-provider-composition");
+        var options = AppHostOptions.Parse(layout.Arguments("run"));
+        var generation = new ProcessGeneration(RuntimeRole.Server, 1, Guid.NewGuid());
+        var injected = new StubProvider(CreatePlan(generation));
+
+        var defaultRuntime = AppHostComposition.CreateForTests(options);
+        var injectedRuntime = AppHostComposition.CreateForTests(
+            options,
+            roleLaunchPlanProvider: injected);
+        try
+        {
+            Assert.IsType<FixtureRoleLaunchPlanProvider>(defaultRuntime.ActiveRoleLaunchPlanProvider);
+            Assert.Same(defaultRuntime.FixtureRoleLaunchPlanProvider, defaultRuntime.ActiveRoleLaunchPlanProvider);
+            Assert.Same(injected, injectedRuntime.ActiveRoleLaunchPlanProvider);
+            Assert.NotNull(injectedRuntime.FixtureRoleLaunchPlanProvider);
+        }
+        finally
+        {
+            await defaultRuntime.Orchestrator.DisposeAsync();
+            await injectedRuntime.Orchestrator.DisposeAsync();
+        }
+    }
+
     [Fact]
     public async Task Executor_RequiresAnExplicitRoleLaunchPlanProvider()
     {

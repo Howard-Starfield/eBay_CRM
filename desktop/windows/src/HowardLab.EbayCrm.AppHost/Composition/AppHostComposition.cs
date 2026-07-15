@@ -48,7 +48,8 @@ public static class AppHostComposition
         IEnumerable<SecretValue>? diagnosticSecrets = null,
         Action<SecretValue>? diagnosticSecretObserver = null,
         DiagnosticSegmentFactory? diagnosticSegmentFactory = null,
-        TimeSpan? diagnosticCompletionBudget = null)
+        TimeSpan? diagnosticCompletionBudget = null,
+        IRoleLaunchPlanProvider? roleLaunchPlanProvider = null)
     {
         var canonical = Path.GetFullPath(options.ProfileRoot);
         var temporary = Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.GetTempPath())) + Path.DirectorySeparatorChar;
@@ -65,7 +66,8 @@ public static class AppHostComposition
             diagnosticSecrets,
             diagnosticSecretObserver,
             diagnosticSegmentFactory,
-            diagnosticCompletionBudget);
+            diagnosticCompletionBudget,
+            roleLaunchPlanProvider);
     }
 
     private static AppHostTestRuntime CreateRuntime(
@@ -76,7 +78,8 @@ public static class AppHostComposition
         IEnumerable<SecretValue>? diagnosticSecrets,
         Action<SecretValue>? diagnosticSecretObserver,
         DiagnosticSegmentFactory? diagnosticSegmentFactory,
-        TimeSpan? diagnosticCompletionBudget)
+        TimeSpan? diagnosticCompletionBudget,
+        IRoleLaunchPlanProvider? roleLaunchPlanProvider = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         if (options.Mode != AppHostMode.Run)
@@ -109,7 +112,8 @@ public static class AppHostComposition
         var ownedDiagnosticSink = new OwnershipGatedDiagnosticSink(
             diagnosticSink,
             diagnosticCompletionBudget ?? TimeSpan.FromSeconds(1));
-        var roleLaunchPlanProvider = new FixtureRoleLaunchPlanProvider(options, validated);
+        var fixtureRoleLaunchPlanProvider = new FixtureRoleLaunchPlanProvider(options, validated);
+        var activeRoleLaunchPlanProvider = roleLaunchPlanProvider ?? fixtureRoleLaunchPlanProvider;
         var executor = new LifecycleCommandExecutor(
             options,
             validated,
@@ -119,10 +123,14 @@ public static class AppHostComposition
             ownedDiagnosticSink,
             secretRegistry,
             diagnosticSecretObserver,
-            roleLaunchPlanProvider);
+            activeRoleLaunchPlanProvider);
         var orchestrator = new RuntimeOrchestrator(coordinator, executor, shutdownBudget);
         executor.EventSink = orchestrator.HandleEventAsync;
-        return new AppHostTestRuntime(orchestrator, executor, roleLaunchPlanProvider);
+        return new AppHostTestRuntime(
+            orchestrator,
+            executor,
+            fixtureRoleLaunchPlanProvider,
+            activeRoleLaunchPlanProvider);
     }
 
     public static Task<AppHostProbeResult> ProbeAsync(
@@ -328,7 +336,8 @@ public static class AppHostComposition
 internal sealed record AppHostTestRuntime(
     RuntimeOrchestrator Orchestrator,
     LifecycleCommandExecutor Executor,
-    FixtureRoleLaunchPlanProvider FixtureRoleLaunchPlanProvider);
+    FixtureRoleLaunchPlanProvider FixtureRoleLaunchPlanProvider,
+    IRoleLaunchPlanProvider ActiveRoleLaunchPlanProvider);
 
 internal sealed class OwnershipGatedDiagnosticSink : IDiagnosticSink
 {
