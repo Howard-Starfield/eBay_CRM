@@ -48,9 +48,9 @@ ran before acceptance tests that consume its folder.
 
 Total: 381 passed, 0 failed, 0 skipped. PostgreSQL-backed tests had zero skips.
 
-The generated `win-x64` folder contained 204 files totaling 81,233,630 bytes.
-It contained AppHost EXE/DLL, Fixture EXE/DLL and its attested dependency
-closure, migration `0001_apphost_control.sql`, `hostfxr.dll`, `coreclr.dll`, and
+Every recorded clean `win-x64` publish contained 204 files, including AppHost
+EXE/DLL, Fixture EXE/DLL and its attested dependency closure, migration
+`0001_apphost_control.sql`, `hostfxr.dll`, `coreclr.dll`, and
 `System.Private.CoreLib.dll`. The generated folder is ignored and not committed.
 
 ### 2026-07-15 evidence-cleanup replay
@@ -58,17 +58,22 @@ closure, migration `0001_apphost_control.sql`, `hostfxr.dll`, `coreclr.dll`, and
 The follow-up replay based on commit `65039dabf54b0e42cd4247c993030b8f502f4729`
 removed the publish directory before publishing. Two consecutive clean publishes
 both produced 204 files totaling 81,233,630 bytes, with zero differences across
-relative path, length, and SHA-256. This current reproducible total supersedes
-the earlier recorded 81,233,626-byte total; the earlier per-file inventory was
-not retained, so no unsupported attribution is made for the four-byte change.
+relative path, length, and SHA-256. An earlier run recorded 81,233,626 bytes,
+and an independent clean controller replay of commit `c8ca33da` recorded
+81,233,622 bytes. No cause is attributed to these small cross-rebuild byte-total
+differences because the earlier per-file inventories were not retained.
 The tested follow-up staged tree before the final metadata additions was
 `3f2088f95c474f960b1fc91d63f5c907b4b11b55`.
 
-Before and after the complete destructive partition, the inventory remained
-204 files and 81,233,630 bytes. The containment test now emits current-run
-identity JSON through xUnit output and asserts that every published artifact's
-relative path, length, and SHA-256 remains unchanged. It does not write test
-evidence into the application publish directory.
+For the implementer run, the inventory remained 204 files and 81,233,630 bytes
+before and after the complete destructive partition. The independent controller
+run remained at 204 files, contained zero evidence files, and totaled
+81,233,622 bytes after its destructive partition. The acceptance invariant is
+per-run immutability: the containment test emits current-run identity JSON
+through xUnit output and asserts that every published artifact's relative path,
+length, and SHA-256 remains unchanged from that run's clean pre-test snapshot.
+It does not require byte-for-byte equality across independent clean rebuilds and
+does not write test evidence into the application publish directory.
 
 ## Acceptance-gate observations
 
