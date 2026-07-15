@@ -225,6 +225,7 @@ Date: 2026-07-15 (America/Los_Angeles)
 
 Branch: `codex/phase-1b-apphost-hardening`
 
+Phase 1B base commit: `2507d8c92f3d2771ee803fb18feb757396a740c0`.
 Tested implementation commit: `f432ece2a41601e48fec36528a80d3b0587d7064`.
 Tested implementation tree: `6a7cbe59c95508ead2b1265d7caec6c2322da3d5`.
 The later documentation-only evidence commit does not change the tested
