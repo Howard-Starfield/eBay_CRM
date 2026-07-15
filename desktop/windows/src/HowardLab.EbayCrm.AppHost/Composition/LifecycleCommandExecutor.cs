@@ -40,6 +40,9 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     private readonly ValidatedAppHostPayload _payload;
     private readonly IProfileRuntimeIdentityStore _identityStore;
     private readonly WindowsProcessLauncher _launcher;
+    private readonly OwnershipGatedDiagnosticSink _diagnosticSink;
+    private readonly DiagnosticSecretRegistry _diagnosticSecrets;
+    private readonly Action<SecretValue>? _diagnosticSecretObserver;
     private readonly IRoleOperationBoundary _roleOperationBoundary;
     private readonly RoleOperationDeadlines _roleOperationDeadlines;
     private UserProfileInstanceLock? _instanceLock;
@@ -65,7 +68,27 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             payload,
             identityStore,
             NoopRoleOperationBoundary.Instance,
-            RoleOperationDeadlines.Production)
+            RoleOperationDeadlines.Production,
+            CreateFallbackDiagnosticComposition())
+    {
+    }
+
+    private LifecycleCommandExecutor(
+        AppHostOptions options,
+        ValidatedAppHostPayload payload,
+        IProfileRuntimeIdentityStore? identityStore,
+        IRoleOperationBoundary roleOperationBoundary,
+        RoleOperationDeadlines roleOperationDeadlines,
+        DiagnosticComposition diagnostics)
+        : this(
+            options,
+            payload,
+            identityStore,
+            roleOperationBoundary,
+            roleOperationDeadlines,
+            diagnostics.Sink,
+            diagnostics.Registry,
+            diagnosticSecretObserver: null)
     {
     }
 
@@ -74,14 +97,20 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         ValidatedAppHostPayload payload,
         IProfileRuntimeIdentityStore? identityStore,
         IRoleOperationBoundary roleOperationBoundary,
-        RoleOperationDeadlines roleOperationDeadlines)
+        RoleOperationDeadlines roleOperationDeadlines,
+        OwnershipGatedDiagnosticSink diagnosticSink,
+        DiagnosticSecretRegistry diagnosticSecrets,
+        Action<SecretValue>? diagnosticSecretObserver)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _payload = payload ?? throw new ArgumentNullException(nameof(payload));
         _identityStore = identityStore ?? new ProfileRuntimeIdentityStore();
         _roleOperationBoundary = roleOperationBoundary ?? throw new ArgumentNullException(nameof(roleOperationBoundary));
         _roleOperationDeadlines = roleOperationDeadlines ?? throw new ArgumentNullException(nameof(roleOperationDeadlines));
-        _launcher = new WindowsProcessLauncher(NoopDiagnosticSink.Instance);
+        _diagnosticSink = diagnosticSink ?? throw new ArgumentNullException(nameof(diagnosticSink));
+        _diagnosticSecrets = diagnosticSecrets ?? throw new ArgumentNullException(nameof(diagnosticSecrets));
+        _diagnosticSecretObserver = diagnosticSecretObserver;
+        _launcher = new WindowsProcessLauncher(_diagnosticSink);
     }
 
     public Func<LifecycleEvent, CancellationToken, Task>? EventSink { get; set; }
@@ -95,6 +124,13 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
     internal Action<RuntimeRole, WindowsJobObject, WindowsSupervisedProcess>? RoleLaunchedForTests { get; set; }
 
     internal int ReleaseInstanceCountForTests => Volatile.Read(ref _releaseInstanceCountForTests);
+
+    internal long DiagnosticSinkFailureCountForTests => _diagnosticSink.SinkFailureCount;
+
+    internal long DiagnosticCompletionTimeoutCountForTests => _diagnosticSink.CompletionTimeoutCount;
+
+    internal ValueTask WriteDiagnosticForTestsAsync(DiagnosticEvent diagnosticEvent) =>
+        _diagnosticSink.WriteAsync(diagnosticEvent);
 
     internal static void RetainWorkerJobHandleInRoleForTests(
         RuntimeRole role,
@@ -253,6 +289,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             cancellationToken).ConfigureAwait(false)
             ?? throw new AppHostExecutionException("profile-already-owned");
         _instanceOperationId = command.OperationId;
+        _diagnosticSink.Activate();
         return new InstanceAcquired(command.OperationId);
     }
 
@@ -272,6 +309,7 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
             _payload.Profile,
             existingCluster,
             cancellationToken).ConfigureAwait(false);
+        RegisterDiagnosticSecret(_profileIdentity.Password);
         return new RuntimePrepared(command.OperationId);
     }
 
@@ -392,6 +430,11 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         try
         {
             var child = channel.CreateChildEnvironment();
+            foreach (var secret in child.SecretEnvironment.Values)
+            {
+                RegisterDiagnosticSecret(secret);
+            }
+
             var environment = new Dictionary<string, string>(child.Environment, StringComparer.Ordinal)
             {
                 ["SystemRoot"] = Environment.GetEnvironmentVariable("SystemRoot")
@@ -818,14 +861,21 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
 
     private async Task<LifecycleEvent?> ReleaseInstanceAsync()
     {
+        var errors = new List<Exception>();
+        await CaptureCleanupAsync(
+            () => _diagnosticSink.DisposeAsync().AsTask(),
+            errors).ConfigureAwait(false);
         if (_instanceLock is not null)
         {
-            await _instanceLock.DisposeAsync().ConfigureAwait(false);
+            await CaptureCleanupAsync(
+                () => _instanceLock.DisposeAsync().AsTask(),
+                errors).ConfigureAwait(false);
             _instanceLock = null;
             _instanceOperationId = null;
             Interlocked.Increment(ref _releaseInstanceCountForTests);
         }
 
+        ThrowCleanupErrors(errors);
         return null;
     }
 
@@ -1245,6 +1295,28 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
     }
 
+    private void RegisterDiagnosticSecret(SecretValue secret)
+    {
+        _diagnosticSecrets.Register(secret);
+        _diagnosticSecretObserver?.Invoke(secret);
+    }
+
+    private static DiagnosticComposition CreateFallbackDiagnosticComposition()
+    {
+        var registry = new DiagnosticSecretRegistry();
+        var sink = new JsonLinesDiagnosticSink(
+            (_, _) => ValueTask.FromResult<Stream>(Stream.Null),
+            new HowardLab.EbayCrm.AppHost.Core.Time.SystemClock(),
+            registry);
+        return new DiagnosticComposition(
+            new OwnershipGatedDiagnosticSink(sink, TimeSpan.FromSeconds(1)),
+            registry);
+    }
+
+    private sealed record DiagnosticComposition(
+        OwnershipGatedDiagnosticSink Sink,
+        DiagnosticSecretRegistry Registry);
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -1352,13 +1424,6 @@ public sealed class LifecycleCommandExecutor : ILifecycleCommandExecutor, IDepen
         }
     }
 
-    private sealed class NoopDiagnosticSink : IDiagnosticSink
-    {
-        internal static NoopDiagnosticSink Instance { get; } = new();
-        public ValueTask WriteAsync(DiagnosticEvent diagnosticEvent, CancellationToken cancellationToken = default) =>
-            ValueTask.CompletedTask;
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
-    }
 }
 
 public sealed class AppHostExecutionException : Exception

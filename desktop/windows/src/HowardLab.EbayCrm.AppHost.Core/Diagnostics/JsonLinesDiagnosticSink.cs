@@ -20,7 +20,7 @@ public sealed class JsonLinesDiagnosticSink : IDiagnosticSink
     private static readonly byte[] NewLine = [(byte)'\n'];
     private readonly DiagnosticSegmentFactory _segmentFactory;
     private readonly IClock _clock;
-    private readonly string[] _canaries;
+    private readonly DiagnosticSecretRegistry _secretRegistry;
     private readonly int _maxFieldBytes;
     private readonly long _maxSegmentBytes;
     private readonly int _maxSegmentCount;
@@ -40,9 +40,29 @@ public sealed class JsonLinesDiagnosticSink : IDiagnosticSink
         int maxFieldBytes = 4_096,
         long maxSegmentBytes = 1_048_576,
         int maxSegmentCount = 4)
+        : this(
+            segmentFactory,
+            clock,
+            CreateRegistry(registeredSecrets),
+            channelCapacity,
+            maxFieldBytes,
+            maxSegmentBytes,
+            maxSegmentCount)
+    {
+    }
+
+    public JsonLinesDiagnosticSink(
+        DiagnosticSegmentFactory segmentFactory,
+        IClock clock,
+        DiagnosticSecretRegistry secretRegistry,
+        int channelCapacity = 256,
+        int maxFieldBytes = 4_096,
+        long maxSegmentBytes = 1_048_576,
+        int maxSegmentCount = 4)
     {
         ArgumentNullException.ThrowIfNull(segmentFactory);
         ArgumentNullException.ThrowIfNull(clock);
+        ArgumentNullException.ThrowIfNull(secretRegistry);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(channelCapacity);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxFieldBytes);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(maxFieldBytes, 65_536);
@@ -51,14 +71,7 @@ public sealed class JsonLinesDiagnosticSink : IDiagnosticSink
 
         _segmentFactory = segmentFactory;
         _clock = clock;
-        _canaries = (registeredSecrets ?? [])
-            .Select(secret => secret?.RevealForChildEnvironment() ?? throw new ArgumentException(
-                "Registered secrets cannot contain null values.",
-                nameof(registeredSecrets)))
-            .Select(value => SecretCanary.Validate(value, nameof(registeredSecrets)))
-            .Distinct(StringComparer.Ordinal)
-            .OrderByDescending(value => value.Length)
-            .ToArray();
+        _secretRegistry = secretRegistry;
         _maxFieldBytes = maxFieldBytes;
         _maxSegmentBytes = maxSegmentBytes;
         _maxSegmentCount = maxSegmentCount;
@@ -302,10 +315,7 @@ public sealed class JsonLinesDiagnosticSink : IDiagnosticSink
 
     private string RedactAndTruncate(string value)
     {
-        foreach (var canary in _canaries)
-        {
-            value = value.Replace(canary, SecretCanary.RedactedText, StringComparison.Ordinal);
-        }
+        value = _secretRegistry.Redact(value);
 
         if (Encoding.UTF8.GetByteCount(value) <= _maxFieldBytes)
         {
@@ -314,6 +324,24 @@ public sealed class JsonLinesDiagnosticSink : IDiagnosticSink
 
         var prefixLength = GetCompleteUtf16PrefixLength(value, _maxFieldBytes);
         return value[..prefixLength];
+    }
+
+    private static DiagnosticSecretRegistry CreateRegistry(IEnumerable<SecretValue>? registeredSecrets)
+    {
+        var registry = new DiagnosticSecretRegistry();
+        foreach (var secret in registeredSecrets ?? [])
+        {
+            if (secret is null)
+            {
+                throw new ArgumentException(
+                    "Registered secrets cannot contain null values.",
+                    nameof(registeredSecrets));
+            }
+
+            registry.Register(secret);
+        }
+
+        return registry;
     }
 
     private static int GetCompleteUtf16PrefixLength(ReadOnlySpan<char> value, int maximumBytes)

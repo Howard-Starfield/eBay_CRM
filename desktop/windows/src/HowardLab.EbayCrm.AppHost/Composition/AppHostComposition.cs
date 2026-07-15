@@ -3,10 +3,12 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using HowardLab.EbayCrm.AppHost.Core.Diagnostics;
 using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
 using HowardLab.EbayCrm.AppHost.Core.Time;
 using HowardLab.EbayCrm.AppHost.Protocol.Control;
 using HowardLab.EbayCrm.AppHost.Windows.Instance;
+using HowardLab.EbayCrm.AppHost.Windows.Diagnostics;
 using HowardLab.EbayCrm.AppHost.Windows.Native;
 using HowardLab.EbayCrm.AppHost.Windows.Postgres;
 
@@ -30,7 +32,11 @@ public static class AppHostComposition
             options,
             null,
             NoopRoleOperationBoundary.Instance,
-            RoleOperationDeadlines.Production);
+            RoleOperationDeadlines.Production,
+            diagnosticSecrets: null,
+            diagnosticSecretObserver: null,
+            diagnosticSegmentFactory: null,
+            diagnosticCompletionBudget: null);
         return runtime.Orchestrator;
     }
 
@@ -38,7 +44,11 @@ public static class AppHostComposition
         AppHostOptions options,
         ShutdownBudget? shutdownBudget = null,
         IRoleOperationBoundary? roleOperationBoundary = null,
-        RoleOperationDeadlines? roleOperationDeadlines = null)
+        RoleOperationDeadlines? roleOperationDeadlines = null,
+        IEnumerable<SecretValue>? diagnosticSecrets = null,
+        Action<SecretValue>? diagnosticSecretObserver = null,
+        DiagnosticSegmentFactory? diagnosticSegmentFactory = null,
+        TimeSpan? diagnosticCompletionBudget = null)
     {
         var canonical = Path.GetFullPath(options.ProfileRoot);
         var temporary = Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.GetTempPath())) + Path.DirectorySeparatorChar;
@@ -51,14 +61,22 @@ public static class AppHostComposition
             options,
             shutdownBudget,
             roleOperationBoundary ?? NoopRoleOperationBoundary.Instance,
-            roleOperationDeadlines ?? RoleOperationDeadlines.Production);
+            roleOperationDeadlines ?? RoleOperationDeadlines.Production,
+            diagnosticSecrets,
+            diagnosticSecretObserver,
+            diagnosticSegmentFactory,
+            diagnosticCompletionBudget);
     }
 
     private static AppHostTestRuntime CreateRuntime(
         AppHostOptions options,
         ShutdownBudget? shutdownBudget,
         IRoleOperationBoundary roleOperationBoundary,
-        RoleOperationDeadlines roleOperationDeadlines)
+        RoleOperationDeadlines roleOperationDeadlines,
+        IEnumerable<SecretValue>? diagnosticSecrets,
+        Action<SecretValue>? diagnosticSecretObserver,
+        DiagnosticSegmentFactory? diagnosticSegmentFactory,
+        TimeSpan? diagnosticCompletionBudget)
     {
         ArgumentNullException.ThrowIfNull(options);
         if (options.Mode != AppHostMode.Run)
@@ -72,12 +90,34 @@ public static class AppHostComposition
         var coordinator = new LifecycleCoordinator(
             new SystemClock(),
             new RestartBudget(3, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(5)));
+        var secretRegistry = new DiagnosticSecretRegistry();
+        foreach (var secret in diagnosticSecrets ?? [])
+        {
+            secretRegistry.Register(secret);
+        }
+
+        var segmentFactory = diagnosticSegmentFactory ??
+            new WindowsDiagnosticSegmentFactory(validated.Profile).OpenAsync;
+        var diagnosticSink = new JsonLinesDiagnosticSink(
+            segmentFactory,
+            new SystemClock(),
+            secretRegistry,
+            channelCapacity: 256,
+            maxFieldBytes: 4_096,
+            maxSegmentBytes: 1_048_576,
+            maxSegmentCount: 4);
+        var ownedDiagnosticSink = new OwnershipGatedDiagnosticSink(
+            diagnosticSink,
+            diagnosticCompletionBudget ?? TimeSpan.FromSeconds(1));
         var executor = new LifecycleCommandExecutor(
             options,
             validated,
             identityStore: null,
             roleOperationBoundary,
-            roleOperationDeadlines);
+            roleOperationDeadlines,
+            ownedDiagnosticSink,
+            secretRegistry,
+            diagnosticSecretObserver);
         var orchestrator = new RuntimeOrchestrator(coordinator, executor, shutdownBudget);
         executor.EventSink = orchestrator.HandleEventAsync;
         return new AppHostTestRuntime(orchestrator, executor);
@@ -286,6 +326,68 @@ public static class AppHostComposition
 internal sealed record AppHostTestRuntime(
     RuntimeOrchestrator Orchestrator,
     LifecycleCommandExecutor Executor);
+
+internal sealed class OwnershipGatedDiagnosticSink : IDiagnosticSink
+{
+    private readonly JsonLinesDiagnosticSink _inner;
+    private readonly TimeSpan _completionBudget;
+    private int _active;
+    private int _disposed;
+    private long _completionTimeoutCount;
+
+    internal OwnershipGatedDiagnosticSink(
+        JsonLinesDiagnosticSink inner,
+        TimeSpan completionBudget)
+    {
+        _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+        if (completionBudget <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(completionBudget));
+        }
+
+        _completionBudget = completionBudget;
+    }
+
+    internal long CompletionTimeoutCount => Interlocked.Read(ref _completionTimeoutCount);
+
+    internal long SinkFailureCount => _inner.SinkFailureCount;
+
+    internal long DroppedEventCount => _inner.DroppedEventCount;
+
+    internal void Activate() => Volatile.Write(ref _active, 1);
+
+    public ValueTask WriteAsync(
+        DiagnosticEvent diagnosticEvent,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(diagnosticEvent);
+        cancellationToken.ThrowIfCancellationRequested();
+        return Volatile.Read(ref _active) != 0
+            ? _inner.WriteAsync(diagnosticEvent, cancellationToken)
+            : ValueTask.CompletedTask;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        using var deadline = new CancellationTokenSource(_completionBudget);
+        try
+        {
+            await _inner.CompleteAsync(deadline.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+        {
+            Interlocked.Increment(ref _completionTimeoutCount);
+            return;
+        }
+
+        await _inner.DisposeAsync().ConfigureAwait(false);
+    }
+}
 
 public sealed record ValidatedAppHostPayload(
     DataProfileIdentity Profile,

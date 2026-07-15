@@ -73,6 +73,87 @@ public sealed class DiagnosticSafetyTests
     }
 
     [Fact]
+    public async Task SecretRegisteredAfterSinkConstructionIsRedactedAcrossTheFieldBoundary()
+    {
+        const string canary = "CANARY-dynamic-secret-across-boundary";
+        var registry = new DiagnosticSecretRegistry();
+        var output = new MemoryStream();
+        var sink = new JsonLinesDiagnosticSink(
+            (_, _) => ValueTask.FromResult<Stream>(output),
+            new TestClock(Epoch),
+            registry,
+            channelCapacity: 1,
+            maxFieldBytes: 8_192,
+            maxSegmentBytes: 16_384,
+            maxSegmentCount: 1);
+        registry.Register(new SecretValue(canary));
+
+        await sink.WriteAsync(
+            DiagnosticEvent.Create("dynamic.redaction")
+                .With("value", DiagnosticField.String(new string('x', 4_080) + canary)));
+        await sink.CompleteAsync();
+
+        var bytes = output.ToArray();
+        var text = Encoding.UTF8.GetString(bytes);
+        Assert.DoesNotContain(canary, text, StringComparison.Ordinal);
+        Assert.Contains("[REDACTED]", text, StringComparison.Ordinal);
+        await sink.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task ConcurrentRegistrationAndWritesUseCoherentSecretSnapshots()
+    {
+        const int count = 32;
+        var registry = new DiagnosticSecretRegistry();
+        var outputs = new List<MemoryStream>();
+        var sink = new JsonLinesDiagnosticSink(
+            (_, _) =>
+            {
+                var output = new MemoryStream();
+                lock (outputs)
+                {
+                    outputs.Add(output);
+                }
+
+                return ValueTask.FromResult<Stream>(output);
+            },
+            new TestClock(Epoch),
+            registry,
+            channelCapacity: count,
+            maxFieldBytes: 1_024,
+            maxSegmentBytes: 65_536,
+            maxSegmentCount: 1);
+
+        await Task.WhenAll(Enumerable.Range(0, count).Select(async index =>
+        {
+            var canary = $"CANARY-concurrent-{index:D2}-secret";
+            registry.Register(new SecretValue(canary));
+            await sink.WriteAsync(
+                DiagnosticEvent.Create("dynamic.concurrent")
+                    .With("value", DiagnosticField.String(canary)));
+        }));
+        await sink.CompleteAsync();
+
+        var text = string.Concat(outputs.Select(output => Encoding.UTF8.GetString(output.ToArray())));
+        Assert.DoesNotContain("CANARY-concurrent-", text, StringComparison.Ordinal);
+        Assert.Equal(count, text.Split("[REDACTED]", StringSplitOptions.None).Length - 1);
+        await sink.DisposeAsync();
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("[REDACTED]")]
+    [InlineData("REDACTED")]
+    [InlineData("ACT")]
+    public void DynamicRegistryRejectsEmptyOrWeakCanaries(string invalidCanary)
+    {
+        var registry = new DiagnosticSecretRegistry();
+
+        Assert.Throws<ArgumentException>(() => registry.Register(new SecretValue(invalidCanary)));
+        Assert.Throws<ArgumentNullException>(() => registry.Register(null!));
+    }
+
+    [Fact]
     public async Task OverlappingCanariesAreRedactedLongestFirst()
     {
         var shortSecret = new SecretValue("TOKEN");
