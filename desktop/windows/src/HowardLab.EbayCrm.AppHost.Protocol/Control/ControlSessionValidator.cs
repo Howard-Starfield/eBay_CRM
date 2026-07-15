@@ -13,7 +13,8 @@ public sealed record ExpectedControlIdentity(
     int ProcessId,
     long ProcessCreationTimeUtcTicks,
     string CapabilityNonce,
-    string BuildIdentity)
+    string BuildIdentity,
+    string ChallengeId)
 {
     public override string ToString() =>
         $"ExpectedControlIdentity {{ Role = {Role}, Generation = {Generation}, StartupOperationId = {StartupOperationId}, ProcessId = {ProcessId}, ProcessCreationTimeUtcTicks = {ProcessCreationTimeUtcTicks}, CapabilityNonce = <redacted>, BuildIdentity = {BuildIdentity} }}";
@@ -42,6 +43,7 @@ public enum ControlValidationReasonCode
     OperationIdMismatch,
     ProcessIdMismatch,
     ProcessCreationTimeMismatch,
+    ChallengeMismatch,
     CapabilityNonceMismatch,
     BuildIdentityMismatch,
     InvalidLoopbackEndpoint,
@@ -117,9 +119,10 @@ public sealed class ControlSessionValidator
         }
 
         if (hello.ProcessId <= 0 ||
-            hello.ProcessCreationTimeUtcTicks <= 0 ||
+            !ProcessCreationTimeTicks.TryParseCanonical(hello.ProcessCreationTimeUtcTicks, out var creationTicks) ||
             !ControlFrameCodec.IsBoundedNonEmpty(hello.CapabilityNonce) ||
-            !ControlFrameCodec.IsBoundedNonEmpty(hello.BuildIdentity))
+            !ControlFrameCodec.IsBoundedNonEmpty(hello.BuildIdentity) ||
+            !ControlFrameCodec.IsBoundedNonEmpty(hello.ChallengeId))
         {
             return ControlValidationResult.Reject(ControlValidationReasonCode.InvalidHelloPayload);
         }
@@ -129,7 +132,7 @@ public sealed class ControlSessionValidator
             return ControlValidationResult.Reject(ControlValidationReasonCode.ProcessIdMismatch);
         }
 
-        if (hello.ProcessCreationTimeUtcTicks != expected.ProcessCreationTimeUtcTicks)
+        if (creationTicks != expected.ProcessCreationTimeUtcTicks)
         {
             return ControlValidationResult.Reject(ControlValidationReasonCode.ProcessCreationTimeMismatch);
         }
@@ -142,6 +145,11 @@ public sealed class ControlSessionValidator
         if (!string.Equals(hello.BuildIdentity, expected.BuildIdentity, StringComparison.Ordinal))
         {
             return ControlValidationResult.Reject(ControlValidationReasonCode.BuildIdentityMismatch);
+        }
+
+        if (!SecretEquals(hello.ChallengeId, expected.ChallengeId))
+        {
+            return ControlValidationResult.Reject(ControlValidationReasonCode.ChallengeMismatch);
         }
 
         if (hello.LoopbackEndpoint is not null && !IsValidLoopbackEndpoint(hello.LoopbackEndpoint))
@@ -166,7 +174,9 @@ public sealed class ControlSessionValidator
             return ControlValidationResult.Reject(ControlValidationReasonCode.UnknownMessageType);
         }
 
-        if (envelope.OperationId == Guid.Empty || envelope.Payload.ValueKind != JsonValueKind.Object)
+        if (envelope.OperationId == Guid.Empty ||
+            envelope.Generation is < 0 or > ControlProtocolConstants.MaxGeneration ||
+            envelope.Payload.ValueKind != JsonValueKind.Object)
         {
             return ControlValidationResult.Reject(ControlValidationReasonCode.InvalidEnvelope);
         }
@@ -174,6 +184,11 @@ public sealed class ControlSessionValidator
         if (_state == SessionState.Stopped && envelope.Type == ControlMessageType.Health)
         {
             return ControlValidationResult.Reject(ControlValidationReasonCode.SessionStopped);
+        }
+
+        if (_state != SessionState.AwaitHello && envelope.Type == ControlMessageType.Hello)
+        {
+            return ControlValidationResult.Reject(ControlValidationReasonCode.UnexpectedHello);
         }
 
         var key = new OperationKey(envelope.Generation, envelope.OperationId, envelope.Type);
@@ -211,11 +226,6 @@ public sealed class ControlSessionValidator
         if (envelope.Role != _expected.Role)
         {
             return ControlValidationResult.Reject(ControlValidationReasonCode.RoleMismatch);
-        }
-
-        if (envelope.Type == ControlMessageType.Hello)
-        {
-            return ControlValidationResult.Reject(ControlValidationReasonCode.UnexpectedHello);
         }
 
         if (_state == SessionState.Stopped)
@@ -262,7 +272,7 @@ public sealed class ControlSessionValidator
             !ControlFrameCodec.IsBoundedNonEmpty(health.BuildIdentity) ||
             !ControlFrameCodec.IsBoundedNonEmpty(health.GenerationNonce) ||
             !ControlFrameCodec.IsBoundedNonEmpty(health.Status) ||
-            health.ActiveWorkRemaining < 0)
+            health.ActiveWorkRemaining is < 0 or > ControlProtocolConstants.MaxActiveWorkRemaining)
         {
             return ControlValidationResult.Reject(ControlValidationReasonCode.InvalidHealthPayload);
         }
@@ -368,7 +378,7 @@ public sealed class ControlSessionValidator
             return ControlValidationResult.Reject(ControlValidationReasonCode.InvalidPayload);
         }
 
-        if (payload.Count < 0)
+        if (payload.Count is < 0 or > ControlProtocolConstants.MaxActiveWorkRemaining)
         {
             return ControlValidationResult.Reject(ControlValidationReasonCode.ActiveWorkNegative);
         }

@@ -173,6 +173,32 @@ public sealed class WindowsControlChannelTests
     }
 
     [Fact]
+    public async Task SendAsync_RejectsSecondIdentityChallengeAfterAuthentication()
+    {
+        await using var channel = CreateChannel();
+        using var job = WindowsJobObject.CreateKillOnClose();
+        await using var process = await LaunchControlClientAsync(channel, job, "valid");
+        await channel.AcceptAsync(process, job, CancellationToken.None).WaitAsync(Deadline);
+        var secondChallenge = new ControlEnvelope(
+            ControlProtocolConstants.CurrentVersion,
+            channel.EndpointIdentity.StartupOperationId,
+            channel.EndpointIdentity.Role,
+            channel.EndpointIdentity.Generation,
+            ControlMessageType.IdentityChallenge,
+            System.Text.Json.JsonSerializer.SerializeToElement(
+                new IdentityChallengePayload(
+                    process.Identity.ProcessId,
+                    ProcessCreationTimeTicks.Format(process.Identity.CreationTimeUtc.UtcTicks),
+                    "second-challenge"),
+                ControlFrameCodec.SerializerOptions));
+
+        var error = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            channel.SendAsync(secondChallenge));
+
+        Assert.Contains("second identity challenge", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task ReadLoopAndSupervisorSend_CanUseDuplexChannelConcurrently()
     {
         await using var channel = CreateChannel();
@@ -200,7 +226,7 @@ public sealed class WindowsControlChannelTests
         var shutdown = CreateEmptyEnvelope(channel, ControlMessageType.Shutdown, Guid.NewGuid());
         await channel.SendAsync(shutdown);
         Assert.Equal(ControlMessageType.ShutdownAccepted, (await channel.ReadAsync()).Type);
-        for (var index = 0; index < 1_021; index++)
+        for (var index = 0; index < 1_020; index++)
         {
             await channel.SendAsync(shutdown);
         }
@@ -242,6 +268,18 @@ public sealed class WindowsControlChannelTests
     public void CreateBeforeLaunch_RejectsTimeoutBeyondCancelAfterRangeBeforeCreatingPipe()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => CreateChannel(TimeSpan.MaxValue));
+    }
+
+    [Fact]
+    public void CreateBeforeLaunch_RejectsGenerationAboveSharedMaximumBeforeCreatingPipe()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            WindowsControlChannel.CreateBeforeLaunch(
+                RuntimeRole.Server,
+                ControlProtocolConstants.MaxGeneration + 1,
+                Guid.NewGuid(),
+                "task-6-build",
+                TimeSpan.FromSeconds(5)));
     }
 
     [Fact]

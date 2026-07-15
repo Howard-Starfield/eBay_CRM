@@ -175,7 +175,9 @@ public sealed class ControlFrameCodec
             throw new ControlProtocolException(ControlProtocolErrorCode.UnknownRole);
         }
 
-        if (envelope.OperationId == Guid.Empty || envelope.Generation < 0 || envelope.Payload.ValueKind != JsonValueKind.Object)
+        if (envelope.OperationId == Guid.Empty ||
+            envelope.Generation is < 0 or > ControlProtocolConstants.MaxGeneration ||
+            envelope.Payload.ValueKind != JsonValueKind.Object)
         {
             throw new ControlProtocolException(ControlProtocolErrorCode.InvalidEnvelope);
         }
@@ -190,12 +192,24 @@ public sealed class ControlFrameCodec
     {
         switch (envelope.Type)
         {
+            case ControlMessageType.IdentityChallenge:
+                var challenge = DeserializePayload<IdentityChallengePayload>(envelope.Payload);
+                if (challenge.ProcessId <= 0 ||
+                    !ProcessCreationTimeTicks.TryParseCanonical(challenge.ProcessCreationTimeUtcTicks, out _) ||
+                    !IsBoundedNonEmpty(challenge.ChallengeId))
+                {
+                    throw new ControlProtocolException(ControlProtocolErrorCode.InvalidPayload);
+                }
+
+                break;
+
             case ControlMessageType.Hello:
                 var hello = DeserializePayload<HelloPayload>(envelope.Payload);
                 if (hello.ProcessId <= 0 ||
-                    hello.ProcessCreationTimeUtcTicks <= 0 ||
+                    !ProcessCreationTimeTicks.TryParseCanonical(hello.ProcessCreationTimeUtcTicks, out _) ||
                     !IsBoundedNonEmpty(hello.CapabilityNonce) ||
                     !IsBoundedNonEmpty(hello.BuildIdentity) ||
+                    !IsBoundedNonEmpty(hello.ChallengeId) ||
                     hello.LoopbackEndpoint is not null && !IsBoundedNonEmpty(hello.LoopbackEndpoint))
                 {
                     throw new ControlProtocolException(ControlProtocolErrorCode.InvalidPayload);
@@ -210,7 +224,7 @@ public sealed class ControlFrameCodec
                     !IsBoundedNonEmpty(health.BuildIdentity) ||
                     !IsBoundedNonEmpty(health.GenerationNonce) ||
                     !IsBoundedNonEmpty(health.Status) ||
-                    health.ActiveWorkRemaining < 0)
+                    health.ActiveWorkRemaining is < 0 or > ControlProtocolConstants.MaxActiveWorkRemaining)
                 {
                     throw new ControlProtocolException(ControlProtocolErrorCode.InvalidPayload);
                 }
@@ -219,7 +233,7 @@ public sealed class ControlFrameCodec
 
             case ControlMessageType.ActiveWorkRemaining:
                 var activeWork = DeserializePayload<ActiveWorkRemainingPayload>(envelope.Payload);
-                if (activeWork.Count < 0)
+                if (activeWork.Count is < 0 or > ControlProtocolConstants.MaxActiveWorkRemaining)
                 {
                     throw new ControlProtocolException(ControlProtocolErrorCode.InvalidPayload);
                 }
@@ -291,6 +305,7 @@ public sealed class ControlFrameCodec
             var known = reader.TokenType == JsonTokenType.String && propertyName switch
             {
                 "type" => reader.GetString() is
+                    "identityChallenge" or
                     "hello" or
                     "drain" or
                     "drainAccepted" or

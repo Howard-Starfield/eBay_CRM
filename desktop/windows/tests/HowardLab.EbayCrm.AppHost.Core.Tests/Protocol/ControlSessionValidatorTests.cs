@@ -10,6 +10,7 @@ public sealed class ControlSessionValidatorTests
     private static readonly Guid DrainOperationId = Guid.Parse("c7daa0b1-abfe-49c5-98de-f4030a838a91");
     private static readonly Guid ShutdownOperationId = Guid.Parse("29e70eb2-df9d-442f-9f27-10194202a803");
     private const string CapabilityNonce = "super-secret-capability";
+    private const string ChallengeId = "challenge-01";
 
     [Fact]
     public void AcceptsHelloOnlyWhenEveryExpectedIdentityFieldMatches()
@@ -37,6 +38,51 @@ public sealed class ControlSessionValidatorTests
         Assert.DoesNotContain(CapabilityNonce, result.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain(CapabilityNonce, envelope.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain(CapabilityNonce, envelope.Payload.Deserialize<HelloPayload>(ControlFrameCodec.SerializerOptions)!.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RejectsHelloWithWrongChallengeId()
+    {
+        var expected = CreateExpected(RuntimeRole.Worker);
+        var envelope = CreateHello(expected);
+        var payload = envelope.Payload.Deserialize<HelloPayload>(ControlFrameCodec.SerializerOptions)!;
+        envelope = envelope with
+        {
+            Payload = JsonSerializer.SerializeToElement(
+                payload with { ChallengeId = "wrong-challenge" },
+                ControlFrameCodec.SerializerOptions),
+        };
+
+        var result = ControlSessionValidator.ValidateHello(expected, envelope);
+
+        Assert.Equal(ControlValidationStatus.Rejected, result.Status);
+        Assert.Equal(ControlValidationReasonCode.ChallengeMismatch, result.ReasonCode);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RejectsExactAndConflictingHelloAfterAuthentication(bool conflicting)
+    {
+        var expected = CreateExpected(RuntimeRole.Worker);
+        var validator = new ControlSessionValidator(expected);
+        var hello = CreateHello(expected);
+        AssertAccepted(validator.Validate(hello));
+        if (conflicting)
+        {
+            var payload = hello.Payload.Deserialize<HelloPayload>(ControlFrameCodec.SerializerOptions)!;
+            hello = hello with
+            {
+                Payload = JsonSerializer.SerializeToElement(
+                    payload with { BuildIdentity = "conflicting-build" },
+                    ControlFrameCodec.SerializerOptions),
+            };
+        }
+
+        var result = validator.Validate(hello);
+
+        Assert.Equal(ControlValidationStatus.Rejected, result.Status);
+        Assert.Equal(ControlValidationReasonCode.UnexpectedHello, result.ReasonCode);
     }
 
     [Fact]
@@ -152,7 +198,7 @@ public sealed class ControlSessionValidatorTests
         var conflict = health with
         {
             Payload = JsonSerializer.SerializeToElement(
-                new HealthPayload(1, "build-1", 7, "generation-7", "ready", 1),
+                new HealthPayload(ControlProtocolConstants.CurrentVersion, "build-1", 7, "generation-7", "ready", 1),
                 ControlFrameCodec.SerializerOptions),
         };
 
@@ -219,7 +265,7 @@ public sealed class ControlSessionValidatorTests
     }
 
     [Fact]
-    public async Task NamedPipeClientConnectsToSuppliedNameAndSendsHelloFirst()
+    public async Task NamedPipeClientWaitsForChallengeAndEchoesExactIdentity()
     {
         var pipeName = $"ebaycrm-{Guid.NewGuid():N}";
         var expected = CreateExpected(RuntimeRole.Worker);
@@ -232,12 +278,31 @@ public sealed class ControlSessionValidatorTests
             PipeOptions.Asynchronous);
         await using var client = new NamedPipeControlClient(pipeName, hello, TimeSpan.FromSeconds(5));
 
-        var receiving = ReadFirstMessageAsync(server);
+        var exchange = Task.Run(async () =>
+        {
+            await server.WaitForConnectionAsync(CancellationToken.None);
+            var codec = new ControlFrameCodec();
+            var challenge = Create(
+                ControlMessageType.IdentityChallenge,
+                expected.StartupOperationId,
+                expected.Role,
+                new IdentityChallengePayload(
+                    expected.ProcessId,
+                    ProcessCreationTimeTicks.Format(expected.ProcessCreationTimeUtcTicks),
+                    "issued-challenge"));
+            await codec.WriteAsync(server, challenge, CancellationToken.None);
+            await server.FlushAsync(CancellationToken.None);
+            return await codec.ReadAsync(server, CancellationToken.None);
+        });
         await client.ConnectAsync(CancellationToken.None);
-        var received = await receiving;
+        var received = await exchange;
 
         Assert.Equal(ControlMessageType.Hello, received.Type);
         Assert.Equal(StartupOperationId, received.OperationId);
+        var payload = received.Payload.Deserialize<HelloPayload>(ControlFrameCodec.SerializerOptions);
+        Assert.NotNull(payload);
+        Assert.Equal("issued-challenge", payload.ChallengeId);
+        Assert.Equal(ProcessCreationTimeTicks.Format(expected.ProcessCreationTimeUtcTicks), payload.ProcessCreationTimeUtcTicks);
     }
 
     [Fact]
@@ -251,6 +316,88 @@ public sealed class ControlSessionValidatorTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => client.ConnectAsync(cancellation.Token));
     }
 
+    [Fact]
+    public async Task NamedPipeClientChallengeReadHonorsOperationTimeout()
+    {
+        var expected = CreateExpected(RuntimeRole.Worker);
+        var transport = new ControlledClientTransport(expected, blockChallenge: true);
+        await using var client = new NamedPipeControlClient(
+            transport,
+            CreateHello(expected),
+            TimeSpan.FromMilliseconds(25));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => client.ConnectAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task NamedPipeClientChallengeReadHonorsCallerCancellation()
+    {
+        var expected = CreateExpected(RuntimeRole.Worker);
+        var transport = new ControlledClientTransport(expected, blockChallenge: true);
+        await using var client = new NamedPipeControlClient(
+            transport,
+            CreateHello(expected),
+            TimeSpan.FromSeconds(5));
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(25));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => client.ConnectAsync(cancellation.Token));
+    }
+
+    [Fact]
+    public async Task NamedPipeClientRejectsASecondChallengeAfterAuthentication()
+    {
+        var expected = CreateExpected(RuntimeRole.Worker);
+        var transport = new ControlledClientTransport(expected, duplicateChallenge: true);
+        await using var client = new NamedPipeControlClient(transport, CreateHello(expected), TimeSpan.FromSeconds(5));
+
+        await client.ConnectAsync(CancellationToken.None);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => client.ReadCommandAsync(CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData(RuntimeRole.Worker, ControlMessageType.Drain)]
+    [InlineData(RuntimeRole.Server, ControlMessageType.DrainAccepted)]
+    public async Task NamedPipeClientRejectsOutboundMessagesOwnedByAppHostOrAnotherRole(
+        RuntimeRole role,
+        ControlMessageType messageType)
+    {
+        var expected = CreateExpected(role);
+        var transport = new ControlledClientTransport(expected);
+        await using var client = new NamedPipeControlClient(transport, CreateHello(expected), TimeSpan.FromSeconds(5));
+        await client.ConnectAsync(CancellationToken.None);
+        var writesBeforeRejection = transport.Stream.WriteCalls;
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            client.SendAsync(CreateEmpty(messageType, Guid.NewGuid(), role), CancellationToken.None));
+
+        Assert.Equal(writesBeforeRejection, transport.Stream.WriteCalls);
+        var operationsAfterRejection = transport.OperationCount;
+        var sendError = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.SendAsync(
+                CreateHealth(Guid.NewGuid(), "ready", 0, role),
+                CancellationToken.None));
+        var readError = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.ReadAsync(CancellationToken.None));
+
+        Assert.Equal("The control client is faulted and cannot be reused.", sendError.Message);
+        Assert.Equal("The control client is faulted and cannot be reused.", readError.Message);
+        Assert.Equal(operationsAfterRejection, transport.OperationCount);
+    }
+
+    [Fact]
+    public async Task NamedPipeClientRejectsDatabaseControlChannelAtChallengeBoundary()
+    {
+        var expected = CreateExpected(RuntimeRole.Database);
+        var transport = new ControlledClientTransport(expected);
+        await using var client = new NamedPipeControlClient(transport, CreateHello(expected), TimeSpan.FromSeconds(5));
+
+        await Assert.ThrowsAsync<InvalidDataException>(
+            () => client.ConnectAsync(CancellationToken.None));
+    }
+
     [Theory]
     [InlineData(ClientFailurePhase.Connect)]
     [InlineData(ClientFailurePhase.HelloWrite)]
@@ -260,7 +407,7 @@ public sealed class ControlSessionValidatorTests
     public async Task NamedPipeClientIsPermanentlyFaultedAfterTransportFailure(ClientFailurePhase failurePhase)
     {
         var expected = CreateExpected(RuntimeRole.Worker);
-        var transport = new ControlledClientTransport();
+        var transport = new ControlledClientTransport(expected);
         await using var client = new NamedPipeControlClient(transport, CreateHello(expected), TimeSpan.FromSeconds(5));
 
         Func<Task> failingOperation;
@@ -309,7 +456,7 @@ public sealed class ControlSessionValidatorTests
     public async Task NamedPipeClientDisposeIsIdempotent()
     {
         var expected = CreateExpected(RuntimeRole.Worker);
-        var transport = new ControlledClientTransport();
+        var transport = new ControlledClientTransport(expected);
         var client = new NamedPipeControlClient(transport, CreateHello(expected), TimeSpan.FromSeconds(5));
 
         await client.DisposeAsync();
@@ -335,7 +482,7 @@ public sealed class ControlSessionValidatorTests
     }
 
     private static ExpectedControlIdentity CreateExpected(RuntimeRole role) =>
-        new(role, 7, StartupOperationId, 4242, 638880000000000000, CapabilityNonce, "build-1");
+        new(role, 7, StartupOperationId, 4242, 638880000000000000, CapabilityNonce, "build-1", ChallengeId);
 
     private static ControlEnvelope CreateHello(
         ExpectedControlIdentity expected,
@@ -347,10 +494,11 @@ public sealed class ControlSessionValidatorTests
             expected.Role,
             new HelloPayload(
                 expected.ProcessId,
-                expected.ProcessCreationTimeUtcTicks,
+                ProcessCreationTimeTicks.Format(expected.ProcessCreationTimeUtcTicks),
                 capabilityNonce ?? expected.CapabilityNonce,
                 expected.BuildIdentity,
-                loopbackEndpoint));
+                loopbackEndpoint,
+                expected.ChallengeId));
 
     private static ControlEnvelope CreateEmpty(ControlMessageType type, Guid operationId, RuntimeRole role = RuntimeRole.Worker) =>
         Create(type, operationId, role, new { });
@@ -359,7 +507,7 @@ public sealed class ControlSessionValidatorTests
         Create(ControlMessageType.ActiveWorkRemaining, operationId, RuntimeRole.Worker, new { count });
 
     private static ControlEnvelope CreateHealth(Guid operationId, string status, int activeWorkRemaining, RuntimeRole role = RuntimeRole.Worker) =>
-        Create(type: ControlMessageType.Health, operationId, role, new HealthPayload(1, "build-1", 7, CapabilityNonce, status, activeWorkRemaining));
+        Create(type: ControlMessageType.Health, operationId, role, new HealthPayload(ControlProtocolConstants.CurrentVersion, "build-1", 7, CapabilityNonce, status, activeWorkRemaining));
 
     private static ControlEnvelope Create(ControlMessageType type, Guid operationId, RuntimeRole role, object payload) =>
         new(
@@ -384,7 +532,24 @@ public sealed class ControlSessionValidatorTests
 
     private sealed class ControlledClientTransport : IControlClientTransport
     {
-        public ControlledWriteStream Stream { get; } = new();
+        public ControlledClientTransport(
+            ExpectedControlIdentity expected,
+            bool duplicateChallenge = false,
+            bool blockChallenge = false)
+        {
+            Stream = new ControlledDuplexStream(Create(
+                ControlMessageType.IdentityChallenge,
+                expected.StartupOperationId,
+                expected.Role,
+                new IdentityChallengePayload(
+                    expected.ProcessId,
+                    ProcessCreationTimeTicks.Format(expected.ProcessCreationTimeUtcTicks),
+                    "issued-challenge")),
+                duplicateChallenge,
+                blockChallenge);
+        }
+
+        public ControlledDuplexStream Stream { get; }
         Stream IControlClientTransport.Stream => Stream;
         public bool IsConnected { get; private set; }
         public bool FailConnect { get; set; }
@@ -392,7 +557,7 @@ public sealed class ControlSessionValidatorTests
         public int ConnectCalls { get; private set; }
         public int FlushCalls { get; private set; }
         public int DisposeCalls { get; private set; }
-        public int OperationCount => ConnectCalls + Stream.WriteCalls + FlushCalls;
+        public int OperationCount => ConnectCalls + Stream.ReadCalls + Stream.WriteCalls + FlushCalls;
 
         public Task ConnectAsync(CancellationToken cancellationToken)
         {
@@ -421,11 +586,34 @@ public sealed class ControlSessionValidatorTests
         }
     }
 
-    private sealed class ControlledWriteStream : Stream
+    private sealed class ControlledDuplexStream : Stream
     {
+        private readonly MemoryStream _challenge;
+        private readonly bool _blockChallenge;
+
+        public ControlledDuplexStream(
+            ControlEnvelope challenge,
+            bool duplicateChallenge,
+            bool blockChallenge)
+        {
+            _blockChallenge = blockChallenge;
+            var json = JsonSerializer.SerializeToUtf8Bytes(challenge, ControlFrameCodec.SerializerOptions);
+            var singleFrameLength = sizeof(uint) + json.Length;
+            var frame = new byte[singleFrameLength * (duplicateChallenge ? 2 : 1)];
+            for (var offset = 0; offset < frame.Length; offset += singleFrameLength)
+            {
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(
+                    frame.AsSpan(offset, sizeof(uint)),
+                    checked((uint)json.Length));
+                json.CopyTo(frame.AsSpan(offset + sizeof(uint)));
+            }
+            _challenge = new MemoryStream(frame, writable: false);
+        }
+
         public int FailWriteCall { get; set; }
+        public int ReadCalls { get; private set; }
         public int WriteCalls { get; private set; }
-        public override bool CanRead => false;
+        public override bool CanRead => true;
         public override bool CanSeek => false;
         public override bool CanWrite => true;
         public override long Length => throw new NotSupportedException();
@@ -437,6 +625,20 @@ public sealed class ControlSessionValidatorTests
             return WriteCalls == FailWriteCall
                 ? ValueTask.FromException(new OperationCanceledException())
                 : ValueTask.CompletedTask;
+        }
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            ReadCalls++;
+            return _blockChallenge
+                ? WaitForCancellationAsync(cancellationToken)
+                : _challenge.ReadAsync(buffer, cancellationToken);
+        }
+
+        private static async ValueTask<int> WaitForCancellationAsync(CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return 0;
         }
 
         public override void Flush() => throw new NotSupportedException();

@@ -66,10 +66,11 @@ public static class FixtureControlLoop
             JsonSerializer.SerializeToElement(
                 new HelloPayload(
                     Environment.ProcessId,
-                    process.StartTime.ToUniversalTime().Ticks,
+                    ProcessCreationTimeTicks.Format(process.StartTime.ToUniversalTime().Ticks),
                     nonce,
                     build,
-                    health.Endpoint),
+                    health.Endpoint,
+                    "pending-challenge"),
                 ControlFrameCodec.SerializerOptions));
         await using var client = new NamedPipeControlClient(pipeName, hello, TimeSpan.FromSeconds(10));
         await client.ConnectAsync(cancellationToken).ConfigureAwait(false);

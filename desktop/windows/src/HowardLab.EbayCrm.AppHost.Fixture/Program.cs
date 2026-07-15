@@ -104,7 +104,13 @@ switch (args[0])
             }
 
             var payload = JsonSerializer.SerializeToElement(
-                new HelloPayload(processId, creationTicks, nonce, build, LoopbackEndpoint: null),
+                new HelloPayload(
+                    processId,
+                    ProcessCreationTimeTicks.Format(creationTicks),
+                    nonce,
+                    build,
+                    LoopbackEndpoint: null,
+                    ChallengeId: "pending-challenge"),
                 ControlFrameCodec.SerializerOptions);
             var hello = new ControlEnvelope(
                 ControlProtocolConstants.CurrentVersion,
@@ -113,20 +119,47 @@ switch (args[0])
                 generation,
                 ControlMessageType.Hello,
                 payload);
+            if (args[1] == "child-shutdown")
+            {
+                await using var adversarialClient = new NamedPipeClientStream(
+                    ".",
+                    pipeName,
+                    PipeDirection.InOut,
+                    PipeOptions.Asynchronous);
+                await adversarialClient.ConnectAsync(5_000);
+                var codec = new ControlFrameCodec();
+                var challengeEnvelope = await codec.ReadAsync(adversarialClient);
+                var challenge = challengeEnvelope.Payload.Deserialize<IdentityChallengePayload>(
+                    ControlFrameCodec.SerializerOptions)
+                    ?? throw new InvalidDataException("Identity challenge payload is missing.");
+                var helloIdentity = payload.Deserialize<HelloPayload>(ControlFrameCodec.SerializerOptions)
+                    ?? throw new InvalidDataException("Hello payload is missing.");
+                var challengeBoundHello = hello with
+                {
+                    Payload = JsonSerializer.SerializeToElement(
+                        helloIdentity with { ChallengeId = challenge.ChallengeId },
+                        ControlFrameCodec.SerializerOptions),
+                };
+                await codec.WriteAsync(adversarialClient, challengeBoundHello);
+                await adversarialClient.FlushAsync();
+                await codec.WriteAsync(
+                    adversarialClient,
+                    CreateEmptyControlEnvelope(
+                        ControlMessageType.Shutdown,
+                        Guid.NewGuid(),
+                        role,
+                        generation));
+                await adversarialClient.FlushAsync();
+                await Task.Delay(Timeout.InfiniteTimeSpan);
+                return 0;
+            }
+
             await using var client = new NamedPipeControlClient(
                 pipeName,
                 hello,
                 TimeSpan.FromSeconds(5));
             await client.ConnectAsync();
-            if (args[1] == "child-shutdown")
-            {
-                await client.SendAsync(CreateEmptyControlEnvelope(
-                    ControlMessageType.Shutdown,
-                    Guid.NewGuid(),
-                    role,
-                    generation));
-            }
-            else if (args[1] == "shutdown-roundtrip")
+            if (args[1] == "shutdown-roundtrip")
             {
                 var shutdown = await client.ReadAsync();
                 await client.SendAsync(CreateEmptyControlEnvelope(

@@ -1,0 +1,656 @@
+{
+  "protocolVersion": 2,
+  "maxFrameBytes": 65536,
+  "maxFramesPerSession": 1024,
+  "maxTextFieldChars": 1024,
+  "validFrames": [
+    {
+      "name": "identity-challenge",
+      "origin": "csharp",
+      "direction": "appHostToChild",
+      "envelope": {
+        "version": 2,
+        "operationId": "046e33a9-8d67-4439-a69f-13debb7f5241",
+        "role": "worker",
+        "generation": 7,
+        "type": "identityChallenge",
+        "payload": {
+          "processId": 4242,
+          "processCreationTimeUtcTicks": "638880000000000123",
+          "challengeId": "challenge-01"
+        }
+      },
+      "frameBase64": "6QAAAHsidmVyc2lvbiI6Miwib3BlcmF0aW9uSWQiOiIwNDZlMzNhOS04ZDY3LTQ0MzktYTY5Zi0xM2RlYmI3ZjUyNDEiLCJyb2xlIjoid29ya2VyIiwiZ2VuZXJhdGlvbiI6NywidHlwZSI6ImlkZW50aXR5Q2hhbGxlbmdlIiwicGF5bG9hZCI6eyJwcm9jZXNzSWQiOjQyNDIsInByb2Nlc3NDcmVhdGlvblRpbWVVdGNUaWNrcyI6IjYzODg4MDAwMDAwMDAwMDEyMyIsImNoYWxsZW5nZUlkIjoiY2hhbGxlbmdlLTAxIn19"
+    },
+    {
+      "name": "hello-v2",
+      "origin": "node",
+      "direction": "childToAppHost",
+      "envelope": {
+        "version": 2,
+        "operationId": "046e33a9-8d67-4439-a69f-13debb7f5241",
+        "role": "worker",
+        "generation": 7,
+        "type": "hello",
+        "payload": {
+          "processId": 4242,
+          "processCreationTimeUtcTicks": "638880000000000123",
+          "capabilityNonce": "nonce-01",
+          "buildIdentity": "build-01",
+          "loopbackEndpoint": "http://127.0.0.1:43123/health",
+          "challengeId": "challenge-01"
+        }
+      },
+      "frameBase64": "SAEAAHsidmVyc2lvbiI6Miwib3BlcmF0aW9uSWQiOiIwNDZlMzNhOS04ZDY3LTQ0MzktYTY5Zi0xM2RlYmI3ZjUyNDEiLCJyb2xlIjoid29ya2VyIiwiZ2VuZXJhdGlvbiI6NywidHlwZSI6ImhlbGxvIiwicGF5bG9hZCI6eyJwcm9jZXNzSWQiOjQyNDIsInByb2Nlc3NDcmVhdGlvblRpbWVVdGNUaWNrcyI6IjYzODg4MDAwMDAwMDAwMDEyMyIsImNhcGFiaWxpdHlOb25jZSI6Im5vbmNlLTAxIiwiYnVpbGRJZGVudGl0eSI6ImJ1aWxkLTAxIiwibG9vcGJhY2tFbmRwb2ludCI6Imh0dHA6Ly8xMjcuMC4wLjE6NDMxMjMvaGVhbHRoIiwiY2hhbGxlbmdlSWQiOiJjaGFsbGVuZ2UtMDEifX0="
+    },
+    {
+      "name": "maximum-generation",
+      "origin": "node",
+      "direction": "appHostToChild",
+      "envelope": {
+        "version": 2,
+        "operationId": "29e70eb2-df9d-442f-9f27-10194202a803",
+        "role": "server",
+        "generation": 9007199254740991,
+        "type": "shutdown",
+        "payload": {}
+      },
+      "frameBase64": "jwAAAHsidmVyc2lvbiI6Miwib3BlcmF0aW9uSWQiOiIyOWU3MGViMi1kZjlkLTQ0MmYtOWYyNy0xMDE5NDIwMmE4MDMiLCJyb2xlIjoic2VydmVyIiwiZ2VuZXJhdGlvbiI6OTAwNzE5OTI1NDc0MDk5MSwidHlwZSI6InNodXRkb3duIiwicGF5bG9hZCI6e319"
+    },
+    {
+      "name": "maximum-active-work",
+      "origin": "node",
+      "direction": "childToAppHost",
+      "envelope": {
+        "version": 2,
+        "operationId": "c7daa0b1-abfe-49c5-98de-f4030a838a91",
+        "role": "worker",
+        "generation": 7,
+        "type": "activeWorkRemaining",
+        "payload": { "count": 2147483647 }
+      },
+      "frameBase64": "nQAAAHsidmVyc2lvbiI6Miwib3BlcmF0aW9uSWQiOiJjN2RhYTBiMS1hYmZlLTQ5YzUtOThkZS1mNDAzMGE4MzhhOTEiLCJyb2xlIjoid29ya2VyIiwiZ2VuZXJhdGlvbiI6NywidHlwZSI6ImFjdGl2ZVdvcmtSZW1haW5pbmciLCJwYXlsb2FkIjp7ImNvdW50IjoyMTQ3NDgzNjQ3fX0="
+    }
+  ],
+  "validSequences": [
+    {
+      "name": "drain",
+      "frames": [
+        {
+          "name": "drain-drain-1",
+          "origin": "csharp",
+          "direction": "appHostToChild",
+          "envelope": {
+            "version": 2,
+            "operationId": "c7daa0b1-abfe-49c5-98de-f4030a838a91",
+            "role": "worker",
+            "generation": 7,
+            "type": "drain",
+            "payload": {}
+          },
+          "frameBase64": "fQAAAHsidmVyc2lvbiI6Miwib3BlcmF0aW9uSWQiOiJjN2RhYTBiMS1hYmZlLTQ5YzUtOThkZS1mNDAzMGE4MzhhOTEiLCJyb2xlIjoid29ya2VyIiwiZ2VuZXJhdGlvbiI6NywidHlwZSI6ImRyYWluIiwicGF5bG9hZCI6e319"
+        },
+        {
+          "name": "drain-drainAccepted-2",
+          "origin": "node",
+          "direction": "childToAppHost",
+          "envelope": {
+            "version": 2,
+            "operationId": "c7daa0b1-abfe-49c5-98de-f4030a838a91",
+            "role": "worker",
+            "generation": 7,
+            "type": "drainAccepted",
+            "payload": {}
+          },
+          "frameBase64": "hQAAAHsidmVyc2lvbiI6Miwib3BlcmF0aW9uSWQiOiJjN2RhYTBiMS1hYmZlLTQ5YzUtOThkZS1mNDAzMGE4MzhhOTEiLCJyb2xlIjoid29ya2VyIiwiZ2VuZXJhdGlvbiI6NywidHlwZSI6ImRyYWluQWNjZXB0ZWQiLCJwYXlsb2FkIjp7fX0="
+        },
+        {
+          "name": "drain-noNewWorkAcquisition-3",
+          "origin": "node",
+          "direction": "childToAppHost",
+          "envelope": {
+            "version": 2,
+            "operationId": "c7daa0b1-abfe-49c5-98de-f4030a838a91",
+            "role": "worker",
+            "generation": 7,
+            "type": "noNewWorkAcquisition",
+            "payload": {}
+          },
+          "frameBase64": "jAAAAHsidmVyc2lvbiI6Miwib3BlcmF0aW9uSWQiOiJjN2RhYTBiMS1hYmZlLTQ5YzUtOThkZS1mNDAzMGE4MzhhOTEiLCJyb2xlIjoid29ya2VyIiwiZ2VuZXJhdGlvbiI6NywidHlwZSI6Im5vTmV3V29ya0FjcXVpc2l0aW9uIiwicGF5bG9hZCI6e319"
+        },
+        {
+          "name": "drain-activeWorkRemaining-4",
+          "origin": "node",
+          "direction": "childToAppHost",
+          "envelope": {
+            "version": 2,
+            "operationId": "c7daa0b1-abfe-49c5-98de-f4030a838a91",
+            "role": "worker",
+            "generation": 7,
+            "type": "activeWorkRemaining",
+            "payload": { "count": 0 }
+          },
+          "frameBase64": "lAAAAHsidmVyc2lvbiI6Miwib3BlcmF0aW9uSWQiOiJjN2RhYTBiMS1hYmZlLTQ5YzUtOThkZS1mNDAzMGE4MzhhOTEiLCJyb2xlIjoid29ya2VyIiwiZ2VuZXJhdGlvbiI6NywidHlwZSI6ImFjdGl2ZVdvcmtSZW1haW5pbmciLCJwYXlsb2FkIjp7ImNvdW50IjowfX0="
+        },
+        {
+          "name": "drain-drained-5",
+          "origin": "node",
+          "direction": "childToAppHost",
+          "envelope": {
+            "version": 2,
+            "operationId": "c7daa0b1-abfe-49c5-98de-f4030a838a91",
+            "role": "worker",
+            "generation": 7,
+            "type": "drained",
+            "payload": {}
+          },
+          "frameBase64": "fwAAAHsidmVyc2lvbiI6Miwib3BlcmF0aW9uSWQiOiJjN2RhYTBiMS1hYmZlLTQ5YzUtOThkZS1mNDAzMGE4MzhhOTEiLCJyb2xlIjoid29ya2VyIiwiZ2VuZXJhdGlvbiI6NywidHlwZSI6ImRyYWluZWQiLCJwYXlsb2FkIjp7fX0="
+        }
+      ]
+    },
+    {
+      "name": "shutdown",
+      "frames": [
+        {
+          "name": "shutdown-shutdown-1",
+          "origin": "csharp",
+          "direction": "appHostToChild",
+          "envelope": {
+            "version": 2,
+            "operationId": "29e70eb2-df9d-442f-9f27-10194202a803",
+            "role": "worker",
+            "generation": 7,
+            "type": "shutdown",
+            "payload": {}
+          },
+          "frameBase64": "gAAAAHsidmVyc2lvbiI6Miwib3BlcmF0aW9uSWQiOiIyOWU3MGViMi1kZjlkLTQ0MmYtOWYyNy0xMDE5NDIwMmE4MDMiLCJyb2xlIjoid29ya2VyIiwiZ2VuZXJhdGlvbiI6NywidHlwZSI6InNodXRkb3duIiwicGF5bG9hZCI6e319"
+        },
+        {
+          "name": "shutdown-shutdownAccepted-2",
+          "origin": "node",
+          "direction": "childToAppHost",
+          "envelope": {
+            "version": 2,
+            "operationId": "29e70eb2-df9d-442f-9f27-10194202a803",
+            "role": "worker",
+            "generation": 7,
+            "type": "shutdownAccepted",
+            "payload": {}
+          },
+          "frameBase64": "iAAAAHsidmVyc2lvbiI6Miwib3BlcmF0aW9uSWQiOiIyOWU3MGViMi1kZjlkLTQ0MmYtOWYyNy0xMDE5NDIwMmE4MDMiLCJyb2xlIjoid29ya2VyIiwiZ2VuZXJhdGlvbiI6NywidHlwZSI6InNodXRkb3duQWNjZXB0ZWQiLCJwYXlsb2FkIjp7fX0="
+        },
+        {
+          "name": "shutdown-stopped-3",
+          "origin": "node",
+          "direction": "childToAppHost",
+          "envelope": {
+            "version": 2,
+            "operationId": "29e70eb2-df9d-442f-9f27-10194202a803",
+            "role": "worker",
+            "generation": 7,
+            "type": "stopped",
+            "payload": {}
+          },
+          "frameBase64": "fwAAAHsidmVyc2lvbiI6Miwib3BlcmF0aW9uSWQiOiIyOWU3MGViMi1kZjlkLTQ0MmYtOWYyNy0xMDE5NDIwMmE4MDMiLCJyb2xlIjoid29ya2VyIiwiZ2VuZXJhdGlvbiI6NywidHlwZSI6InN0b3BwZWQiLCJwYXlsb2FkIjp7fX0="
+        }
+      ]
+    },
+    {
+      "name": "health",
+      "frames": [
+        {
+          "name": "health-health-1",
+          "origin": "node",
+          "direction": "childToAppHost",
+          "envelope": {
+            "version": 2,
+            "operationId": "782331cb-8c4f-4e32-ab3d-b4002dd8849e",
+            "role": "worker",
+            "generation": 7,
+            "type": "health",
+            "payload": {
+              "protocolVersion": 2,
+              "buildIdentity": "build-01",
+              "generation": 7,
+              "generationNonce": "nonce-01",
+              "status": "ready",
+              "activeWorkRemaining": 0
+            }
+          },
+          "frameBase64": "AQEAAHsidmVyc2lvbiI6Miwib3BlcmF0aW9uSWQiOiI3ODIzMzFjYi04YzRmLTRlMzItYWIzZC1iNDAwMmRkODg0OWUiLCJyb2xlIjoid29ya2VyIiwiZ2VuZXJhdGlvbiI6NywidHlwZSI6ImhlYWx0aCIsInBheWxvYWQiOnsicHJvdG9jb2xWZXJzaW9uIjoyLCJidWlsZElkZW50aXR5IjoiYnVpbGQtMDEiLCJnZW5lcmF0aW9uIjo3LCJnZW5lcmF0aW9uTm9uY2UiOiJub25jZS0wMSIsInN0YXR1cyI6InJlYWR5IiwiYWN0aXZlV29ya1JlbWFpbmluZyI6MH19"
+        }
+      ]
+    }
+  ],
+  "invalidEnvelopes": [
+    {
+      "name": "v1-downgrade",
+      "expectedError": "unknown-version",
+      "envelope": {
+        "version": 1,
+        "operationId": "046e33a9-8d67-4439-a69f-13debb7f5241",
+        "role": "worker",
+        "generation": 7,
+        "type": "hello",
+        "payload": {
+          "processId": 4242,
+          "processCreationTimeUtcTicks": "638880000000000123",
+          "capabilityNonce": "nonce-01",
+          "buildIdentity": "build-01",
+          "loopbackEndpoint": null,
+          "challengeId": "challenge-01"
+        }
+      }
+    },
+    {
+      "name": "numeric-creation-ticks",
+      "expectedError": "invalid-creation-ticks",
+      "envelope": {
+        "version": 2,
+        "operationId": "046e33a9-8d67-4439-a69f-13debb7f5241",
+        "role": "worker",
+        "generation": 7,
+        "type": "identityChallenge",
+        "payload": {
+          "processId": 4242,
+          "processCreationTimeUtcTicks": 638880000000000123,
+          "challengeId": "challenge-01"
+        }
+      }
+    },
+    {
+      "name": "noncanonical-creation-ticks",
+      "expectedError": "invalid-creation-ticks",
+      "envelope": {
+        "version": 2,
+        "operationId": "046e33a9-8d67-4439-a69f-13debb7f5241",
+        "role": "worker",
+        "generation": 7,
+        "type": "identityChallenge",
+        "payload": {
+          "processId": 4242,
+          "processCreationTimeUtcTicks": "0638880000000000123",
+          "challengeId": "challenge-01"
+        }
+      }
+    },
+    {
+      "name": "empty-challenge",
+      "expectedError": "invalid-payload",
+      "envelope": {
+        "version": 2,
+        "operationId": "046e33a9-8d67-4439-a69f-13debb7f5241",
+        "role": "worker",
+        "generation": 7,
+        "type": "identityChallenge",
+        "payload": {
+          "processId": 4242,
+          "processCreationTimeUtcTicks": "638880000000000123",
+          "challengeId": ""
+        }
+      }
+    },
+    {
+      "name": "wrong-health-generation",
+      "expectedError": "invalid-payload",
+      "envelope": {
+        "version": 2,
+        "operationId": "782331cb-8c4f-4e32-ab3d-b4002dd8849e",
+        "role": "worker",
+        "generation": 7,
+        "type": "health",
+        "payload": {
+          "protocolVersion": 2,
+          "buildIdentity": "build-01",
+          "generation": 6,
+          "generationNonce": "nonce-01",
+          "status": "ready",
+          "activeWorkRemaining": 0
+        }
+      }
+    },
+    {
+      "name": "payload-field-injection",
+      "expectedError": "invalid-payload",
+      "envelope": {
+        "version": 2,
+        "operationId": "c7daa0b1-abfe-49c5-98de-f4030a838a91",
+        "role": "worker",
+        "generation": 7,
+        "type": "drain",
+        "payload": { "unexpected": true }
+      }
+    },
+    {
+      "name": "generation-above-maximum",
+      "expectedError": "invalid-envelope",
+      "envelope": {
+        "version": 2,
+        "operationId": "29e70eb2-df9d-442f-9f27-10194202a803",
+        "role": "server",
+        "generation": 9007199254740992,
+        "type": "shutdown",
+        "payload": {}
+      }
+    },
+    {
+      "name": "active-work-above-maximum",
+      "expectedError": "invalid-payload",
+      "envelope": {
+        "version": 2,
+        "operationId": "c7daa0b1-abfe-49c5-98de-f4030a838a91",
+        "role": "worker",
+        "generation": 7,
+        "type": "activeWorkRemaining",
+        "payload": { "count": 2147483648 }
+      }
+    }
+  ],
+  "expectedIdentity": {
+    "role": "worker",
+    "generation": 7,
+    "startupOperationId": "046e33a9-8d67-4439-a69f-13debb7f5241",
+    "processId": 4242,
+    "processCreationTimeUtcTicks": "638880000000000123",
+    "capabilityNonce": "nonce-01",
+    "buildIdentity": "build-01",
+    "challengeId": "challenge-01"
+  },
+  "invalidTranscripts": [
+    {
+      "name": "v1-downgrade",
+      "expectedError": "unknown-version",
+      "events": [
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "hello-v2",
+          "mutations": [{ "path": "/version", "value": 1 }]
+        }
+      ]
+    },
+    {
+      "name": "hello-before-challenge",
+      "expectedError": "unexpected-hello",
+      "events": [
+        { "kind": "frame", "direction": "childToAppHost", "vector": "hello-v2" }
+      ]
+    },
+    {
+      "name": "duplicate-challenge",
+      "expectedError": "unexpected-challenge",
+      "events": [
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        },
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        }
+      ]
+    },
+    {
+      "name": "authenticated-duplicate-challenge",
+      "expectedError": "unexpected-challenge",
+      "events": [
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "hello-v2"
+        },
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        }
+      ]
+    },
+    {
+      "name": "exact-duplicate-hello",
+      "expectedError": "unexpected-hello",
+      "events": [
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "hello-v2"
+        },
+        { "kind": "frame", "direction": "childToAppHost", "vector": "hello-v2" }
+      ]
+    },
+    {
+      "name": "conflicting-hello",
+      "expectedError": "unexpected-hello",
+      "events": [
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "hello-v2"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "hello-v2",
+          "mutations": [
+            { "path": "/payload/challengeId", "value": "conflicting-challenge" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wrong-process-id",
+      "expectedError": "process-id-mismatch",
+      "events": [
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "hello-v2",
+          "mutations": [{ "path": "/payload/processId", "value": 4243 }]
+        }
+      ]
+    },
+    {
+      "name": "wrong-creation-time",
+      "expectedError": "process-creation-time-mismatch",
+      "events": [
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "hello-v2",
+          "mutations": [
+            {
+              "path": "/payload/processCreationTimeUtcTicks",
+              "value": "638880000000000124"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wrong-challenge-id",
+      "expectedError": "challenge-mismatch",
+      "events": [
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "hello-v2",
+          "mutations": [
+            { "path": "/payload/challengeId", "value": "wrong-challenge" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "cross-generation",
+      "expectedError": "generation-mismatch",
+      "events": [
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "hello-v2",
+          "mutations": [{ "path": "/generation", "value": 8 }]
+        }
+      ]
+    },
+    {
+      "name": "stale-generation",
+      "expectedError": "generation-mismatch",
+      "events": [
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "hello-v2"
+        },
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "drain-drain-1",
+          "mutations": [{ "path": "/generation", "value": 6 }]
+        }
+      ]
+    },
+    {
+      "name": "wrong-operation",
+      "expectedError": "operation-id-mismatch",
+      "events": [
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "hello-v2",
+          "mutations": [
+            {
+              "path": "/operationId",
+              "value": "29e70eb2-df9d-442f-9f27-10194202a803"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wrong-build",
+      "expectedError": "build-identity-mismatch",
+      "events": [
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "hello-v2",
+          "mutations": [
+            { "path": "/payload/buildIdentity", "value": "wrong-build" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wrong-nonce",
+      "expectedError": "capability-nonce-mismatch",
+      "events": [
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "hello-v2",
+          "mutations": [
+            { "path": "/payload/capabilityNonce", "value": "wrong-nonce" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "out-of-order",
+      "expectedError": "out-of-order",
+      "events": [
+        {
+          "kind": "frame",
+          "direction": "appHostToChild",
+          "vector": "identity-challenge"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "hello-v2"
+        },
+        {
+          "kind": "frame",
+          "direction": "childToAppHost",
+          "vector": "drain-drained-5"
+        }
+      ]
+    },
+    {
+      "name": "oversize",
+      "expectedError": "frame-too-large",
+      "events": [{ "kind": "rawLength", "length": 65537 }]
+    },
+    {
+      "name": "challenge-timeout",
+      "expectedError": "timeout",
+      "events": [{ "kind": "timeout", "phase": "awaitChallenge" }]
+    },
+    {
+      "name": "challenge-cancellation",
+      "expectedError": "cancelled",
+      "events": [{ "kind": "cancellation", "phase": "awaitChallenge" }]
+    }
+  ]
+}

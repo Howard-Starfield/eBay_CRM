@@ -12,7 +12,7 @@ public sealed class ControlFrameCodecTests
     public async Task RoundTripsEnvelopeThroughOneByteReads()
     {
         var codec = new ControlFrameCodec();
-        var expected = CreateEnvelope(ControlMessageType.Health, new HealthPayload(1, "build-1", 7, "generation-7", "ready", 2));
+        var expected = CreateEnvelope(ControlMessageType.Health, new HealthPayload(ControlProtocolConstants.CurrentVersion, "build-1", 7, "generation-7", "ready", 2));
         await using var written = new MemoryStream();
 
         await codec.WriteAsync(written, expected, CancellationToken.None);
@@ -111,7 +111,7 @@ public sealed class ControlFrameCodecTests
     {
         var exception = await Assert.ThrowsAsync<ControlProtocolException>(
             () => new ControlFrameCodec().ReadAsync(
-                new MemoryStream(CreateFrame(Encoding.UTF8.GetBytes("{\"version\":1"))),
+                new MemoryStream(CreateFrame(Encoding.UTF8.GetBytes("{\"version\":2"))),
                 CancellationToken.None));
 
         Assert.Equal(ControlProtocolErrorCode.InvalidJson, exception.Code);
@@ -120,7 +120,7 @@ public sealed class ControlFrameCodecTests
     [Fact]
     public async Task RejectsUnknownProtocolVersion()
     {
-        var json = CreateRawEnvelopeJson().Replace("\"version\":1", "\"version\":2", StringComparison.Ordinal);
+        var json = CreateRawEnvelopeJson().Replace("\"version\":2", "\"version\":1", StringComparison.Ordinal);
 
         var exception = await ReadProtocolExceptionAsync(json);
 
@@ -182,9 +182,9 @@ public sealed class ControlFrameCodecTests
     }
 
     [Theory]
-    [InlineData("{\"version\":1,\"version\":2,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"generation\":7,\"type\":\"health\",\"payload\":{\"protocolVersion\":1,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}}")]
-    [InlineData("{\"version\":1,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"generation\":7,\"type\":\"health\",\"type\":\"drain\",\"payload\":{\"protocolVersion\":1,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}}")]
-    [InlineData("{\"version\":1,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"role\":\"server\",\"generation\":7,\"type\":\"health\",\"payload\":{\"protocolVersion\":1,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}}")]
+    [InlineData("{\"version\":2,\"version\":1,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"generation\":7,\"type\":\"health\",\"payload\":{\"protocolVersion\":2,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}}")]
+    [InlineData("{\"version\":2,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"generation\":7,\"type\":\"health\",\"type\":\"drain\",\"payload\":{\"protocolVersion\":2,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}}")]
+    [InlineData("{\"version\":2,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"role\":\"server\",\"generation\":7,\"type\":\"health\",\"payload\":{\"protocolVersion\":2,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}}")]
     public async Task RejectsConflictingDuplicateTopLevelProperties(string json)
     {
         var exception = await ReadProtocolExceptionAsync(json);
@@ -197,7 +197,7 @@ public sealed class ControlFrameCodecTests
     {
         const string firstSecret = "secret-first-value";
         const string secondSecret = "secret-second-value";
-        var json = $"{{\"version\":1,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"generation\":7,\"type\":\"hello\",\"payload\":{{\"processId\":42,\"processCreationTimeUtcTicks\":638880000000000000,\"capabilityNonce\":\"{firstSecret}\",\"capabilityNonce\":\"{secondSecret}\",\"buildIdentity\":\"build-1\",\"loopbackEndpoint\":null}}}}";
+        var json = $"{{\"version\":2,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"generation\":7,\"type\":\"hello\",\"payload\":{{\"processId\":42,\"processCreationTimeUtcTicks\":\"638880000000000000\",\"capabilityNonce\":\"{firstSecret}\",\"capabilityNonce\":\"{secondSecret}\",\"buildIdentity\":\"build-1\",\"loopbackEndpoint\":null,\"challengeId\":\"challenge-01\"}}}}";
         var pool = new TrackingArrayPool();
 
         var exception = await Assert.ThrowsAsync<ControlProtocolException>(
@@ -227,7 +227,7 @@ public sealed class ControlFrameCodecTests
     [Fact]
     public async Task RejectsUnmappedHelloPayloadFields()
     {
-        var json = "{\"version\":1,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"generation\":7,\"type\":\"hello\",\"payload\":{\"processId\":42,\"processCreationTimeUtcTicks\":638880000000000000,\"capabilityNonce\":\"secret\",\"buildIdentity\":\"build-1\",\"loopbackEndpoint\":null,\"unexpected\":true}}";
+        var json = "{\"version\":2,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"generation\":7,\"type\":\"hello\",\"payload\":{\"processId\":42,\"processCreationTimeUtcTicks\":\"638880000000000000\",\"capabilityNonce\":\"secret\",\"buildIdentity\":\"build-1\",\"loopbackEndpoint\":null,\"challengeId\":\"challenge-01\",\"unexpected\":true}}";
 
         var exception = await ReadProtocolExceptionAsync(json);
 
@@ -239,7 +239,7 @@ public sealed class ControlFrameCodecTests
     {
         var json = CreateRawEnvelopeJson()
             .Replace("\"type\":\"health\"", "\"type\":\"drain\"", StringComparison.Ordinal)
-            .Replace("{\"protocolVersion\":1,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}", "{\"unexpected\":true}", StringComparison.Ordinal);
+            .Replace("{\"protocolVersion\":2,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}", "{\"unexpected\":true}", StringComparison.Ordinal);
 
         var exception = await ReadProtocolExceptionAsync(json);
 
@@ -251,7 +251,7 @@ public sealed class ControlFrameCodecTests
     {
         var json = CreateRawEnvelopeJson()
             .Replace("\"type\":\"health\"", "\"type\":\"activeWorkRemaining\"", StringComparison.Ordinal)
-            .Replace("{\"protocolVersion\":1,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}", "{\"count\":-1}", StringComparison.Ordinal);
+            .Replace("{\"protocolVersion\":2,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}", "{\"count\":-1}", StringComparison.Ordinal);
 
         var exception = await ReadProtocolExceptionAsync(json);
 
@@ -297,12 +297,64 @@ public sealed class ControlFrameCodecTests
     public async Task ClearsRentedWriteBufferWhenWriteIsCancelled()
     {
         var pool = new TrackingArrayPool();
-        var envelope = CreateEnvelope(ControlMessageType.Health, new HealthPayload(1, "build-1", 7, "generation-7", "ready", 0));
+        var envelope = CreateEnvelope(ControlMessageType.Health, new HealthPayload(ControlProtocolConstants.CurrentVersion, "build-1", 7, "generation-7", "ready", 0));
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => new ControlFrameCodec(pool).WriteAsync(new CancelOnWriteStream(), envelope, CancellationToken.None));
 
         Assert.True(pool.ReturnedWithClearData);
+    }
+
+    [Fact]
+    public async Task AcceptsSharedNumericMaximums()
+    {
+        var generation = new ControlEnvelope(
+            ControlProtocolConstants.CurrentVersion,
+            Guid.Parse("57c0b8aa-a43a-431f-b63a-c89a1fb5adc8"),
+            RuntimeRole.Server,
+            ControlProtocolConstants.MaxGeneration,
+            ControlMessageType.Shutdown,
+            JsonSerializer.SerializeToElement(new { }, ControlFrameCodec.SerializerOptions));
+        var activeWork = new ControlEnvelope(
+            ControlProtocolConstants.CurrentVersion,
+            Guid.Parse("57c0b8aa-a43a-431f-b63a-c89a1fb5adc8"),
+            RuntimeRole.Worker,
+            7,
+            ControlMessageType.ActiveWorkRemaining,
+            JsonSerializer.SerializeToElement(
+                new { count = ControlProtocolConstants.MaxActiveWorkRemaining },
+                ControlFrameCodec.SerializerOptions));
+
+        await new ControlFrameCodec().WriteAsync(new MemoryStream(), generation);
+        await new ControlFrameCodec().WriteAsync(new MemoryStream(), activeWork);
+    }
+
+    [Fact]
+    public async Task RejectsValuesImmediatelyAboveSharedNumericMaximums()
+    {
+        var generation = new ControlEnvelope(
+            ControlProtocolConstants.CurrentVersion,
+            Guid.Parse("57c0b8aa-a43a-431f-b63a-c89a1fb5adc8"),
+            RuntimeRole.Server,
+            ControlProtocolConstants.MaxGeneration + 1,
+            ControlMessageType.Shutdown,
+            JsonSerializer.SerializeToElement(new { }, ControlFrameCodec.SerializerOptions));
+        var activeWork = new ControlEnvelope(
+            ControlProtocolConstants.CurrentVersion,
+            Guid.Parse("57c0b8aa-a43a-431f-b63a-c89a1fb5adc8"),
+            RuntimeRole.Worker,
+            7,
+            ControlMessageType.ActiveWorkRemaining,
+            JsonSerializer.SerializeToElement(
+                new { count = (long)ControlProtocolConstants.MaxActiveWorkRemaining + 1 },
+                ControlFrameCodec.SerializerOptions));
+
+        var generationError = await Assert.ThrowsAsync<ControlProtocolException>(
+            () => new ControlFrameCodec().WriteAsync(new MemoryStream(), generation));
+        var activeWorkError = await Assert.ThrowsAsync<ControlProtocolException>(
+            () => new ControlFrameCodec().WriteAsync(new MemoryStream(), activeWork));
+        Assert.Equal(ControlProtocolErrorCode.InvalidEnvelope, generationError.Code);
+        Assert.Equal(ControlProtocolErrorCode.InvalidPayload, activeWorkError.Code);
     }
 
     private static ControlEnvelope CreateEnvelope(ControlMessageType type, object payload) =>
@@ -315,7 +367,7 @@ public sealed class ControlFrameCodecTests
             JsonSerializer.SerializeToElement(payload, ControlFrameCodec.SerializerOptions));
 
     private static string CreateRawEnvelopeJson() =>
-        "{\"version\":1,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"generation\":7,\"type\":\"health\",\"payload\":{\"protocolVersion\":1,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}}";
+        "{\"version\":2,\"operationId\":\"57c0b8aa-a43a-431f-b63a-c89a1fb5adc8\",\"role\":\"worker\",\"generation\":7,\"type\":\"health\",\"payload\":{\"protocolVersion\":2,\"buildIdentity\":\"build-1\",\"generation\":7,\"generationNonce\":\"generation-7\",\"status\":\"ready\",\"activeWorkRemaining\":0}}";
 
     private static byte[] CreateFrame(byte[] payload)
     {

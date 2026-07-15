@@ -1,4 +1,6 @@
 using System.IO.Pipes;
+using System.Security.Cryptography;
+using System.Text.Json;
 using HowardLab.EbayCrm.AppHost.Core.Diagnostics;
 using HowardLab.EbayCrm.AppHost.Core.Processes;
 using HowardLab.EbayCrm.AppHost.Protocol.Control;
@@ -60,7 +62,7 @@ public sealed class WindowsControlChannel : IControlChannel
             throw new ArgumentOutOfRangeException(nameof(role));
         }
 
-        if (generation < 0)
+        if (generation is < 0 or > ControlProtocolConstants.MaxGeneration)
         {
             throw new ArgumentOutOfRangeException(nameof(generation));
         }
@@ -129,9 +131,26 @@ public sealed class WindowsControlChannel : IControlChannel
                 _pipe.SafePipeHandle,
                 expectedProcess,
                 expectedJob);
+            var expected = expectedProcess.Identity;
+            var challengeId = CreateChallengeId();
+            var challenge = new ControlEnvelope(
+                ControlProtocolConstants.CurrentVersion,
+                EndpointIdentity.StartupOperationId,
+                EndpointIdentity.Role,
+                EndpointIdentity.Generation,
+                ControlMessageType.IdentityChallenge,
+                JsonSerializer.SerializeToElement(
+                    new IdentityChallengePayload(
+                        expected.ProcessId,
+                        ProcessCreationTimeTicks.Format(expected.CreationTimeUtc.UtcTicks),
+                        challengeId),
+                    ControlFrameCodec.SerializerOptions));
+            EnsureDirectionAllowed(challenge.Type, ControlDirection.AppHostToChild);
+            CountFrame();
+            await _writeCodec.WriteAsync(_pipe, challenge, boundedCancellation.Token).ConfigureAwait(false);
+            await _pipe.FlushAsync(boundedCancellation.Token).ConfigureAwait(false);
             CountFrame();
             var hello = await _readCodec.ReadAsync(_pipe, boundedCancellation.Token).ConfigureAwait(false);
-            var expected = expectedProcess.Identity;
             var expectedControlIdentity = new ExpectedControlIdentity(
                 EndpointIdentity.Role,
                 EndpointIdentity.Generation,
@@ -139,7 +158,8 @@ public sealed class WindowsControlChannel : IControlChannel
                 expected.ProcessId,
                 expected.CreationTimeUtc.UtcTicks,
                 EndpointIdentity.CapabilityNonce,
-                EndpointIdentity.ExpectedBuildIdentity);
+                EndpointIdentity.ExpectedBuildIdentity,
+                challengeId);
             var validator = new ControlSessionValidator(expectedControlIdentity);
             var validation = validator.Validate(hello);
             if (validation.Status == ControlValidationStatus.Rejected)
@@ -340,33 +360,26 @@ public sealed class WindowsControlChannel : IControlChannel
 
     private void EnsureInboundDirection(ControlMessageType type)
     {
-        var allowed = type == ControlMessageType.Health || EndpointIdentity.Role switch
-        {
-            RuntimeRole.Worker => type is
-                ControlMessageType.DrainAccepted or
-                ControlMessageType.NoNewWorkAcquisition or
-                ControlMessageType.ActiveWorkRemaining or
-                ControlMessageType.Drained or
-                ControlMessageType.ShutdownAccepted or
-                ControlMessageType.Stopped,
-            RuntimeRole.Server or RuntimeRole.Database => type is
-                ControlMessageType.ShutdownAccepted or
-                ControlMessageType.Stopped,
-            _ => false,
-        };
-        if (!allowed)
-        {
-            throw new InvalidDataException($"Control message type {type} is not allowed from the child.");
-        }
+        EnsureDirectionAllowed(type, ControlDirection.ChildToAppHost);
     }
 
     private void EnsureOutboundDirection(ControlMessageType type)
     {
-        var allowed = type == ControlMessageType.Shutdown ||
-            EndpointIdentity.Role == RuntimeRole.Worker && type == ControlMessageType.Drain;
-        if (!allowed)
+        if (type == ControlMessageType.IdentityChallenge)
         {
-            throw new InvalidDataException($"Control message type {type} is not allowed from the AppHost.");
+            throw new InvalidDataException(
+                "A second identity challenge is not allowed after authentication.");
+        }
+
+        EnsureDirectionAllowed(type, ControlDirection.AppHostToChild);
+    }
+
+    private void EnsureDirectionAllowed(ControlMessageType type, ControlDirection direction)
+    {
+        if (!ControlDirectionPolicy.IsAllowed(EndpointIdentity.Role, type, direction))
+        {
+            throw new InvalidDataException(
+                $"Control message type {type} is not allowed for role {EndpointIdentity.Role} in direction {direction}.");
         }
     }
 
@@ -379,6 +392,15 @@ public sealed class WindowsControlChannel : IControlChannel
         {
             throw new InvalidOperationException("The control endpoint does not match the supervised process generation.");
         }
+    }
+
+    private static string CreateChallengeId()
+    {
+        var bytes = RandomNumberGenerator.GetBytes(32);
+        return Convert.ToBase64String(bytes)
+            .TrimEnd('=')
+            .Replace('+', '-')
+            .Replace('/', '_');
     }
 
     private void EnsureAuthenticated()
