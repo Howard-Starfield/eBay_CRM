@@ -12,6 +12,7 @@ using HowardLab.EbayCrm.AppHost.Windows.Instance;
 
 namespace HowardLab.EbayCrm.AppHost.Integration.Tests.AppHost;
 
+[Collection("AppHost shutdown timing")]
 public sealed class AppHostShutdownTests
 {
     [Fact, Trait("Category", "AppHost")]
@@ -383,3 +384,6 @@ public sealed class AppHostShutdownTests
         }
     }
 }
+
+[CollectionDefinition("AppHost shutdown timing", DisableParallelization = true)]
+public sealed class AppHostShutdownTimingCollection;
