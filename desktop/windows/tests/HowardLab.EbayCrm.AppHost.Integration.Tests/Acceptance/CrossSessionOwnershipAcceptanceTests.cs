@@ -128,7 +128,7 @@ public sealed class CrossSessionOwnershipAcceptanceTests
         var deleteCount = 0;
 
         var error = Assert.Throws<COMException>(() =>
-            RealS4uTaskSession.RegisterWithCreatedFolderCleanup(
+            RealS4uTaskSession.CompleteAfterFolderAcquisition(
                 () => throw new COMException(
                     "policy-blocked",
                     unchecked((int)0x80070005)),
@@ -137,6 +137,31 @@ public sealed class CrossSessionOwnershipAcceptanceTests
 
         Assert.Equal(unchecked((int)0x80070005), error.HResult);
         Assert.Equal(expectedDeleteCount, deleteCount);
+    }
+
+    [Fact]
+    public void ConfigurationFailureAfterFolderCreation_RemovesFolderBeforeRegistration()
+    {
+        var deleteCount = 0;
+        var registrationAttempted = false;
+
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            RealS4uTaskSession.CompleteAfterFolderAcquisition(
+                () =>
+                {
+                    InjectSettingsFailure();
+                    registrationAttempted = true;
+                    return new object();
+                },
+                folderCreated: true,
+                () => deleteCount++));
+
+        Assert.Equal("injected-settings-failure", error.Message);
+        Assert.False(registrationAttempted);
+        Assert.Equal(1, deleteCount);
+
+        static void InjectSettingsFailure() =>
+            throw new InvalidOperationException("injected-settings-failure");
     }
 
     private static Process StartOwner(string appHostPath, string fixturePath, TestLayout layout)

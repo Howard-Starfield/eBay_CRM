@@ -359,36 +359,42 @@ internal sealed class RealS4uTaskSession : IS4uTaskSession
                 folderCreated = true;
             }
 
-            definition = service.NewTask(0);
-            definition.RegistrationInfo.Description = "eBayCRM same-user cross-session acceptance";
-            definition.Principal.UserId = WindowsIdentity.GetCurrent().Name;
-            definition.Principal.LogonType = TaskLogonS4u;
-            definition.Principal.RunLevel = TaskRunLevelLua;
-            definition.Settings.Enabled = true;
-            definition.Settings.Hidden = true;
-            definition.Settings.AllowDemandStart = true;
-            definition.Settings.StartWhenAvailable = false;
-            definition.Settings.DisallowStartIfOnBatteries = false;
-            definition.Settings.StopIfGoingOnBatteries = false;
-            definition.Settings.ExecutionTimeLimit = "PT30S";
-            definition.Settings.MultipleInstances = 2;
-            trigger = definition.Triggers.Create(TaskTriggerTime);
-            trigger.StartBoundary = DateTime.Now.AddMinutes(5).ToString("s", CultureInfo.InvariantCulture);
-            trigger.EndBoundary = DateTime.Now.AddMinutes(6).ToString("s", CultureInfo.InvariantCulture);
-            trigger.Enabled = true;
-            action = definition.Actions.Create(TaskActionExec);
-            action.Path = brokerPath;
-            action.Arguments = "--request \"" + requestPath.Replace("\"", "\"\"") + "\"";
-            action.WorkingDirectory = Path.GetDirectoryName(brokerPath)!;
-            registered = RegisterWithCreatedFolderCleanup(
-                () => folder.RegisterTaskDefinition(
+            registered = CompleteAfterFolderAcquisition(
+                () =>
+                {
+                    definition = service.NewTask(0);
+                    definition.RegistrationInfo.Description =
+                        "eBayCRM same-user cross-session acceptance";
+                    definition.Principal.UserId = WindowsIdentity.GetCurrent().Name;
+                    definition.Principal.LogonType = TaskLogonS4u;
+                    definition.Principal.RunLevel = TaskRunLevelLua;
+                    definition.Settings.Enabled = true;
+                    definition.Settings.Hidden = true;
+                    definition.Settings.AllowDemandStart = true;
+                    definition.Settings.StartWhenAvailable = false;
+                    definition.Settings.DisallowStartIfOnBatteries = false;
+                    definition.Settings.StopIfGoingOnBatteries = false;
+                    definition.Settings.ExecutionTimeLimit = "PT30S";
+                    definition.Settings.MultipleInstances = 2;
+                    trigger = definition.Triggers.Create(TaskTriggerTime);
+                    trigger.StartBoundary = DateTime.Now.AddMinutes(5)
+                        .ToString("s", CultureInfo.InvariantCulture);
+                    trigger.EndBoundary = DateTime.Now.AddMinutes(6)
+                        .ToString("s", CultureInfo.InvariantCulture);
+                    trigger.Enabled = true;
+                    action = definition.Actions.Create(TaskActionExec);
+                    action.Path = brokerPath;
+                    action.Arguments = "--request \"" + requestPath.Replace("\"", "\"\"") + "\"";
+                    action.WorkingDirectory = Path.GetDirectoryName(brokerPath)!;
+                    return folder.RegisterTaskDefinition(
                     taskName,
                     definition,
                     TaskCreate,
                     WindowsIdentity.GetCurrent().Name,
                     null,
                     TaskLogonS4u,
-                    taskSddl),
+                    taskSddl);
+                },
                 folderCreated,
                 () =>
                 {
@@ -416,14 +422,14 @@ internal sealed class RealS4uTaskSession : IS4uTaskSession
         }
     }
 
-    internal static object RegisterWithCreatedFolderCleanup(
-        Func<object> register,
+    internal static object CompleteAfterFolderAcquisition(
+        Func<object> complete,
         bool folderCreated,
         Action deleteCreatedFolder)
     {
         try
         {
-            return register();
+            return complete();
         }
         catch
         {
