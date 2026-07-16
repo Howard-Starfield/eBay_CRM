@@ -84,14 +84,15 @@ public static class AppHostComposition
     {
         ArgumentNullException.ThrowIfNull(options);
         EnsureSupportedRoleTarget(options);
-        if (options.Mode != AppHostMode.Run)
+        if (options.Mode is not (AppHostMode.Run or AppHostMode.AcceptanceRunOnce))
         {
             throw new AppHostOptionsException("run-mode-required");
         }
 
         // Profile ownership must be established before checking shared runtime
         // resources so every same-profile loser reports one stable reason.
-        var requiresFixtureValidation = roleLaunchPlanProvider is null;
+        var requiresFixtureValidation = roleLaunchPlanProvider is null &&
+            options.RoleTarget == AppHostRoleTarget.ControlledFixture;
         var validated = Validate(
             options,
             requireAvailablePort: false,
@@ -131,6 +132,12 @@ public static class AppHostComposition
                 case AppHostRoleTarget.ControlledFixture:
                     fixtureRoleLaunchPlanProvider = new FixtureRoleLaunchPlanProvider(options, validated);
                     activeRoleLaunchPlanProvider = fixtureRoleLaunchPlanProvider;
+                    break;
+                case AppHostRoleTarget.ControlledNodeProbe:
+                    activeRoleLaunchPlanProvider = new PublishedNodeProbeRoleLaunchPlanProvider(
+                        options.NodeProbeRoot ??
+                            throw new AppHostOptionsException("node-probe-root-required"),
+                        ReserveLoopbackPort);
                     break;
                 default:
                     throw new AppHostOptionsException("invalid-role-target");
@@ -255,9 +262,55 @@ public static class AppHostComposition
     private static void EnsureSupportedRoleTarget(AppHostOptions? options)
     {
         ArgumentNullException.ThrowIfNull(options);
-        if (options.RoleTarget != AppHostRoleTarget.ControlledFixture)
+        switch (options.RoleTarget)
         {
-            throw new AppHostOptionsException("invalid-role-target");
+            case AppHostRoleTarget.ControlledFixture:
+                if (options.Mode == AppHostMode.AcceptanceRunOnce)
+                {
+                    throw new AppHostOptionsException("role-target-mode-mismatch");
+                }
+
+                if (options.NodeProbeRoot is not null)
+                {
+                    throw new AppHostOptionsException("node-probe-root-not-allowed");
+                }
+
+                break;
+            case AppHostRoleTarget.ControlledNodeProbe:
+                if (options.Mode != AppHostMode.AcceptanceRunOnce)
+                {
+                    throw new AppHostOptionsException("role-target-mode-mismatch");
+                }
+
+                if (!StringComparer.Ordinal.Equals(
+                        Environment.GetEnvironmentVariable("EBAYCRM_RELEASE_ACCEPTANCE"),
+                        "1"))
+                {
+                    throw new AppHostOptionsException("release-acceptance-required");
+                }
+
+                if (options.NodeProbeRoot is null)
+                {
+                    throw new AppHostOptionsException("node-probe-root-required");
+                }
+
+                break;
+            default:
+                throw new AppHostOptionsException("invalid-role-target");
+        }
+    }
+
+    private static int ReserveLoopbackPort()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        try
+        {
+            return ((IPEndPoint)listener.LocalEndpoint).Port;
+        }
+        finally
+        {
+            listener.Stop();
         }
     }
 

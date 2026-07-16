@@ -36,6 +36,155 @@ public sealed class AppHostStartupTests
         Assert.Equal(AppHostMode.Run, options.Mode);
     }
 
+    [Fact, Trait("Category", "AppHost")]
+    public void Options_AcceptExactReleaseGatedPublishedNodeProbeCombination()
+    {
+        using var layout = TestLayout.Create();
+        var nodeProbeRoot = Path.Combine(layout.Root, "node-probe");
+        Directory.CreateDirectory(nodeProbeRoot);
+        using var releaseAcceptance = new EnvironmentVariableScope(
+            "EBAYCRM_RELEASE_ACCEPTANCE",
+            "1");
+
+        var options = AppHostOptions.Parse(
+            [
+                .. layout.Arguments(
+                    "acceptance-run-once",
+                    roleTarget: "controlled-node-probe"),
+                "--node-probe-root", nodeProbeRoot,
+            ]);
+
+        Assert.Equal(AppHostMode.AcceptanceRunOnce, options.Mode);
+        Assert.Equal(AppHostRoleTarget.ControlledNodeProbe, options.RoleTarget);
+        Assert.Equal(nodeProbeRoot, options.NodeProbeRoot);
+    }
+
+    [Theory, Trait("Category", "AppHost")]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("true")]
+    [InlineData("01")]
+    public void Options_ReleaseAcceptanceGateRequiresExactOne(string? gateValue)
+    {
+        using var layout = TestLayout.Create();
+        var nodeProbeRoot = Path.Combine(layout.Root, "node-probe");
+        Directory.CreateDirectory(nodeProbeRoot);
+        using var releaseAcceptance = new EnvironmentVariableScope(
+            "EBAYCRM_RELEASE_ACCEPTANCE",
+            gateValue);
+
+        var error = Assert.Throws<AppHostOptionsException>(() => AppHostOptions.Parse(
+            [
+                .. layout.Arguments(
+                    "acceptance-run-once",
+                    roleTarget: "controlled-node-probe"),
+                "--node-probe-root", nodeProbeRoot,
+            ]));
+
+        Assert.Equal("release-acceptance-required", error.ReasonCode);
+    }
+
+    [Theory, Trait("Category", "AppHost")]
+    [InlineData("run", "controlled-node-probe", true)]
+    [InlineData("probe", "controlled-node-probe", true)]
+    [InlineData("acceptance-run-once", "controlled-fixture", false)]
+    public void Options_RejectModeAndRoleTargetMismatch(
+        string mode,
+        string roleTarget,
+        bool includeNodeProbeRoot)
+    {
+        using var layout = TestLayout.Create();
+        var nodeProbeRoot = Path.Combine(layout.Root, "node-probe");
+        Directory.CreateDirectory(nodeProbeRoot);
+        using var releaseAcceptance = new EnvironmentVariableScope(
+            "EBAYCRM_RELEASE_ACCEPTANCE",
+            "1");
+        var arguments = layout.Arguments(mode, roleTarget: roleTarget).ToList();
+        if (includeNodeProbeRoot)
+        {
+            arguments.AddRange(["--node-probe-root", nodeProbeRoot]);
+        }
+
+        var error = Assert.Throws<AppHostOptionsException>(() =>
+            AppHostOptions.Parse([.. arguments]));
+
+        Assert.Equal("role-target-mode-mismatch", error.ReasonCode);
+    }
+
+    [Fact, Trait("Category", "AppHost")]
+    public void Options_ControlledNodeProbeRequiresRoot()
+    {
+        using var layout = TestLayout.Create();
+        using var releaseAcceptance = new EnvironmentVariableScope(
+            "EBAYCRM_RELEASE_ACCEPTANCE",
+            "1");
+
+        var error = Assert.Throws<AppHostOptionsException>(() => AppHostOptions.Parse(
+            layout.Arguments(
+                "acceptance-run-once",
+                roleTarget: "controlled-node-probe")));
+
+        Assert.Equal("node-probe-root-required", error.ReasonCode);
+    }
+
+    [Fact, Trait("Category", "AppHost")]
+    public void Options_ControlledFixtureRejectsNodeProbeRoot()
+    {
+        using var layout = TestLayout.Create();
+        var nodeProbeRoot = Path.Combine(layout.Root, "node-probe");
+        Directory.CreateDirectory(nodeProbeRoot);
+
+        var error = Assert.Throws<AppHostOptionsException>(() => AppHostOptions.Parse(
+            [
+                .. layout.Arguments("run"),
+                "--node-probe-root", nodeProbeRoot,
+            ]));
+
+        Assert.Equal("node-probe-root-not-allowed", error.ReasonCode);
+    }
+
+    [Theory, Trait("Category", "AppHost")]
+    [InlineData("relative-node-probe")]
+    [InlineData(@"\\server\share\node-probe")]
+    public void Options_RejectNonLocalNodeProbeRoot(string nodeProbeRoot)
+    {
+        using var layout = TestLayout.Create();
+        using var releaseAcceptance = new EnvironmentVariableScope(
+            "EBAYCRM_RELEASE_ACCEPTANCE",
+            "1");
+
+        var error = Assert.Throws<AppHostOptionsException>(() => AppHostOptions.Parse(
+            [
+                .. layout.Arguments(
+                    "acceptance-run-once",
+                    roleTarget: "controlled-node-probe"),
+                "--node-probe-root", nodeProbeRoot,
+            ]));
+
+        Assert.Equal("invalid-node-probe-root", error.ReasonCode);
+    }
+
+    [Fact, Trait("Category", "AppHost")]
+    public void Composition_DirectRecordCannotBypassReleaseAcceptanceGate()
+    {
+        using var layout = TestLayout.Create();
+        using var releaseAcceptance = new EnvironmentVariableScope(
+            "EBAYCRM_RELEASE_ACCEPTANCE",
+            null);
+        var options = AppHostOptions.Parse(layout.Arguments("run")) with
+        {
+            Mode = AppHostMode.AcceptanceRunOnce,
+            RoleTarget = AppHostRoleTarget.ControlledNodeProbe,
+            NodeProbeRoot = null,
+        };
+
+        var error = Assert.Throws<AppHostOptionsException>(() =>
+            AppHostComposition.Create(options));
+
+        Assert.Equal("release-acceptance-required", error.ReasonCode);
+        Assert.Empty(Directory.EnumerateFileSystemEntries(layout.ProfileRoot));
+    }
+
     [Theory, Trait("Category", "AppHost")]
     [InlineData("postgres-desktop", AppHostRuntimeBackend.PostgresDesktop)]
     [InlineData("redis", AppHostRuntimeBackend.RedisCompatibility)]
@@ -1242,5 +1391,20 @@ public sealed class AppHostStartupTests
             CancellationToken cancellationToken = default) => ValueTask.CompletedTask;
 
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class EnvironmentVariableScope : IDisposable
+    {
+        private readonly string _name;
+        private readonly string? _originalValue;
+
+        internal EnvironmentVariableScope(string name, string? value)
+        {
+            _name = name;
+            _originalValue = Environment.GetEnvironmentVariable(name);
+            Environment.SetEnvironmentVariable(name, value);
+        }
+
+        public void Dispose() => Environment.SetEnvironmentVariable(_name, _originalValue);
     }
 }

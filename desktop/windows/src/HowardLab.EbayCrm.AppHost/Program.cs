@@ -1,5 +1,6 @@
 using System.Text.Json;
 using HowardLab.EbayCrm.AppHost.Composition;
+using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
 using HowardLab.EbayCrm.AppHost.Windows.Instance;
 using HowardLab.EbayCrm.AppHost.Windows.Postgres;
 
@@ -21,7 +22,25 @@ try
     };
     await using var orchestrator = AppHostComposition.Create(options);
     orchestrator.StateChanged += state => Console.WriteLine(state);
-    await orchestrator.RunUntilStoppedAsync(stopping.Token);
+    if (options.Mode == AppHostMode.AcceptanceRunOnce)
+    {
+        await orchestrator.StartAsync(stopping.Token);
+        if (orchestrator.State != RuntimeState.Ready)
+        {
+            throw new AppHostExecutionException("acceptance-run-not-ready");
+        }
+
+        await orchestrator.StopAsync(stopping.Token);
+        if (orchestrator.State != RuntimeState.Stopped)
+        {
+            throw new AppHostExecutionException("acceptance-run-not-stopped");
+        }
+    }
+    else
+    {
+        await orchestrator.RunUntilStoppedAsync(stopping.Token);
+    }
+
     return 0;
 }
 catch (Exception error) when (error is AppHostOptionsException or AppHostExecutionException)

@@ -6,6 +6,7 @@ public enum AppHostMode
 {
     Run,
     Probe,
+    AcceptanceRunOnce,
 }
 
 public enum AppHostRuntimeBackend
@@ -17,6 +18,7 @@ public enum AppHostRuntimeBackend
 public enum AppHostRoleTarget
 {
     ControlledFixture,
+    ControlledNodeProbe,
 }
 
 public sealed record AppHostOptions(
@@ -26,7 +28,8 @@ public sealed record AppHostOptions(
     int Port,
     AppHostMode Mode,
     AppHostRuntimeBackend RuntimeBackend,
-    AppHostRoleTarget RoleTarget)
+    AppHostRoleTarget RoleTarget,
+    string? NodeProbeRoot = null)
 {
     private static readonly string[] RequiredOptions =
     [
@@ -37,6 +40,11 @@ public sealed record AppHostOptions(
         "--mode",
         "--runtime-backend",
         "--role-target",
+    ];
+    private static readonly string[] KnownOptions =
+    [
+        .. RequiredOptions,
+        "--node-probe-root",
     ];
 
     public static AppHostOptions Parse(IReadOnlyList<string> arguments)
@@ -51,7 +59,7 @@ public sealed record AppHostOptions(
                 throw new AppHostOptionsException("inline-option-not-allowed");
             }
 
-            if (!RequiredOptions.Contains(option, StringComparer.Ordinal))
+            if (!KnownOptions.Contains(option, StringComparer.Ordinal))
             {
                 throw new AppHostOptionsException("unknown-option");
             }
@@ -67,7 +75,7 @@ public sealed record AppHostOptions(
             }
         }
 
-        if (values.Count != RequiredOptions.Length || RequiredOptions.Any(option => !values.ContainsKey(option)))
+        if (RequiredOptions.Any(option => !values.ContainsKey(option)))
         {
             throw new AppHostOptionsException("missing-required-option");
         }
@@ -92,6 +100,7 @@ public sealed record AppHostOptions(
         {
             "run" => AppHostMode.Run,
             "probe" => AppHostMode.Probe,
+            "acceptance-run-once" => AppHostMode.AcceptanceRunOnce,
             _ => throw new AppHostOptionsException("invalid-mode"),
         };
 
@@ -105,8 +114,48 @@ public sealed record AppHostOptions(
         var roleTarget = values["--role-target"] switch
         {
             "controlled-fixture" => AppHostRoleTarget.ControlledFixture,
+            "controlled-node-probe" => AppHostRoleTarget.ControlledNodeProbe,
             _ => throw new AppHostOptionsException("invalid-role-target"),
         };
+
+        string? nodeProbeRoot;
+        if (roleTarget == AppHostRoleTarget.ControlledNodeProbe)
+        {
+            if (mode != AppHostMode.AcceptanceRunOnce)
+            {
+                throw new AppHostOptionsException("role-target-mode-mismatch");
+            }
+
+            if (!StringComparer.Ordinal.Equals(
+                    Environment.GetEnvironmentVariable("EBAYCRM_RELEASE_ACCEPTANCE"),
+                    "1"))
+            {
+                throw new AppHostOptionsException("release-acceptance-required");
+            }
+
+            if (!values.TryGetValue("--node-probe-root", out var requestedNodeProbeRoot))
+            {
+                throw new AppHostOptionsException("node-probe-root-required");
+            }
+
+            nodeProbeRoot = ParseExistingAbsoluteLocalDirectory(
+                requestedNodeProbeRoot,
+                "invalid-node-probe-root");
+        }
+        else
+        {
+            if (values.ContainsKey("--node-probe-root"))
+            {
+                throw new AppHostOptionsException("node-probe-root-not-allowed");
+            }
+
+            if (mode == AppHostMode.AcceptanceRunOnce)
+            {
+                throw new AppHostOptionsException("role-target-mode-mismatch");
+            }
+
+            nodeProbeRoot = null;
+        }
 
         return new AppHostOptions(
             profileRoot,
@@ -115,7 +164,8 @@ public sealed record AppHostOptions(
             port,
             mode,
             runtimeBackend,
-            roleTarget);
+            roleTarget,
+            nodeProbeRoot);
     }
 
     private static string ParseAbsoluteLocalPath(string value, string reasonCode)
@@ -132,6 +182,39 @@ public sealed record AppHostOptions(
             return Path.TrimEndingDirectorySeparator(Path.GetFullPath(value));
         }
         catch (Exception error) when (error is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            throw new AppHostOptionsException(reasonCode, error);
+        }
+    }
+
+    private static string ParseExistingAbsoluteLocalDirectory(string value, string reasonCode)
+    {
+        var canonical = ParseAbsoluteLocalPath(value, reasonCode);
+        try
+        {
+            if (!Directory.Exists(canonical))
+            {
+                throw new AppHostOptionsException(reasonCode);
+            }
+
+            for (var current = new DirectoryInfo(canonical);
+                 current is not null;
+                 current = current.Parent)
+            {
+                if ((current.Attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    throw new AppHostOptionsException(reasonCode);
+                }
+            }
+
+            return canonical;
+        }
+        catch (AppHostOptionsException)
+        {
+            throw;
+        }
+        catch (Exception error) when (
+            error is IOException or UnauthorizedAccessException or System.Security.SecurityException)
         {
             throw new AppHostOptionsException(reasonCode, error);
         }
