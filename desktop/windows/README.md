@@ -63,3 +63,70 @@ and `System.Private.CoreLib.dll`.
 When package inputs intentionally change, run `dotnet restore
 desktop\windows\EbayCrm.Desktop.sln --force-evaluate`, review every lock-file
 change, then repeat the locked sequence above.
+
+## Phase 1C scripted verification
+
+Phase 1C packages the locked restore, Release build, clean self-contained
+publish, Node protocol/probe gates, isolated .NET test partitions, publish-file
+checks, and final matching-process/temp cleanup scan into one command:
+
+```powershell
+& .\desktop\windows\scripts\Verify-Phase1C.ps1
+```
+
+That default command remains the full Phase 1C gate. For a focused rebuild and
+review of only the published Node probe boundary, use:
+
+```powershell
+& .\desktop\windows\scripts\Verify-Phase1C.ps1 -PublishedNodeProbeOnly
+```
+
+The focused switch still performs the locked restore, zero-warning Release
+build, clean self-contained `win-x64` publish, Node typecheck and 61-test
+protocol/probe suite, generated payload staging and validation, published
+external AppHost smoke test, publish inventory checks, and final cleanup audit.
+It skips the Core, Windows, ordinary integration, and destructive containment
+partitions. Those partitions remain part of the default full gate.
+
+The generated payload is rooted at
+`desktop\windows\artifacts\win-x64\node-probe`. It contains a copied
+`node.exe`, a minimal `package.json`, six compiled JavaScript files under
+`app`, and `node-payload-manifest-v1.json`. The manifest declares the eight
+runtime artifacts in ordinal path order with byte length and SHA-256, identifies
+the server and worker entrypoints, and binds them to build identity
+`published-node-probe/1`. The manifest is the ninth payload file. The entire
+`desktop\windows\artifacts\win-x64` tree is generated evidence and must never
+be committed.
+
+The script defaults PostgreSQL to `.tools\postgresql\16\bin` and Node to the
+`node` command. An explicit parameter takes precedence over the corresponding
+environment variable:
+
+```powershell
+& .\desktop\windows\scripts\Verify-Phase1C.ps1 `
+  -PostgresBin 'C:\tools\postgresql-16\bin' `
+  -NodeExe 'C:\Program Files\nodejs\node.exe'
+```
+
+`EBAYCRM_POSTGRES_BIN` and `EBAYCRM_NODE_EXE` remain supported when parameters
+are omitted. The script sets `EBAYCRM_RELEASE_ACCEPTANCE=1`, deletes only the
+validated non-reparse-point `desktop\windows\artifacts\win-x64` directory,
+publishes with the Phase 1B settings above, and always performs the Phase 1C
+cleanup audit after the verification attempt. The cleanup command can also be
+run independently; pass the UTC start of the run whose temporary artifacts
+should be audited:
+
+```powershell
+& .\desktop\windows\scripts\Test-Phase1CCleanup.ps1 `
+  -RunStartUtc ([datetime]'2026-07-15T12:00:00Z')
+```
+
+The standalone cleanup script's process portion is a non-exhaustive matching
+scan: it reports relevant processes only when an accessible command line
+contains this repository/worktree path. Inaccessible or null command lines and
+descendant command lines that omit the path are not observable matches, and the
+script does not delete temporary directories. This scan alone is not exact
+ownership or exhaustive descendant-cleanup evidence. The published external
+smoke separately provides exact completion-port ledger and cumulative Job
+accounting closure for every process in that smoke run; see the Phase 1C
+production launch boundary report.
