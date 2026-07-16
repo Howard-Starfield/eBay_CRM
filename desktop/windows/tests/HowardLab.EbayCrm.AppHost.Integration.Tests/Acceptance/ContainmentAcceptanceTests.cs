@@ -26,7 +26,7 @@ public sealed class ContainmentAcceptanceTests(ITestOutputHelper output)
     public async Task PublishedHost_ExternalTerminationContainsEveryRetainedDescendantAndColdRestarts()
     {
         var publishInventory = CapturePublishedInventory();
-        Assert.Equal(204, publishInventory.Length);
+        Assert.Equal(213, publishInventory.Length);
         using var layout = TestLayout.CreatePublished();
         var executable = Path.Combine(TestLayout.FindPublishedDirectory(), "HowardLab.EbayCrm.AppHost.exe");
         var retained = new ConcurrentDictionary<int, ProcessIdentitySnapshot>();
