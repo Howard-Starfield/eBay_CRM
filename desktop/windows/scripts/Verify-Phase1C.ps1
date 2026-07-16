@@ -322,7 +322,24 @@ function Stage-PublishedNodeProbePayload {
 $runStartUtc = [datetime]::UtcNow
 $cleanupScript = Join-Path $PSScriptRoot 'Test-Phase1CCleanup.ps1'
 $verificationFailure = $null
+$locationCleanupFailure = $null
+$environmentRestorationFailures = [System.Collections.Generic.List[
+    System.Management.Automation.ErrorRecord]]::new()
 $locationPushed = $false
+$verificationEnvironmentNames = @(
+    'EBAYCRM_POSTGRES_BIN',
+    'EBAYCRM_RELEASE_ACCEPTANCE',
+    'EBAYCRM_NODE_EXE'
+)
+$verificationEnvironmentSnapshots = @{}
+foreach ($name in $verificationEnvironmentNames) {
+    $verificationEnvironmentSnapshots[$name] = [pscustomobject]@{
+        Exists = Test-Path -LiteralPath "Env:\$name"
+        Value = [Environment]::GetEnvironmentVariable(
+            $name,
+            [EnvironmentVariableTarget]::Process)
+    }
+}
 
 try {
     $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\..'))
@@ -477,9 +494,55 @@ catch {
     $verificationFailure = $_
 }
 finally {
-    if ($locationPushed) {
-        Pop-Location
+    try {
+        if ($locationPushed) {
+            Pop-Location
+        }
     }
+    catch {
+        $locationCleanupFailure = $_
+    }
+    finally {
+        foreach ($name in $verificationEnvironmentNames) {
+            try {
+                $snapshot = $verificationEnvironmentSnapshots[$name]
+                $value = if ($snapshot.Exists) { $snapshot.Value } else { $null }
+                [Environment]::SetEnvironmentVariable(
+                    $name,
+                    $value,
+                    [EnvironmentVariableTarget]::Process)
+            }
+            catch {
+                $environmentRestorationFailures.Add($_)
+            }
+        }
+    }
+}
+
+$verificationAttemptFailures = [System.Collections.Generic.List[
+    System.Management.Automation.ErrorRecord]]::new()
+if ($null -ne $verificationFailure) {
+    $verificationAttemptFailures.Add($verificationFailure)
+}
+if ($null -ne $locationCleanupFailure) {
+    $verificationAttemptFailures.Add($locationCleanupFailure)
+}
+foreach ($failure in $environmentRestorationFailures) {
+    $verificationAttemptFailures.Add($failure)
+}
+
+if ($verificationAttemptFailures.Count -eq 1) {
+    $verificationFailure = $verificationAttemptFailures[0]
+}
+elseif ($verificationAttemptFailures.Count -gt 1) {
+    $exceptions = @($verificationAttemptFailures | ForEach-Object { $_.Exception })
+    $verificationFailure = [System.Management.Automation.ErrorRecord]::new(
+        [System.AggregateException]::new(
+            'Phase 1C verification, location cleanup, or environment restoration failed.',
+            [System.Exception[]]$exceptions),
+        'Phase1CVerificationAttemptFailed',
+        [System.Management.Automation.ErrorCategory]::OperationStopped,
+        $null)
 }
 
 $cleanupFailure = $null

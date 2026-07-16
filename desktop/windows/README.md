@@ -109,12 +109,13 @@ environment variable:
 ```
 
 `EBAYCRM_POSTGRES_BIN` and `EBAYCRM_NODE_EXE` remain supported when parameters
-are omitted. The script sets `EBAYCRM_RELEASE_ACCEPTANCE=1`, deletes only the
-validated non-reparse-point `desktop\windows\artifacts\win-x64` directory,
-publishes with the Phase 1B settings above, and always performs the Phase 1C
-cleanup audit after the verification attempt. The cleanup command can also be
-run independently; pass the UTC start of the run whose temporary artifacts
-should be audited:
+are omitted. The script temporarily sets `EBAYCRM_RELEASE_ACCEPTANCE=1` and
+restores all three verification environment variables to their prior process
+state, deletes only the validated non-reparse-point
+`desktop\windows\artifacts\win-x64` directory, publishes with the Phase 1B
+settings above, and always performs the Phase 1C cleanup audit after the
+verification attempt. The cleanup command can also be run independently; pass
+the UTC start of the run whose temporary artifacts should be audited:
 
 ```powershell
 & .\desktop\windows\scripts\Test-Phase1CCleanup.ps1 `
