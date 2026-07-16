@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "records": [
+    {
+      "kind": "frontendAsset",
+      "role": "frontend",
+      "sourcePath": "packages/twenty-front/build/index.html",
+      "emittedPath": "packages/twenty-server/dist/front/index.html",
+      "buildProvenance": "vite-empty-runtime-config-v1"
+    }
+  ]
+}
