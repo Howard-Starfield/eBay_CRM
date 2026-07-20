@@ -158,7 +158,7 @@ jobs:
   # ── Dispatch: pixel diff for the triggering workflow's project (PRs + main) ──
   dispatch-pixel-diff:
     needs: resolve-context
-    if: needs.resolve-context.outputs.has_artifact == 'true'
+    if: github.repository == 'twentyhq/twenty' && needs.resolve-context.outputs.has_artifact == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
