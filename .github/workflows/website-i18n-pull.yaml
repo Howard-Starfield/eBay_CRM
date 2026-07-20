@@ -31,6 +31,7 @@ concurrency:
 
 jobs:
   pull_website_translations:
+    if: github.repository == 'twentyhq/twenty'
     name: Pull website translations
     runs-on: ubuntu-latest
     steps:
