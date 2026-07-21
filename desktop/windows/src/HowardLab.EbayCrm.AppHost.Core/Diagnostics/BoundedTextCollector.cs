@@ -22,6 +22,7 @@ public sealed class BoundedTextCollector
     private long _invalidEncodingCount;
     private long _lineCount;
     private long _truncatedByteCount;
+    private long _observedByteCount;
     private bool _lineAccepting = true;
     private bool _hasFinalFragment;
     private bool _previousWasCarriageReturn;
@@ -102,6 +103,17 @@ public sealed class BoundedTextCollector
         }
     }
 
+    public long ObservedByteCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _observedByteCount;
+            }
+        }
+    }
+
     public void Append(string text)
     {
         ArgumentNullException.ThrowIfNull(text);
@@ -171,6 +183,7 @@ public sealed class BoundedTextCollector
 
     private void AppendSourceBytes(ReadOnlySpan<byte> bytes)
     {
+        _observedByteCount = checked(_observedByteCount + bytes.Length);
         foreach (var value in bytes)
         {
             _matchBuffer[_matchCount++] = value;

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.Loader;
 using System.Text;
@@ -469,7 +470,7 @@ public sealed class ProductionPayloadCanonicalizerTests
         {
             if (Directory.Exists(root))
             {
-                Directory.Delete(root, recursive: true);
+                DeleteTestDirectoryWithBoundedRetry(root);
             }
             var parent = Path.GetDirectoryName(root)!;
             if (Directory.Exists(parent) && Directory.GetFileSystemEntries(parent).Length == 0)
@@ -588,6 +589,29 @@ public sealed class ProductionPayloadCanonicalizerTests
     private static void BuildActualAppHost(string project, string output, string? catalogPath)
     {
         Directory.CreateDirectory(output);
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            var result = RunActualAppHostBuild(project, output, catalogPath);
+            if (result.ExitCode == 0)
+            {
+                return;
+            }
+            if (attempt < 4 &&
+                result.Output.Contains("being used by another process", StringComparison.OrdinalIgnoreCase))
+            {
+                Thread.Sleep(200);
+                continue;
+            }
+            Assert.Fail(result.Output);
+        }
+        Assert.Fail("bounded-apphost-build-retry-exhausted");
+    }
+
+    private static (int ExitCode, string Output) RunActualAppHostBuild(
+        string project,
+        string output,
+        string? catalogPath)
+    {
         using var process = new System.Diagnostics.Process
         {
             StartInfo = new System.Diagnostics.ProcessStartInfo
@@ -625,7 +649,26 @@ public sealed class ProductionPayloadCanonicalizerTests
         }
         var combined = (stdout.GetAwaiter().GetResult() + stderr.GetAwaiter().GetResult());
         Assert.True(combined.Length < 1_000_000);
-        Assert.True(process.ExitCode == 0, combined);
+        return (process.ExitCode, combined);
+    }
+
+    private static void DeleteTestDirectoryWithBoundedRetry(string path)
+    {
+        var deadline = Stopwatch.StartNew();
+        while (true)
+        {
+            try
+            {
+                Directory.Delete(path, recursive: true);
+                return;
+            }
+            catch (Exception error) when (
+                error is IOException or UnauthorizedAccessException &&
+                deadline.Elapsed < TimeSpan.FromSeconds(30))
+            {
+                Thread.Sleep(200);
+            }
+        }
     }
 
     private static string EvaluateCatalogOverride(string project, string catalogPath)

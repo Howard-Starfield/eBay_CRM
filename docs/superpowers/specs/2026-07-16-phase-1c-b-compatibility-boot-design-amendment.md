@@ -116,6 +116,45 @@ the exact file copied into and manifested in the installed payload. A different
 system Node, a matching version with a different file hash, or a failed/offline
 signature check fails the build before Yarn runs.
 
+On 2026-07-20, the user approved replacing the initial full monorepo install
+after two cold closure failures at production build command 2, while a warmed
+exact rerun passed. The initial development-capable focus is exactly
+`workspaces focus twenty twenty-server twenty-front twenty-emails`, run through
+the checked-in Yarn `4.13.0` executable and pinned Node. It does not use
+`--production`; Nx, Lingui, TypeScript, and Vite build dependencies remain
+available. Lockfile immutability remains enforced by the existing exact
+`YARN_ENABLE_IMMUTABLE_INSTALLS=true` child environment.
+
+The focused immutable development install retains the lockfile's Git-sourced Electron
+`@electron/node-gyp` locator. Its sole build-time Git is the official Git for
+Windows `MinGit-2.55.0.2-64-bit.zip` release asset for
+`2.55.0.windows.2`, length `38,839,825`, SHA-256
+`E3EA2944CEA4B3FABCD69C7C1669EF69B1B66C05AC7806D81224D0ABAD2DEC31`.
+The builder downloads only that exact release URL or accepts the same exact
+offline archive, preflights every ZIP entry without following links, extracts
+an ordinary exact tree, and validates `cmd/git.exe` length, SHA-256,
+Authenticode signer/chain, and exact version output. It copies that tree only
+to the generated build root at `.phase1cb-toolchain/mingit`; command `PATH` is
+exactly the pinned Node directory, its `cmd` directory, and Windows System32.
+Before Yarn runs, the builder requires the exact `yarn.lock` key, resolution,
+and dependent-package reference for
+`https://github.com/electron/node-gyp.git` at commit
+`06b29aafb7708acef8b3669835c8a7857ebc92d2`. It then supervises the staged
+`git.exe` through an explicit canary: initialize a generated bare repository,
+perform a depth-one fetch of that exact URL and commit with prompts and ambient
+Git configuration disabled, and verify the exact commit in `FETCH_HEAD`. The
+bounded Trace2 record proves the canary used MinGit `2.55.0.windows.2` with that
+locator and commit; it is not represented as trace emitted by Yarn. Yarn's Git
+use remains separately constrained by the exact child `PATH` and immutable
+lock. The focused install must not fetch or materialize the retired Electron
+locator cache path
+`@electron-node-gyp-https-d0f303c37e-e8c97bb534.zip`; its absence is positive
+proof that the unrelated Companion/Electron graph stayed excluded. The lock
+identity and MinGit canary remain required. The resolution ledger binds these
+identities, the required cache absence, and generated evidence roots. MinGit is
+build-only: it is never sourced from the developer checkout or ambient `PATH`,
+and no MinGit file enters the payload or runtime manifest.
+
 The closure contains:
 
 - the exact release-pinned `node.exe` used for the build;
@@ -130,15 +169,16 @@ The closure contains:
 
 The build uses the checked-in Yarn `4.13.0` executable and immutable lockfile.
 It creates a clean generated build root containing only copied, manifest-listed
-source/build inputs, performs the full immutable non-production install there,
-builds Lingui catalogs, workspace packages, the server/worker/command bundles,
-and the frontend, and then performs the same production focus/prune transition
-as the production image. Only after that transition may the final payload be
-materialized. Build logs and dependency-resolution records must prove that no
-module, executable, cache, or generated output was resolved from the developer
-source checkout or its `node_modules`. Runtime commands invoke the payload's
-`node.exe` directly; runtime never invokes Yarn, npm, npx, Corepack, or a system
-Node installation.
+source/build inputs, performs the approved development-capable focus there for
+`twenty`, `twenty-server`, `twenty-front`, and `twenty-emails`, builds Lingui
+catalogs, workspace packages, the server/worker/command bundles, and the
+frontend, and then performs the unchanged final `--production` focus/prune
+transition as the production image. Only after that transition may the final
+payload be materialized. Build logs and dependency-resolution records must prove
+that no module, executable, cache, or generated output was resolved from the
+developer source checkout or its `node_modules`. Runtime commands invoke the
+payload's `node.exe` directly; runtime never invokes Yarn, npm, npx, Corepack,
+or a system Node installation.
 
 Yarn workspace links and any package-manager reparse points are not copied into
 the final payload. A staging step resolves only links whose canonical targets
