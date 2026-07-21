@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Buffers.Binary;
 using System.Globalization;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using HowardLab.EbayCrm.AppHost.Core.Diagnostics;
 using HowardLab.EbayCrm.AppHost.Core.Lifecycle;
@@ -289,8 +290,27 @@ switch (args[0])
         using (var orphan = Process.Start(orphanStartInfo)
             ?? throw new InvalidOperationException("Could not start the output-handle fixture."))
         {
+            if (args.Length == 2)
+            {
+                File.WriteAllText(args[1], JsonSerializer.Serialize(new
+                {
+                    ProcessId = orphan.Id,
+                    CreationTimeUtcTicks = orphan.StartTime.ToUniversalTime().Ticks,
+                }));
+            }
         }
 
+        return 0;
+
+    case "probe-inherited-handle":
+        if (args.Length != 3 || !long.TryParse(args[1], out var inheritedHandleValue))
+        {
+            return 4;
+        }
+        if (FixtureHandleProbe.IsValid(new IntPtr(inheritedHandleValue)))
+        {
+            File.WriteAllText(args[2], "inherited");
+        }
         return 0;
 
     case "announce-tree-hold":
@@ -365,7 +385,16 @@ static ControlEnvelope CreateEmptyControlEnvelope(
         role,
         generation,
         type,
-        JsonSerializer.SerializeToElement(new { }, ControlFrameCodec.SerializerOptions));
+    JsonSerializer.SerializeToElement(new { }, ControlFrameCodec.SerializerOptions));
+
+static class FixtureHandleProbe
+{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetHandleInformation(IntPtr handle, out uint flags);
+
+    internal static bool IsValid(IntPtr handle) => GetHandleInformation(handle, out _);
+}
 
 sealed class MigrationGateLauncher(IProcessLauncher inner, string gatePath) : IProcessLauncher
 {

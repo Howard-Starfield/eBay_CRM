@@ -23,6 +23,7 @@
     <ProjectReference Include="..\..\src\HowardLab.EbayCrm.AppHost.Fixture\HowardLab.EbayCrm.AppHost.Fixture.csproj" />
     <ProjectReference Include="..\..\src\HowardLab.EbayCrm.AppHost.Protocol\HowardLab.EbayCrm.AppHost.Protocol.csproj" />
     <ProjectReference Include="..\..\src\HowardLab.EbayCrm.AppHost.Windows\HowardLab.EbayCrm.AppHost.Windows.csproj" />
+    <ProjectReference Include="..\..\tools\HowardLab.EbayCrm.PayloadTool\HowardLab.EbayCrm.PayloadTool.csproj" />
   </ItemGroup>
 
 </Project>

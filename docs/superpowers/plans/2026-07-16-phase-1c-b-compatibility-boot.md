@@ -15,7 +15,7 @@
 - The runtime backend is exactly `RedisCompatibility`; never choose `PostgresDesktop`, create pg-boss product tables, silently fall back, or claim Redis-free readiness.
 - Use only official `https://nodejs.org/dist/v24.18.0/node-v24.18.0-win-x64.zip`, archive SHA-256 `0AE68406B42D7725661DA979B1403EC9926DA205C6770827F33AAC9D8F26E821`, extracted `node.exe` SHA-256 `9A4EB5F1C29C6A2E93852EAD46B999E284A6A5CA8BAB4D4E241D587D025A52DE`, and a valid OpenJS Foundation Authenticode chain.
 - The extracted Node file that runs the build must be byte-identical to the manifested runtime Node file. Runtime may not invoke Yarn, npm, npx, Corepack, or a system Node.
-- Use repository Yarn `node .yarn/releases/yarn-4.13.0.cjs`; all repository installs use `--immutable`. Verification restores use `--locked-mode`; Task 7 may run one reviewed `--force-evaluate` restore solely to add exact Npgsql 10.0.3 to the lockfile, immediately followed by a locked restore.
+- Use repository Yarn `node .yarn/releases/yarn-4.13.0.cjs`; the initial payload build uses the approved development-capable `workspaces focus twenty twenty-server twenty-front twenty-emails` with `YARN_ENABLE_IMMUTABLE_INSTALLS=true`, and the final production focus/prune remains unchanged. Verification restores use `--locked-mode`; Task 7 may run one reviewed `--force-evaluate` restore solely to add exact Npgsql 10.0.3 to the lockfile, immediately followed by a locked restore.
 - Pin Npgsql `10.0.3` in the Windows project lockfile. Use `NpgsqlDataSource`, async opens with cancellation, explicit transactions where needed, typed reads, and bound parameters; SQL text is compiled static source only.
 - The Garnet candidate is `garnet-server` 1.1.10 from the official NuGet flat-container URL. Its NuGet catalog SHA-512 is `6ae1EHr76KhprSWzY+HEvL4idOqmPn/iHjciAFdAJjdPcm5CdhXDD5G154MPJ1HxL47apNEsR+V5K80e2ukQ9Q==` and its license expression is `MIT`.
 - Garnet's selected `tools/net8.0/any/GarnetServer.dll` is framework-dependent. Its only accepted host is the official private `dotnet-runtime-8.0.29-win-x64.zip` from `https://builds.dotnet.microsoft.com/dotnet/Runtime/8.0.29/dotnet-runtime-8.0.29-win-x64.zip`, SHA-512 `e3f31d298a2b674b54c7fc89fb3f06d9645fc5879a54f2ebf2ea20e9ee7ae55f1bfe3284c1f90a591d6be2d6bcd251790ddc27771d65303e7a6a56d331df4632`, under the official .NET MIT license. Never use a system `dotnet`, SDK, `dotnet tool install`, or roll-forward outside the cataloged private 8.0.29 runtime; patch resolution is constrained to that private root.
@@ -233,13 +233,30 @@ param(
     [string] $RepositoryRoot = (Resolve-Path "$PSScriptRoot\..\..\.."),
     [string] $OutputRoot = "$RepositoryRoot\desktop\windows\artifacts\phase-1c-b",
     [string] $NodeArchivePath,
+    [string] $GitArchivePath,
+    [string] $PayloadToolExePath,
+    [string] $PayloadToolSha256,
     [string] $CandidateCatalogPath,
     [switch] $Offline,
     [switch] $ClosureOnly
 )
 ```
 
-Resolve every root canonically; reject any reparse component; download only the pinned official URL when not offline; hash before extraction; validate `node.exe` hash and Authenticode; copy tracked source/build inputs into a clean generated root while excluding `.git`, `.worktrees`, `.superpowers`, `.tools`, all `node_modules`, and artifacts; prove no resulting resolved path points into the source checkout.
+Resolve every root canonically; reject any reparse component; download only
+the pinned official URLs when not offline; hash before extraction; validate
+`node.exe` hash and Authenticode. Pin build-only Git for Windows MinGit
+`2.55.0.windows.2` at the exact official
+`MinGit-2.55.0.2-64-bit.zip` URL, length `38,839,825`, and SHA-256
+`E3EA2944CEA4B3FABCD69C7C1669EF69B1B66C05AC7806D81224D0ABAD2DEC31`.
+Offline mode requires both exact archives. Validate every MinGit ZIP entry for
+canonical containment, case alias, ADS/reserved-name/traversal/reparse hazards,
+manually extract an exact ordinary tree, and validate `cmd/git.exe` version,
+hash, length, and Authenticode identity. Copy that tree to generated staging
+`.phase1cb-toolchain/mingit`; never source it from the checkout or ambient
+`PATH`. Copy tracked source/build inputs into a clean generated root while
+excluding `.git`, `.worktrees`, `.superpowers`, `.tools`, all `node_modules`,
+and artifacts; prove no resulting resolved path points into the source
+checkout.
 
 `-ClosureOnly` does not consume a candidate catalog. The default full publish
 requires `-CandidateCatalogPath` from a successful current Task 6A staging run,
@@ -247,12 +264,12 @@ validates its canonical digest and every referenced file/ACL, and embeds that
 exact catalog alongside the production release catalog; missing, stale, or
 untrusted candidate input fails before AppHost publish.
 
-- [ ] **Step 4: Implement full build then production prune**
+- [ ] **Step 4: Implement focused development build then production prune**
 
 Use the extracted payload Node for every command:
 
 ```powershell
-& $PinnedNode .yarn/releases/yarn-4.13.0.cjs install --immutable
+& $PinnedNode .yarn/releases/yarn-4.13.0.cjs workspaces focus twenty twenty-server twenty-front twenty-emails
 & $PinnedNode .yarn/releases/yarn-4.13.0.cjs nx run twenty-server:lingui:extract
 & $PinnedNode .yarn/releases/yarn-4.13.0.cjs nx run twenty-server:lingui:compile
 & $PinnedNode .yarn/releases/yarn-4.13.0.cjs nx run twenty-emails:lingui:extract
@@ -265,6 +282,32 @@ $env:NODE_OPTIONS='--max-old-space-size=8192'
 & $PinnedNode .yarn/releases/yarn-4.13.0.cjs exec tsc --project desktop/windows/node/tsconfig.publish.json --outDir $CompiledDesktopNodeRoot
 & $PinnedNode .yarn/releases/yarn-4.13.0.cjs workspaces focus --production twenty-emails twenty-shared twenty-client-sdk twenty-server
 ```
+
+On 2026-07-20, the user approved this amendment after two cold closure failures
+at production build command 2, while a warmed exact rerun passed. The first
+command is the exact development-capable focus above, not a full monorepo
+install and not a `--production` focus; it retains Nx, Lingui, TypeScript, and
+Vite build dependencies. Its existing
+`YARN_ENABLE_IMMUTABLE_INSTALLS=true` child environment continues to enforce
+lockfile immutability. Before it runs, require the exact `yarn.lock` key,
+resolution, and dependent-package reference for
+`https://github.com/electron/node-gyp.git` at commit
+`06b29aafb7708acef8b3669835c8a7857ebc92d2`. Then run an explicit supervised
+canary with the exact staged `git.exe`: `init --bare` a generated probe
+repository, depth-one fetch only that URL and commit, and require the exact
+commit at the start of bounded `FETCH_HEAD`. Parse bounded Trace2 evidence to
+prove this canary used MinGit `2.55.0.windows.2` and the exact locator/commit.
+Do not claim that Yarn emitted this trace. Every build child instead receives
+an exact `PATH` of pinned Node directory, staged MinGit `cmd`, and System32;
+Git configuration and prompts are disabled. After the focused development
+install, require the exact retired Electron locator cache path
+`@electron-node-gyp-https-d0f303c37e-e8c97bb534.zip` to be absent; that absence
+is positive proof that the unrelated Companion/Electron graph stayed excluded.
+The lock identity and MinGit canary remain required. The resolution ledger binds
+the MinGit identities, exact locator/commit, lock binding, canary method, cache
+absence, and generated trace/probe roots.
+The final `--production` focus/prune and its workspace set are unchanged. MinGit and all canary evidence remain
+generated build evidence and must be absent from the materialized payload.
 
 First replace only the POSIX asset-copy command in `twenty-server`'s build target with `node scripts/copy-build-assets.mjs`; retain `rimraf`, Nest build, dependencies, outputs, and cache semantics. The helper uses only Node filesystem APIs with literal source/destination identities and canonical/reparse checks. A clean Windows test constrains `PATH` so no Unix copy tools are reachable and runs the real target through the exact pinned Node/Yarn, proving the server dist plus SDK assets are complete.
 
@@ -304,7 +347,18 @@ Run:
 ```powershell
 dotnet test desktop/windows/tests/HowardLab.EbayCrm.AppHost.Windows.Tests/HowardLab.EbayCrm.AppHost.Windows.Tests.csproj --configuration Release --filter FullyQualifiedName~ProductionPayloadBuilder --nologo
 node --test packages/twenty-server/scripts/copy-build-assets.test.mjs
-& .\desktop\windows\scripts\Build-Phase1CBPayload.ps1 -ClosureOnly
+$toolRoot = Join-Path $PWD 'desktop\windows\artifacts\phase-1c-b-payload-tool'
+& .\desktop\windows\scripts\Publish-Phase1CBPayloadTool.ps1 -RepositoryRoot $PWD -OutputRoot $toolRoot
+$tool = Join-Path $toolRoot 'HowardLab.EbayCrm.PayloadTool.exe'
+$toolSha256 = (Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash
+& .\desktop\windows\scripts\Build-Phase1CBPayload.ps1 `
+    -RepositoryRoot $PWD `
+    -NodeArchivePath (Join-Path $PWD 'desktop\windows\artifacts\node-v24.18.0-win-x64.zip') `
+    -GitArchivePath (Join-Path $PWD 'desktop\windows\artifacts\MinGit-2.55.0.2-64-bit.zip') `
+    -PayloadToolExePath $tool `
+    -PayloadToolSha256 $toolSha256 `
+    -Offline `
+    -ClosureOnly
 ```
 
 Expected: tests pass; the real closure build reports exact Node/Yarn/source
@@ -317,7 +371,7 @@ created in later tasks.
 - [ ] **Step 7: Review and commit**
 
 ```powershell
-git add .gitignore packages/twenty-server/project.json packages/twenty-server/scripts/copy-build-assets.mjs packages/twenty-server/scripts/copy-build-assets.test.mjs desktop/windows/EbayCrm.Desktop.sln desktop/windows/tools/HowardLab.EbayCrm.PayloadTool desktop/windows/src/HowardLab.EbayCrm.AppHost.Windows/Payload/ProductionPayloadBuilder.cs desktop/windows/tests/HowardLab.EbayCrm.AppHost.Windows.Tests/Payload/ProductionPayloadBuilderTests.cs desktop/windows/scripts/Build-Phase1CBPayload.ps1
+git add .gitignore packages/twenty-server/project.json packages/twenty-server/scripts/copy-build-assets.mjs packages/twenty-server/scripts/copy-build-assets.test.mjs desktop/windows/EbayCrm.Desktop.sln desktop/windows/tools/HowardLab.EbayCrm.PayloadTool desktop/windows/src/HowardLab.EbayCrm.AppHost.Windows/Payload/ProductionPayloadBuilder.cs desktop/windows/tests/HowardLab.EbayCrm.AppHost.Windows.Tests/Payload/ProductionPayloadBuilderTests.cs desktop/windows/scripts/Build-Phase1CBPayload.ps1 desktop/windows/scripts/Publish-Phase1CBPayloadTool.ps1
 git commit -m "build(windows): stage trusted Twenty payload"
 ```
 
